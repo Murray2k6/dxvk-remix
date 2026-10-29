@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <algorithm>
 
 #include "../util/xxHash/xxhash.h"
@@ -132,9 +133,20 @@ namespace dxvk {
     // Call this only from the dxvk-cs thread.
     static void clearDrawcallTranslationInvalid();
 
+    // Increments each time applyPendingValues changes the resolved value of at least one option.
+    // Call this only from the dxvk-cs thread.
+    static uint32_t valueChangeGeneration() { return s_valueChangeGeneration; }
+
+    // Returns the names of the options whose resolved value changed since the last call, for the log, and clears them.
+    // Call this only from the dxvk-cs thread.
+    static std::string takeChangedOptionNames();
+
   private:
     static std::mutex s_layerMutex;
     static bool s_drawcallTranslationInvalid;
+    static uint32_t s_valueChangeGeneration;
+    static std::vector<std::string> s_changedOptionNames;
+    static uint32_t s_changedOptionsUnnamed;
     
     // Remove a layer from the registry and all options (internal use only)
     static bool unregisterLayer(const RtxOptionLayer* layer);

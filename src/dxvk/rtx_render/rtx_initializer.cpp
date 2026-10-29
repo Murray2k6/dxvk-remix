@@ -22,7 +22,11 @@
 #pragma once
 
 #include "rtx_initializer.h"
+#include "rtx_scene_manager.h"
+#include "rtx_asset_replacer.h"
+#include "rtx_context.h"
 #include "rtx_options.h"
+#include "rtx_fork_light_bvh.h"
 #include "../../util/thread.h"
 #include "dxvk_context.h"
 #include "dxvk_device.h"
@@ -38,10 +42,33 @@
 #include "rtx_tone_mapping.h"
 #include "rtx_neural_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
+#include "rtx_auto_exposure.h"
+#include "rtx_numos.h"
+#include "rtx_numos_settings.h"
+#include "rtx_option_manager.h"
+#include "rtx_stress.h"
 
 namespace dxvk {
   RtxInitializer::RtxInitializer(DxvkDevice* device)
   : CommonDeviceObject(device) { 
+  }
+
+  void RtxInitializer::onDestroy() {
+    // Raised before the joins below so the asset loaders abandon their prim walks rather
+    // than running the stage to completion - otherwise quitting while enhancements load
+    // blocks for the whole remaining load and looks like a hang.
+    if (auto& replacer = m_device->getCommon()->getSceneManager().getAssetReplacer()) {
+      replacer->cancelLoading();
+    }
+
+    waitForShaderPrewarm();
+
+    if (m_asyncAssetLoadThread.joinable()) {
+      if (!m_assetsLoaded) {
+        Logger::warn("Async asset loading thread is running while device is being destroyed! Attempting to join...");
+      }
+      m_asyncAssetLoadThread.join();
+    }
   }
 
   void RtxInitializer::initialize() {
@@ -69,7 +96,11 @@ namespace dxvk {
         env::getEnvVar("DXVK_GRAPHICS_PRESET_TYPE") != "0") {
       const DxvkDeviceInfo& deviceInfo = m_device->adapter()->devicePropertiesExt();
 
-      RtxOptions::updateUpscalerFromDlssPreset();
+      // The DLSS preset only applies where DLSS runs. Elsewhere it would select DLSS at every start,
+      // and the fallback to TAA-U would replace the upscaler the user saved.
+      if (m_device->getCommon()->metaDLSS().supportsDLSS()) {
+        RtxOptions::updateUpscalerFromDlssPreset();
+      }
       RtxOptions::updateGraphicsPresets(m_device);
       RtxOptions::updateRaytraceModePresets(deviceInfo.core.properties.vendorID, deviceInfo.khrDeviceDriverProperties.driverID);
     } else {
@@ -90,8 +121,16 @@ namespace dxvk {
     ShaderManager::getInstance()->addGlobalExtraLayout(pCommon->getSceneManager().getBindlessResourceManager().getGlobalBindlessTableLayout(BindlessResourceManager::Textures));
     ShaderManager::getInstance()->addGlobalExtraLayout(pCommon->getSceneManager().getBindlessResourceManager().getGlobalBindlessTableLayout(BindlessResourceManager::Samplers));
 
+    // The atmosphere's deprecated settings migrate into their replacements here, so the prewarm compiles for them.
+    NumosSettings::resolved();
+
     // Need to promote all of the hardware support Options before prewarming shaders.
     RtxOptionManager::applyPendingValues(m_device, /* forceOnChange */ true);
+    RtxStress::apply();
+
+    // The prewarm reads SER support through RtxOptions before RtxContext records it.
+    // SER SPIR-V must never reach a driver without VK_NV_ray_tracing_invocation_reorder.
+    RtxOptions::enableShaderExecutionReordering = RtxContext::checkIsShaderExecutionReorderingSupported(*m_device);
 
     // Kick off shader prewarming
     startPrewarmShaders();
@@ -142,15 +181,55 @@ namespace dxvk {
     m_assetsLoaded = true;
   }
 
-  void RtxInitializer::startPrewarmShaders() {
+  bool RtxInitializer::prewarmEnabled() const {
     // If we want to run without shader prewarming, then pipelines will be built inline with other GPU work on first use (typically means
     // long stutters whenever a yet to be compiled pipeline comes into use).
-    if (!asyncShaderPrewarming()
-        // WAR: Shader prewarming caused a deadlock on AMD in the past so it is forcibly disabled, should re-evaluate this at some point.
-        || m_device->properties().core.properties.vendorID == static_cast<uint32_t>(DxvkGpuVendor::Amd)) {
+    return asyncShaderPrewarming();
+  }
+
+  void RtxInitializer::beginPrewarmTracking(const char* name, uint32_t queuedBase) {
+    DxvkPipelineManager& pipelineManager = m_device->getCommon()->pipelineManager();
+
+    // Without the state cache workers, registered shaders are not compiled ahead of use, so there is nothing to wait for.
+    m_startupPrewarmRunning = pipelineManager.hasStateCache();
+    m_startupPrewarmCompiling = false;
+    m_startupPrewarmName = name;
+    m_startupPrewarmStart = std::chrono::steady_clock::now();
+    m_startupPrewarmQueuedBase = queuedBase;
+    m_startupPrewarmCountsBase = pipelineManager.pipelineCache()->compileCounts();
+  }
+
+  void RtxInitializer::startPrewarmShaders() {
+    m_prewarmOptionGeneration = RtxOptionManager::valueChangeGeneration();
+    m_lastPrewarmRefresh = std::chrono::steady_clock::now();
+    // The prewarm below covers the startup values.
+    RtxOptionManager::takeChangedOptionNames();
+
+    if (!prewarmEnabled()) {
       return;
     }
 
+    DxvkPipelineManager& pipelineManager = m_device->getCommon()->pipelineManager();
+    beginPrewarmTracking("startup prewarm", pipelineManager.remixShaderQueuedCount());
+
+    registerPrewarmShaders();
+
+    // Prewarm the rest of the pipelines that can be done automatically
+    AutoShaderPipelinePrewarmer::prewarmComputePipelines(pipelineManager);
+
+    // The prewarm always registers every pipeline the active settings use. The pipeline cache decides whether they
+    // load or compile. It is keyed on the GPU, the driver and the runtime build, so an update compiles them all.
+    const DxvkPipelineCache::LoadResult cacheResult = pipelineManager.pipelineCache()->loadResult();
+    const char* expectation =
+      cacheResult == DxvkPipelineCache::LoadResult::Loaded ? "they should load from the caches" :
+      cacheResult == DxvkPipelineCache::LoadResult::Disabled ? "only the driver's own cache can serve them" :
+      "a full compile is expected";
+    Logger::info(str::format("[ShaderPrewarm] startup prewarm: ", pipelineManager.remixShaderQueuedCount() - m_startupPrewarmQueuedBase,
+                             " pipelines queued for the active settings; ", DxvkPipelineCache::describe(cacheResult),
+                             ", so ", expectation));
+  }
+
+  void RtxInitializer::registerPrewarmShaders() {
     DxvkObjects* pCommon = m_device->getCommon();
 
     // Prewarm all the shaders we'll need for RT by registering them (per-pass) with the driver
@@ -167,9 +246,112 @@ namespace dxvk {
     pCommon->metaToneMapping().prewarmShaders(pCommon->pipelineManager());
     pCommon->metaNeuralRadianceCache().prewarmShaders(pCommon->pipelineManager());
     pCommon->metaRayReconstruction().prewarmShaders(pCommon->pipelineManager());
+    pCommon->metaNumos().prewarmShaders();
 
-    // Prewarm the rest of the pipelines that can be done automatically
-    AutoShaderPipelinePrewarmer::prewarmComputePipelines(pCommon->pipelineManager());
+    prewarmLightBvhSelectSlim();
+  }
+
+  RtxInitializer::PrewarmProgress RtxInitializer::updateStartupPrewarm() {
+    PrewarmProgress progress;
+    if (!m_startupPrewarmRunning) {
+      return progress;
+    }
+
+    DxvkPipelineManager& pipelineManager = m_device->getCommon()->pipelineManager();
+    const uint32_t pending = pipelineManager.remixShaderCompilationCount();
+    const uint32_t total = pipelineManager.remixShaderQueuedCount() - m_startupPrewarmQueuedBase;
+    const double elapsedSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_startupPrewarmStart).count();
+    m_startupPrewarmCompiling = m_startupPrewarmCompiling || pipelineManager.remixShaderSlowCompileCount() > 0;
+
+    if (pending == 0) {
+      m_startupPrewarmRunning = false;
+      DxvkPipelineCache* cache = pipelineManager.pipelineCache();
+      cache->setStartupPrewarmDone();
+
+      // Remix pipelines created while the prewarm ran. Before the first ray traced frame, those are the prewarm's.
+      const DxvkPipelineCache::CompileCounts counts = cache->compileCounts();
+      const uint32_t created = counts.remixCreated - m_startupPrewarmCountsBase.remixCreated;
+      const uint32_t compiled = counts.remixCompiled - m_startupPrewarmCountsBase.remixCompiled;
+      const uint64_t compiledMs = (counts.remixCompiledMicroseconds - m_startupPrewarmCountsBase.remixCompiledMicroseconds) / 1000;
+      Logger::info(str::format("[ShaderPrewarm] ", m_startupPrewarmName, " finished: ", total, " pipelines in ",
+                               uint32_t(elapsedSeconds * 1000.0), " ms: ", created > compiled ? created - compiled : 0u,
+                               " from the caches, ", compiled, " compiled (", compiledMs, " ms of compile time)"));
+      return progress;
+    }
+
+    progress.running = true;
+    progress.compiling = m_startupPrewarmCompiling;
+    progress.total = total;
+    progress.done = total > pending ? total - pending : 0u;
+    progress.elapsedSeconds = elapsedSeconds;
+    return progress;
+  }
+
+  void RtxInitializer::refreshPrewarm() {
+    // An option change can make other shader variants reachable. Registering is idempotent: a shader that exists is
+    // looked up, and only new ones are compiled.
+    const uint32_t generation = RtxOptionManager::valueChangeGeneration();
+    if (generation == m_prewarmOptionGeneration || !prewarmEnabled()) {
+      return;
+    }
+
+    // Until the first ray traced frames are reported, every change registers at once, so the frame after it never
+    // compiles on demand. Later, at most once a second, as some options change every frame.
+    const auto now = std::chrono::steady_clock::now();
+    if (m_firstFramesReported && std::chrono::duration<double>(now - m_lastPrewarmRefresh).count() < 1.0) {
+      return;
+    }
+    m_prewarmOptionGeneration = generation;
+    m_lastPrewarmRefresh = now;
+
+    DxvkPipelineManager& pipelineManager = m_device->getCommon()->pipelineManager();
+    const uint32_t queuedBefore = pipelineManager.remixShaderQueuedCount();
+    registerPrewarmShaders();
+    const uint32_t queued = pipelineManager.remixShaderQueuedCount() - queuedBefore;
+    const std::string changed = RtxOptionManager::takeChangedOptionNames();
+    if (queued == 0) {
+      return;
+    }
+    Logger::info(str::format("[ShaderPrewarm] options changed (", changed, "): ", queued, " pipelines queued for the new settings",
+                             m_raytracedFrameSeen ? "" : ", before the first 3D frame"));
+
+    // Before the first 3D frame, the wait screen covers these like the startup prewarm.
+    if (!m_raytracedFrameSeen && !m_startupPrewarmRunning) {
+      beginPrewarmTracking("prewarm for the changed settings", queuedBefore);
+    }
+  }
+
+  void RtxInitializer::onRaytracedFrame() {
+    if (m_firstFramesReported) {
+      return;
+    }
+
+    DxvkPipelineManager& pipelineManager = m_device->getCommon()->pipelineManager();
+    DxvkPipelineCache* cache = pipelineManager.pipelineCache();
+    const auto now = std::chrono::steady_clock::now();
+    if (!m_raytracedFrameSeen) {
+      m_raytracedFrameSeen = true;
+      m_firstRaytracedFrame = now;
+      m_firstFramesCountsBase = cache->compileCounts();
+      Logger::info(str::format("[ShaderPrewarm] first 3D frame, ",
+                               uint32_t(std::chrono::duration<double>(now - m_startupPrewarmStart).count()),
+                               " s after the last prewarm began"));
+      return;
+    }
+    if (std::chrono::duration<double>(now - m_firstRaytracedFrame).count() < kFirstFramesReportSeconds) {
+      return;
+    }
+    m_firstFramesReported = true;
+
+    // The "[ShaderCompile] after the startup prewarm" lines name these pipelines.
+    const DxvkPipelineCache::CompileCounts counts = cache->compileCounts();
+    const uint32_t onDemand = counts.onDemandCompiled - m_firstFramesCountsBase.onDemandCompiled;
+    const uint64_t onDemandMs = (counts.onDemandMicroseconds - m_firstFramesCountsBase.onDemandMicroseconds) / 1000;
+    const uint32_t background = counts.backgroundCompiled - m_firstFramesCountsBase.backgroundCompiled;
+    const uint64_t backgroundMs = (counts.backgroundMicroseconds - m_firstFramesCountsBase.backgroundMicroseconds) / 1000;
+    Logger::info(str::format("[ShaderPrewarm] first ", uint32_t(kFirstFramesReportSeconds), " s of 3D frames: ", onDemand,
+                             " pipelines compiled on demand (", onDemandMs, " ms the frames waited), ", background,
+                             " compiled in the background (", backgroundMs, " ms)"));
   }
 
   void RtxInitializer::waitForShaderPrewarm() {

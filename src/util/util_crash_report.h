@@ -22,9 +22,10 @@
 #pragma once
 
 // Shared crash-reporting definitions used by both the RTX Remix runtime and the 32-bit bridge, so
-// the two stay in sync on how crashes are signaled and how the crash-report dialog is worded.
+// the two stay in sync on how crashes are signaled and how the crash dialog is worded.
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 
 namespace dxvk {
@@ -34,61 +35,65 @@ namespace dxvk {
   // caught by crashpad) or a normal exit, so it can show an appropriate dialog.
   static constexpr uint32_t kRemixGpuCrashExitCode = 0x60D0DEADu;
 
-  // Named window message sent by the runtime to the bridge client immediately when a GPU crash is
-  // detected — before the slow Sentry capture and upload. The bridge client registers a handler
+  // Named window message sent by the runtime to the bridge client as soon as a GPU crash is
+  // detected, before it waits for the Aftermath dump. The bridge client registers a handler
   // via gpRemixMessageChannel so it can disable the Windows ghost dialog and prepare the crash
   // dialog window as early as possible, without waiting for the server process to exit.
   static constexpr const char* kGpuCrashNotifyMsgName = "UWM_REMIX_GPU_CRASH_NOTIFY";
 
-  // Title used for all crash-report dialogs.
-  static constexpr const wchar_t* kCrashReportDialogTitle = L"RTX Remix Crash Report";
+  // Title used for all crash dialogs.
+  static constexpr const wchar_t* kCrashReportDialogTitle = L"Remix Plus Crash Report";
 
-  // Selects the opening line of the crash-report dialog.
+  // Selects the opening line of the crash dialog.
   enum class CrashPromptKind {
     CpuImmediate,   // CPU crash, dialog shown at crash time (bridge server exit).
     CpuNextLaunch,  // Crash detected on the next launch (runtime, no bridge).
     GpuImmediate,   // GPU crash, dialog shown at crash time.
   };
 
-  // Builds the crash-report dialog message from shared parts so the runtime and bridge produce
-  // identical wording. \p hasPermission selects the "will upload" vs. "ask for permission" text.
-  inline std::wstring buildCrashReportMessage(CrashPromptKind kind, bool hasPermission) {
+  // Returns the folder that holds the crashpad minidumps (.dmp) under the Remix logs folder.
+  inline std::filesystem::path crashReportsDir(const std::filesystem::path& logsDir) {
+    return logsDir / ".sentry-native" / "reports";
+  }
+
+  // Returns the file the runtime leaves in the Remix logs folder when it ends the process after a GPU crash.
+  // The problem notice of the next session reports it and deletes it.
+  inline std::filesystem::path gpuCrashMarkerPath(const std::filesystem::path& logsDir) {
+    return logsDir / "gpu-crash.marker";
+  }
+
+  // Builds the crash dialog message from shared parts so the runtime and bridge produce
+  // identical wording. \p logsDir is the Remix logs folder.
+  inline std::wstring buildCrashReportMessage(CrashPromptKind kind, const std::filesystem::path& logsDir) {
     std::wstring message;
 
-    // Part 1: what happened.
     switch (kind) {
     case CrashPromptKind::CpuImmediate:
-      message = L"The RTX Remix Runtime has encountered an unexpected issue. The application will close.\n\n";
+      message = L"The Remix Plus runtime has encountered an unexpected issue. The application will close.\n\n";
       break;
     case CrashPromptKind::CpuNextLaunch:
-      message = L"The RTX Remix Runtime crashed last time.\n\n";
+      message = L"The Remix Plus runtime crashed last time.\n\n";
       break;
     case CrashPromptKind::GpuImmediate:
-      message = L"The RTX Remix Runtime has encountered a GPU Crash. The application will close.\n\n";
+      message = L"The Remix Plus runtime has encountered a GPU crash. The application will close.\n\n";
       break;
     }
 
-    // Part 2: upload intent / consent request.
-    if (hasPermission) {
-      message += L"A crash report will be uploaded to help improve Remix. ";
-    } else {
-      message += L"Would you like to help improve Remix by granting permission to upload crash data?\n\n";
-    }
-
-    // Standard body.
-    message +=
-      L"Data collected will be used in compliance with NVIDIA's Privacy Policy. "
-      L"Permission can be changed at any time in the User Menu > Permissions tab.\n\n"
-      L"If you can reliably reproduce this crash, please create an issue on our GitHub:\n"
-      L"https://github.com/NVIDIAGameWorks/rtx-remix/issues";
-
-    // GPU crashes benefit from an Aftermath dump; nudge the user to enable it for next time.
+    // A GPU crash ends the process on purpose, so crashpad writes no minidump for it.
     if (kind == CrashPromptKind::GpuImmediate) {
       message +=
-        L"\n\nAdding 'dxvk.enableAftermath = True' to dxvk.conf will include additional information"
-        L" in future GPU crash reports, but may have a small performance overhead.";
+        L"Please attach the log files from this folder to your bug report:\n" + logsDir.wstring() + L"\n\n"
+        L"Adding 'dxvk.enableAftermath = True' to dxvk.conf makes future GPU crashes also write an Aftermath"
+        L" crash dump (.nv-gpudmp), whose path is in remix-dxvk.log. Attach it as well."
+        L" Aftermath may have a small performance overhead.";
+    } else {
+      message +=
+        L"A crash report was saved to:\n" + crashReportsDir(logsDir).wstring() + L"\n\n"
+        L"Please attach the newest .dmp file from that folder, and the log files from this folder,"
+        L" to your bug report:\n" + logsDir.wstring();
     }
 
+    message += L"\n\nCrash reports are never uploaded. They stay on this computer.";
     return message;
   }
 }

@@ -26,7 +26,6 @@
 #include "rtx_ray_portal_manager.h"
 
 #include "rtx_context.h"
-#include "../d3d9/d3d9_state.h"
 #include "../util/util_vector.h"
 #include "../util/util_matrix.h"
 #include "rtx_intersection_test_helpers.h"
@@ -75,6 +74,7 @@ namespace dxvk {
     : CommonDeviceObject(device)
     , kCameraDepthPenetrationThreshold(RtxOptions::rayPortalCameraInBetweenPortalsCorrectionThreshold() * RtxOptions::getMeterToWorldUnitScale())
     , m_pResourceCache(pResourceCache) {
+    m_rayPortalInstanceIds.fill(kInvalidInstanceId);
   }
 
   RayPortalManager::~RayPortalManager() {
@@ -101,8 +101,13 @@ namespace dxvk {
 
     // Note: Ignore duplicate Ray Portals if the index has already been set
     if (rayPortalInfo.has_value()) {
+      // The preserve path registers a portal again in the frame its draw set it, so the setter is not a duplicate.
+      if (m_rayPortalInstanceIds[rayPortalSurfaceMaterial.getRayPortalIndex()] == instance.getId()) {
+        return;
+      }
       // Hide the duplicate instance to avoid artifacts when one instance is offset and another is not
       instance.setHidden(true);
+      ++m_duplicatesHidden;
       return;
     }
 
@@ -219,6 +224,7 @@ namespace dxvk {
     newRayPortalInfo.spriteSheetFPS = instance.surface.spriteSheetFPS;
 
     rayPortalInfo.emplace(newRayPortalInfo);
+    m_rayPortalInstanceIds[newRayPortalInfo.portalIndex] = instance.getId();
   }
 
   void RayPortalManager::clear() {
@@ -227,6 +233,7 @@ namespace dxvk {
     for (auto& rayPortalInfo : m_rayPortalInfos) {
       rayPortalInfo.reset();
     }
+    m_rayPortalInstanceIds.fill(kInvalidInstanceId);
   }
 
   void RayPortalManager::garbageCollection() {

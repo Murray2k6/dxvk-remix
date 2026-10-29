@@ -31,7 +31,9 @@ namespace dxvk {
 
 // NV-DXVK start: external API
   D3D9InterfaceEx::D3D9InterfaceEx(bool bExtended, bool WithExternalSwapchain, bool WithDrawCallConversion, bool WithRemixAPI)
-    : m_instance    ( new DxvkInstance() )
+  // NV-DXVK start: Share the instance across unified frontends
+    : m_instance    ( DxvkInstance::getSharedInstance() )
+  // NV-DXVK end
     , m_extended    ( bExtended ) 
     , m_d3d9Options ( nullptr, m_instance->config(), WithRemixAPI)
     , m_withExternalSwapchain { WithExternalSwapchain }
@@ -377,6 +379,9 @@ namespace dxvk {
 
     try {
       auto dxvkDevice = dxvkAdapter->createDevice(m_instance, D3D9DeviceEx::GetDeviceFeatures(dxvkAdapter));
+      // NV-DXVK start: Identify the Vulkan device used by each frontend
+      Logger::info(str::format("D3D9: shared VkDevice ", dxvkDevice->handle()));
+      // NV-DXVK end
 
       auto* device = new D3D9DeviceEx(
         this,

@@ -266,6 +266,9 @@ pxr::UsdStageRefPtr GameExporter::createInstanceStage(const Export& exportData) 
   const auto relToCaptureIconPath = std::filesystem::relative(exportData.meta.iconPath, exportData.baseExportPath).string();
   customLayerData.SetValueAtPath("lightspeed_game_icon", pxr::VtValue(dxvk::str::sanitizeUtf8(relToCaptureIconPath)));
   customLayerData.SetValueAtPath("lightspeed_geometry_hash_rules", pxr::VtValue(dxvk::str::sanitizeUtf8(exportData.meta.geometryHashRule)));
+  if (!exportData.meta.assetKeyDerivation.empty()) {
+    customLayerData.SetValueAtPath("remix_asset_key_derivation", pxr::VtValue(exportData.meta.assetKeyDerivation));
+  }
   instanceStage->GetRootLayer()->SetCustomLayerData(customLayerData);
 
   return instanceStage;
@@ -285,7 +288,9 @@ void GameExporter::setCommonStageMetaData(pxr::UsdStageRefPtr stage, const Expor
     for (auto& pair : exportData.meta.renderingSettingsDict) {
       configs.push_back(pair.first + " = " + pair.second);
     }
-    settings.GetPrim().CreateAttribute(pxr::TfToken("remix_config"), pxr::SdfValueTypeNames->StringArray).Set(configs);
+    // Must be namespaced: Hydra only gathers namespaced attributes from a render settings
+    // prim into the namespacedSettings that HdRemixRenderSettings reads.
+    settings.GetPrim().CreateAttribute(pxr::TfToken("remix:remix_config"), pxr::SdfValueTypeNames->StringArray).Set(configs);
   }
 }
 

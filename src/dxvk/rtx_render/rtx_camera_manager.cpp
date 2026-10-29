@@ -22,10 +22,7 @@
 #include "rtx_camera_manager.h"
 
 #include "dxvk_device.h"
-
-namespace {
-  constexpr float kFovToleranceRadians = 0.001f;
-}
+#include "rtx_fork_camera_origin.h"
 
 namespace dxvk {
 
@@ -45,93 +42,15 @@ namespace dxvk {
     m_decompositionCache.clear();
   }
 
-  CameraType::Enum CameraManager::processCameraData(const DrawCallState& input) {
-    // If theres no real camera data here - bail
-    if (isIdentityExact(input.getTransformData().viewToProjection)) {
-      return input.testCategoryFlags(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
-    }
-
-    switch (RtxOptions::fusedWorldViewMode()) {
-    case FusedWorldViewMode::None:
-      if (input.getTransformData().objectToView == input.getTransformData().objectToWorld && !isIdentityExact(input.getTransformData().objectToView)) {
-        return input.testCategoryFlags(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
-      }
-      break;
-    case FusedWorldViewMode::View:
-      if (Logger::logLevel() >= LogLevel::Warn) {
-        // Check if World is identity
-        ONCE_IF_FALSE(isIdentityExact(input.getTransformData().objectToWorld),
-                      Logger::warn("[RTX-Compatibility] Fused world-view tranform set to View but World transform is not identity!"));
-      }
-      break;
-    case FusedWorldViewMode::World:
-      if (Logger::logLevel() >= LogLevel::Warn) {
-        // Check if View is identity
-        ONCE_IF_FALSE(isIdentityExact(input.getTransformData().objectToView),
-                      Logger::warn("[RTX-Compatibility] Fused world-view tranform set to World but View transform is not identity!"));
-      }
-      break;
-    }
-
-    // Get camera params
-    DecomposeProjectionParams decomposeProjectionParams = getOrDecomposeProjection(input.getTransformData().viewToProjection);
-
-    // Filter invalid cameras, extreme shearing
-    static auto isFovValid = [](float fovA) {
-      return fovA >= kFovToleranceRadians;
-    };
-    static auto areFovsClose = [](float fovA, const RtCamera& cameraB) {
-      return std::abs(fovA - cameraB.getFov()) < kFovToleranceRadians;
-    };
-
-    if (std::abs(decomposeProjectionParams.shearX) > 0.01f || !isFovValid(decomposeProjectionParams.fov)) {
-      ONCE(Logger::warn("[RTX] CameraManager: rejected an invalid camera"));
-      return input.getCategoryFlags().test(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
-    }
-
-
-    auto isViewModel = [this](float fov, float maxZ, uint32_t frameId) {
-      if (RtxOptions::ViewModel::enable()) {
-        // Note: max Z check is the top-priority
-        if (maxZ <= RtxOptions::ViewModel::maxZThreshold()) {
-          return true;
-        }
-        if (getCamera(CameraType::Main).isValid(frameId)) {
-          // FOV is different from Main camera => assume that it's a ViewModel one
-          if (!areFovsClose(fov, getCamera(CameraType::Main))) {
-            return true;
-          }
-        }
-      }
-      return false;
-    };
-
+  void CameraManager::applyFrameCamera(CameraType::Enum cameraType, const Matrix4& worldToView, const Matrix4& viewToProjection) {
     const uint32_t frameId = m_device->getCurrentFrameId();
-
-    auto cameraType = CameraType::Main;
-    if (input.isDrawingToRaytracedRenderTarget) {
-      cameraType = CameraType::RenderToTexture;
-    } else if (input.testCategoryFlags(InstanceCategories::Sky)) {
-      cameraType = CameraType::Sky;
-    } else if (isViewModel(decomposeProjectionParams.fov, input.maxZ, frameId)) {
-      cameraType = CameraType::ViewModel;
-    }
-    
-    // Check fov consistency across frames
-    if (frameId > 0) {
-      if (getCamera(cameraType).isValid(frameId - 1) && !areFovsClose(decomposeProjectionParams.fov, getCamera(cameraType))) {
-        ONCE(Logger::warn("[RTX] CameraManager: FOV of a camera changed between frames"));
-      }
-    }
-
+    const DecomposeProjectionParams decomposeProjectionParams = getOrDecomposeProjection(viewToProjection);
     auto& camera = getCamera(cameraType);
     auto cameraSequence = RtCameraSequence::getInstance();
     bool shouldUpdateMainCamera = cameraType == CameraType::Main && camera.getLastUpdateFrame() != frameId;
     bool isPlaying = RtCameraSequence::mode() == RtCameraSequence::Mode::Playback;
     bool isBrowsing = RtCameraSequence::mode() == RtCameraSequence::Mode::Browse;
     bool isCameraCut = false;
-    Matrix4 worldToView = input.getTransformData().worldToView;
-    Matrix4 viewToProjection = input.getTransformData().viewToProjection;
     if (isPlaying || isBrowsing) {
       if (shouldUpdateMainCamera) {
         RtCamera::RtCameraSetting setting;
@@ -166,17 +85,59 @@ namespace dxvk {
       m_lastCameraCutFrameId = m_device->getCurrentFrameId();
     }
     m_lastSetCameraType = cameraType;
-
-    return cameraType;
   }
 
   bool CameraManager::isCameraCutThisFrame() const {
     return m_lastCameraCutFrameId == m_device->getCurrentFrameId();
   }
 
+  void CameraManager::signalCameraCut() {
+    getMainCamera().invalidateViewHistory(m_device->getCurrentFrameId());
+  }
+
+  void CameraManager::shiftCameraHistory(CameraType::Enum type, const Vector3& offset) {
+    if (type >= CameraType::Count) {
+      return;
+    }
+    RtCamera& camera = getCamera(type);
+    if (camera.getLastUpdateFrame() != m_device->getCurrentFrameId() && offset != Vector3(0.0f)) {
+      camera.applyArtificialWorldOffset(offset);
+    }
+  }
+
+  void CameraManager::processExternalCamera(CameraType::Enum type,
+                                            const Matrix4& worldToView,
+                                            const Matrix4& viewToProjection,
+                                            const Vector3* worldOrigin,
+                                            const Matrix4d* preciseWorldToView) {
+    if (worldOrigin != nullptr && type < CameraType::Count) {
+      // Ported from BetaRT (sambow23/dxvk-remix-gmod, commit 11761453a). Shift last frame's camera
+      // into this frame's render origin before update() turns it into the previous camera, so an origin move is
+      // neither motion nor a camera cut. Only once per frame: update() ignores a second call in the same frame.
+      RtCamera& camera = getCamera(type);
+      if (camera.getLastUpdateFrame() != m_device->getCurrentFrameId()) {
+        const Vector3 previousHistoryOffset = fork_camera_origin::calculatePreviousCameraHistoryOffset(
+          m_externalCameraOriginValid[type], m_externalCameraOrigins[type], *worldOrigin);
+        if (previousHistoryOffset != Vector3(0.0f)) {
+          camera.applyArtificialWorldOffset(previousHistoryOffset);
+        }
+        m_externalCameraOrigins[type] = *worldOrigin;
+        m_externalCameraOriginValid[type] = true;
+      }
+    }
+    updateExternalCamera(type, worldToView, viewToProjection, preciseWorldToView);
+  }
+
   void CameraManager::processExternalCamera(CameraType::Enum type,
                                             const Matrix4& worldToView,
                                             const Matrix4& viewToProjection) {
+    updateExternalCamera(type, worldToView, viewToProjection, nullptr);
+  }
+
+  void CameraManager::updateExternalCamera(CameraType::Enum type,
+                                           const Matrix4& worldToView,
+                                           const Matrix4& viewToProjection,
+                                           const Matrix4d* preciseWorldToView) {
     DecomposeProjectionParams decomposeProjectionParams = getOrDecomposeProjection(viewToProjection);
 
     getCamera(type).update(
@@ -187,7 +148,9 @@ namespace dxvk {
       decomposeProjectionParams.aspectRatio,
       decomposeProjectionParams.nearPlane,
       decomposeProjectionParams.farPlane,
-      decomposeProjectionParams.isLHS);
+      decomposeProjectionParams.isLHS,
+      (uint32_t) RtCamera::UpdateFlag::UpdateNormal,
+      preciseWorldToView);
   }
 
     DecomposeProjectionParams CameraManager::getOrDecomposeProjection(const Matrix4& viewToProjection) {

@@ -1,4 +1,0 @@
-#pragma once
-
-#define TRANSMITTANCE_LUT_ATMOSPHERE_ARGS 0
-#define TRANSMITTANCE_LUT_OUTPUT          1

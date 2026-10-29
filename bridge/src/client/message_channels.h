@@ -28,12 +28,17 @@
 #include "config/global_options.h"
 
 #include "../../../src/util/util_crash_report.h"
+#include "../../../src/util/util_frame_pacer.h"
 
+#include <atomic>
 #include <memory>
 #include <stdint.h>
 
 extern std::unique_ptr<bridge_util::MessageChannelClient> gpServerMessageChannel; // Message channel with the Bridge server
 extern std::unique_ptr<bridge_util::MessageChannelClient> gpRemixMessageChannel;  // Message channel with the Remix renderer
+
+// The frame rate limit that Present enforces, in frames per second. The runtime sets it, and 0 means off.
+extern std::atomic<uint32_t> gFrameRateLimit;
 
 static void initServerMessageChannel(const uint32_t serverThreadId) {
   assert(!gpServerMessageChannel);
@@ -64,16 +69,28 @@ static void initRemixMessageChannel() {
   assert(!gpRemixMessageChannel);
   gpRemixMessageChannel = std::make_unique<MessageChannelClient>("UWM_REMIX_BRIDGE_REGISTER_THREADPROC_MSG");
 
-  // The renderer sends this the moment it detects a GPU crash, before the slow Sentry capture.
-  // Acting here — before OnServerExited fires — prevents Windows from ghosting the window during
-  // the 10-15 seconds the server spends on Sentry upload before it exits. This is specifically
-  // for GPU crashes; CPU crashes are handled via OnServerExited directly since the server dies
-  // immediately and there is no early notification.
+  // The renderer sends this the moment it detects a GPU crash, before it waits for the Aftermath dump.
+  // Acting here, before OnServerExited fires, prevents Windows from ghosting the window while
+  // the server finishes that wait and exits. This is specifically for GPU crashes; CPU crashes
+  // are handled via OnServerExited directly since the server dies immediately and there is no
+  // early notification.
   gpRemixMessageChannel->registerHandler(dxvk::kGpuCrashNotifyMsgName, [](uintptr_t, intptr_t) {
     Logger::warn("Crash handler (GPU, early): preparing window for crash dialog");
     // This handler runs on the game's main (window-owning) thread via the WndProc, so the synchronous
     // window path is safe and takes effect immediately.
     WndProc::prepareForCrashDialog(/*async=*/false);
+    return true;
+  });
+
+  // The runtime sends rtx.frameRateLimit here, so the wait happens in the game process before its next frame.
+  gpRemixMessageChannel->registerHandler(dxvk::kFrameRateLimitMsgName, [](uintptr_t wParam, intptr_t) {
+    const uint32_t limit = static_cast<uint32_t>(wParam);
+    gFrameRateLimit = limit;
+    if (limit) {
+      Logger::info(format_string("[FrameLimit] %u fps via game-side limiter", limit));
+    } else {
+      Logger::info("[FrameLimit] off");
+    }
     return true;
   });
 }

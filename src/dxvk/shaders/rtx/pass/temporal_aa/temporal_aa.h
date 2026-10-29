@@ -48,4 +48,6 @@ struct TemporalAaArgs
   float invMaximumRadiance;
   float colorClampingFactor;
   float newFrameWeight;
+  // Renderer-wide pre-exposure (rtx_pre_exposure.h): this frame's over last frame's, 1 except on a step.
+  float historyRatio;
 };

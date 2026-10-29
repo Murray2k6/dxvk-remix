@@ -332,13 +332,9 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
   case WM_INPUT:
   {
-    // Stamp raw-input recency for the gate read by overlayInputForward.
-    // Stamped on every WM_INPUT regardless of foreground/inside-overlay state
-    // — what matters is that Path B's raw-input path is alive at all, not
-    // that it produced a usable event. Stamping before the foreground early-
-    // out avoids a race where the game wnd proc's Path A would erroneously
-    // forward mouse during the brief window where the game is foreground
-    // but Path B has already declined to act on the event.
+    // Stamps raw-input recency for overlayInputForward's gate on every WM_INPUT, whatever the foreground state,
+    // since the gate asks whether Path B is alive at all. Stamping before the foreground early-out keeps Path A
+    // from forwarding input while the game is foreground and Path B has declined the event.
     m_lastRawInputTickMs.store(GetTickCount64(), std::memory_order_relaxed);
 
     if (!isOurForeground()) {

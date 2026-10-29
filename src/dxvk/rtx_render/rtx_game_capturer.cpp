@@ -32,6 +32,7 @@
 #include "rtx_materials.h"
 #include "rtx_texture_manager.h"
 #include "rtx_fork_hooks.h"
+#include "rtx_asset_replacer.h"
 
 #include "../dxvk_device.h"
 
@@ -159,8 +160,8 @@ namespace dxvk {
     if (m_bTriggerCapture) {
       m_bTriggerCapture = false;
       if(isIdle()) {
-        if (RtxOptions::getEnableAnyReplacements() && m_sceneManager.areAllReplacementsLoaded()) {
-          Logger::warn("[GameCapturer] Cannot begin capture when replacement assets are enabled/loaded.");
+        if (RtxOptions::getEnableAnyReplacements()) {
+          Logger::warn("[GameCapturer] Cannot begin capture while replacement assets are enabled.");
         } else if (m_state.has<State::Capturing>()) {
           Logger::warn("[GameCapturer] Cannot begin new capture, one currently in progress.");
         } else {
@@ -383,7 +384,7 @@ namespace dxvk {
 
   void GameCapturer::captureDistantLight(const RtDistantLight& rtLight) {
     const auto hash = rtLight.getHash();
-    if (m_pCap->sphereLights.count(hash) == 0) {
+    if (m_pCap->distantLights.count(hash) == 0) {
       const std::string name = dxvk::hashToString(hash);
       lss::DistantLight& distantLight = m_pCap->distantLights[hash];
       distantLight.lightName = name;
@@ -401,7 +402,101 @@ namespace dxvk {
     distantLight.finalTime = m_pCap->currentFrameNum;
   }
 
+  pxr::GfMatrix4d GameCapturer::instanceXformCorrection() const {
+    pxr::GfMatrix4d xform { 1.0 };
+    if (m_pCap->camera.proj.bInv && !m_pCap->camera.view.bInv) {
+      // Add flip transformation for games that render world upside down
+      xform[0][0] = xform[1][1] = -1.0;
+    } else {
+      // Add mirror transformation for games that need additional basis changing because view and projection transformation have different handedness.
+      // Note1: Don't do this transformation if the view and projection have same handedness, they will automatically cancel out.
+      // Note2: Don't do this transformation if the game also flip the up vector in view matrix.
+      //        Because it will automatically cancel out the basis changing and we only need to send an identity matrix here.
+      if (m_pCap->camera.isLHS() && !m_pCap->camera.view.bInv) {
+        xform[0][0] = -1.0;
+      }
+    }
+    return xform;
+  }
+
+  // A draw GPU-instanced by the host (remixapi_InstanceInfoGpuInstancingEXT) is one RtInstance whose
+  // surface carries the placement list. The Toolkit has no PointInstancer support and only understands
+  // instance prims (inst_<mesh hash>_<n>, each referencing mesh_<hash>), so each placement becomes one,
+  // up to rtx.capture.maxHostInstancesPerDraw nearest the camera.
+  void GameCapturer::captureHostInstances(const Rc<DxvkContext> ctx, const RtInstance& rtInstance, const uint8_t instanceFlags) {
+    const std::vector<Matrix4>& placements = *rtInstance.surface.instancesToObject;
+    const Matrix4 base = rtInstance.getTransform();
+    const BlasEntry* pBlas = rtInstance.getBlas();
+    const AxisAlignedBoundingBox& bbox = pBlas->input.getGeometryData().boundingBox;
+    const float maxDistance = maxInstanceDistance();
+    const uint32_t cap = maxHostInstancesPerDraw();
+    const Vector3 cameraPos = m_sceneManager.getCamera().getPosition();
+
+    struct Candidate { float distance; uint32_t index; };
+    std::vector<Candidate> selected;
+    selected.reserve(placements.size());
+    for (uint32_t k = 0; k < uint32_t(placements.size()); ++k) {
+      const Matrix4 xform = base * placements[k];
+      const Vector3 center = bbox.getTransformedCentroid(xform);
+      float radius = 0.f;
+      if (bbox.isValid()) {
+        const float scale = std::max({ length(xform[0].xyz()), length(xform[1].xyz()), length(xform[2].xyz()) });
+        radius = length(bbox.maxPos - bbox.minPos) * 0.5f * scale;
+      }
+      const float distance = std::max(0.f, length(center - cameraPos) - radius);
+      if (maxDistance > 0.f && distance > maxDistance) {
+        continue;
+      }
+      selected.push_back({ distance, k });
+    }
+    if (cap > 0 && selected.size() > cap) {
+      std::nth_element(selected.begin(), selected.begin() + cap, selected.end(),
+                       [](const Candidate& a, const Candidate& b) { return a.distance < b.distance; });
+      selected.resize(cap);
+    }
+    if (selected.empty()) {
+      return;
+    }
+    // Placement order, so instance numbering follows the host's list.
+    std::sort(selected.begin(), selected.end(), [](const Candidate& a, const Candidate& b) { return a.index < b.index; });
+
+    const XXH64_hash_t instanceId = rtInstance.getId();
+    const bool bPointsUpdate = checkInstanceUpdateFlag(instanceFlags, InstFlag::PositionsUpdate);
+    const bool bNormalsUpdate = checkInstanceUpdateFlag(instanceFlags, InstFlag::NormalsUpdate);
+    const bool bIndexUpdate = checkInstanceUpdateFlag(instanceFlags, InstFlag::IndexUpdate);
+    const pxr::GfMatrix4d correction = instanceXformCorrection();
+    const lss::RenderingMetaData metadata = createDrawCallMetadata(rtInstance);
+
+    XXH64_hash_t existingMeshHash = 0;
+    for (const Candidate& c : selected) {
+      const struct { XXH64_hash_t id; uint64_t placement; } keyData { instanceId, c.index };
+      const XXH64_hash_t key = XXH3_64bits(&keyData, sizeof(keyData));
+      const bool bIsNew = m_pCap->instances.count(key) == 0;
+      Instance& instance = m_pCap->instances[key];
+      if (bIsNew) {
+        newInstance(ctx, rtInstance, key);
+      } else if (existingMeshHash == 0) {
+        existingMeshHash = instance.meshHash;
+      }
+      if (m_pCap->bCaptureInstances) {
+        const pxr::GfMatrix4d xform = matrix4ToGfMatrix4d(base * placements[c.index]) * correction;
+        if (bIsNew || instance.lssData.xforms.empty() || instance.lssData.xforms.back().xform != xform) {
+          instance.lssData.xforms.push_back({ m_pCap->currentFrameNum, xform });
+        }
+      }
+      instance.lssData.finalTime = m_pCap->currentFrameNum;
+      instance.lssData.isSky = false;
+      instance.lssData.metadata = metadata;
+    }
+
+    if (m_pCap->bCaptureInstances && existingMeshHash != 0 && (bPointsUpdate || bNormalsUpdate || bIndexUpdate)) {
+      captureMesh(ctx, existingMeshHash, *pBlas, rtInstance.getCategoryFlags(), false, bPointsUpdate, bNormalsUpdate, bIndexUpdate, rtInstance.isFrontFaceFlipped);
+    }
+  }
+
   void GameCapturer::captureInstances(const Rc<DxvkContext> ctx) {
+    const float maxDistance = maxInstanceDistance();
+    const Vector3 cameraPos = m_sceneManager.getCamera().getPosition();
     for (const RtInstance* pRtInstance : m_sceneManager.getInstanceTable()) {
       assert(pRtInstance->getBlas() != nullptr);
 
@@ -412,6 +507,38 @@ namespace dxvk {
         continue;
       }
       assert(instanceId != UINT64_MAX);
+
+      // Instances that are not in the scene this frame are left out: hidden ones (a retained instance its host
+      // culled or swapped out, which keeps its BLAS), ones about to be freed, and ignored ones (a D3D9 draw of an
+      // ignored texture never becomes an instance).
+      if (pRtInstance->isHidden() || pRtInstance->isMarkedForGC() ||
+          pRtInstance->testCategoryFlags(InstanceCategories::Ignore)) {
+        continue;
+      }
+
+      if (pRtInstance->surface.instancesFromHost && pRtInstance->surface.instancesToObject != nullptr &&
+          !pRtInstance->surface.instancesToObject->empty() &&
+          pRtInstance->getBlas()->input.cameraType != CameraType::Sky) {
+        captureHostInstances(ctx, *pRtInstance, m_pCap->instanceFlags[instanceId]);
+        continue;
+      }
+
+      // rtx.capture.maxInstanceDistance: leave out instances whose bounding
+      // sphere stays farther than the limit from the camera. Sky geometry is
+      // always kept (it drives the sky probe bake).
+      if (maxDistance > 0.f && pRtInstance->getBlas()->input.cameraType != CameraType::Sky) {
+        const AxisAlignedBoundingBox& bbox = pRtInstance->getBlas()->input.getGeometryData().boundingBox;
+        const Matrix4 xform = pRtInstance->getTransform();
+        const Vector3 center = bbox.getTransformedCentroid(xform);
+        float radius = 0.f;
+        if (bbox.isValid()) {
+          const float scale = std::max({ length(xform[0].xyz()), length(xform[1].xyz()), length(xform[2].xyz()) });
+          radius = length(bbox.maxPos - bbox.minPos) * 0.5f * scale;
+        }
+        if (length(center - cameraPos) - radius > maxDistance) {
+          continue;
+        }
+      }
 
       if (pRtInstance->getBlas()->input.cameraType == CameraType::Sky) {
         if (!m_pCap->bSkyProbeBaked) {
@@ -439,19 +566,7 @@ namespace dxvk {
         captureMesh(ctx, instance.meshHash, *pBlas, pRtInstance->getCategoryFlags(), false, bPointsUpdate, bNormalsUpdate, bIndexUpdate, pRtInstance->isFrontFaceFlipped);
       }
       if (m_pCap->bCaptureInstances && (bIsNew || bXformUpdate)) {
-        pxr::GfMatrix4d xform { 1.0 };
-        if (m_pCap->camera.proj.bInv && !m_pCap->camera.view.bInv) {
-          // Add flip transformation for games that render world upside down
-          xform[0][0] = xform[1][1] = -1.0;
-        } else {
-          // Add mirror transformation for games that need additional basis changing because view and projection transformation have different handedness.
-          // Note1: Don't do this transformation if the view and projection have same handedness, they will automatically cancel out.
-          // Note2: Don't do this transformation if the game also flip the up vector in view matrix.
-          //        Because it will automatically cancel out the basis changing and we only need to send an identity matrix here.
-          if (m_pCap->camera.isLHS() && !m_pCap->camera.view.bInv) {
-            xform[0][0] = -1.0;
-          }
-        }
+        const pxr::GfMatrix4d xform = instanceXformCorrection();
         instance.lssData.xforms.push_back({ m_pCap->currentFrameNum, matrix4ToGfMatrix4d(pRtInstance->getTransform()) * xform });
         const SkinningData& skinData = pRtInstance->getBlas()->input.getSkinningState();
         if (skinData.numBones > 0) {
@@ -465,17 +580,25 @@ namespace dxvk {
   }
 
   void GameCapturer::newInstance(const Rc<DxvkContext> ctx, const RtInstance& rtInstance) {
+    newInstance(ctx, rtInstance, rtInstance.getId());
+  }
+
+  void GameCapturer::newInstance(const Rc<DxvkContext> ctx, const RtInstance& rtInstance, const XXH64_hash_t instanceKey) {
     const BlasEntry* pBlas = rtInstance.getBlas();
     assert(pBlas != nullptr);
     const XXH64_hash_t matHash = rtInstance.getMaterialDataHash();
 
-    // For external (API-submitted) meshes, use the original API handle as the hash so
-    // captures and runtime replacement lookups agree on mesh identity. Falling back to
-    // the geometry-data hash for API meshes produces a different hash at capture-time
-    // than at runtime, breaking replacement parity.
+    // API meshes use their API handle as the hash, as the runtime replacement lookup does.
     XXH64_hash_t meshHash = 0;
+    // A host asset key is what replacements are looked up with, so the capture uses it too.
+    const AssetResolver& resolver = ctx->getCommonObjects()->getSceneManager().getAssetReplacer()->assetResolver();
     if (pBlas->input.getGeometryData().externalMesh != nullptr) {
       meshHash = reinterpret_cast<XXH64_hash_t>(pBlas->input.getGeometryData().externalMesh);
+      if (const AssetResolver::AssetKey* key = resolver.meshKey(meshHash)) {
+        if (key->key != 0) {
+          meshHash = key->key;
+        }
+      }
       Logger::info(str::format("[GameCapturer] Using external mesh hash: 0x", std::hex, meshHash, std::dec));
     } else {
       meshHash = pBlas->input.getHash(RtxOptions::geometryAssetHashRule());
@@ -486,7 +609,12 @@ namespace dxvk {
 
     // For API materials, use the MaterialData hash (what runtime uses for replacement lookup).
     // For D3D9 materials this equals matHash, but for API-submitted materials the two differ.
-    const XXH64_hash_t materialLookupHash = material.getHash();
+    XXH64_hash_t materialLookupHash = material.getHash();
+    if (const AssetResolver::AssetKey* key = resolver.materialKey(materialLookupHash)) {
+      if (key->key != 0) {
+        materialLookupHash = key->key;
+      }
+    }
 
     const bool bIsNewMat = (materialLookupHash != 0x0) && (m_pCap->materials.count(materialLookupHash) == 0);
     if (bIsNewMat) {
@@ -501,8 +629,7 @@ namespace dxvk {
       if (bIsNewMesh) {
         m_pCap->meshes[meshHash] = std::make_shared<Mesh>();
         m_pCap->meshes[meshHash]->instanceCount = 0;
-        // Use the lookup hash for USD references so replacements resolve the same
-        // way they do at runtime.
+        // USD references use the lookup hash, so replacements resolve as they do at runtime.
         m_pCap->meshes[meshHash]->matHash = materialLookupHash;
       }
       instanceNum = m_pCap->meshes[meshHash]->instanceCount++;
@@ -511,11 +638,10 @@ namespace dxvk {
       captureMesh(ctx, meshHash, *pBlas, rtInstance.getCategoryFlags(), true, true, true, true, rtInstance.isFrontFaceFlipped);
     }
 
-    const XXH64_hash_t instanceId = rtInstance.getId();
+    const XXH64_hash_t instanceId = instanceKey;
     Instance& instance = m_pCap->instances[instanceId];
     instance.meshHash = meshHash;
-    // Store the lookup hash, not the BLAS hash, so capture output lines up with
-    // the runtime replacement lookup.
+    // The lookup hash, not the BLAS hash, matches the runtime replacement lookup.
     instance.matHash = materialLookupHash;
     instance.meshInstNum = instanceNum;
     instance.lssData.firstTime = m_pCap->currentFrameNum;
@@ -584,7 +710,9 @@ namespace dxvk {
       pMesh->lssData.numIndices = numIndices;
       pMesh->lssData.isDoubleSided = isDoubleSided;
       pMesh->lssData.numBones = skinData.numBones;
-      pMesh->lssData.bonesPerVertex = skinData.numBonesPerVertex;
+      // API draws leave SkinningData::numBonesPerVertex at 0; the mesh carries the real value.
+      pMesh->lssData.bonesPerVertex = skinData.numBonesPerVertex != 0 ? skinData.numBonesPerVertex
+                                                                      : blas.input.getGeometryData().numBonesPerVertex;
       pMesh->lssData.isLhs = isLhs;
       Logger::debug("[GameCapturer][" + m_pCap->idStr + "][Mesh:" + pMesh->lssData.meshName + "] New");
     }
@@ -1052,7 +1180,8 @@ namespace dxvk {
     exportPrep.meta.exeName = env::getExeName();
     exportPrep.meta.iconPath = BASE_DIR + exportPrep.meta.exeName + "_icon.bmp";
     exportPrep.meta.geometryHashRule = RtxOptions::geometryAssetHashRuleString();
-    exportPrep.meta.metersPerUnit = RtxOptions::sceneScale();
+    exportPrep.meta.assetKeyDerivation = str::format(AssetResolver::kKeyDerivationVersion);
+    exportPrep.meta.metersPerUnit = metersPerUnit() > 0.f ? metersPerUnit() : RtxOptions::sceneScale();
     exportPrep.meta.timeCodesPerSecond = framesPerSecond;
     exportPrep.meta.startTimeCode = 0.0;
     exportPrep.meta.endTimeCode = floor(static_cast<double>(cap.currentFrameNum));

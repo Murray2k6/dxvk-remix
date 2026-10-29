@@ -27,8 +27,11 @@
 #include "rtx/pass/nrd_args.h"
 #include "../../util/util_string.h"
 #include "../../util/util_global_time.h"
+#include "../../util/util_aftermath.h"
 #include <Shlwapi.h>
+#include <chrono>
 #include <filesystem>
+#include "rtx_pipeline_stats.h"
 
 namespace nrd {
   using pfnCreateInstance = Result(*)(const InstanceCreationDesc& instanceCreationDesc, Instance*& instance);
@@ -549,6 +552,8 @@ namespace dxvk {
     VkShaderModule shaderModule = VK_NULL_HANDLE;
     VK_THROW_IF_FAILED(m_vkd->vkCreateShaderModule(m_vkd->device(), &shaderInfo, nullptr, &shaderModule));
 
+    registerAftermathShader(shaderInfo.pCode, shaderInfo.codeSize, str::format("NRD ", nrdPipelineDesc.shaderFileName));
+
     VkPipelineShaderStageCreateInfo stageInfo;
     stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stageInfo.pNext = nullptr;
@@ -561,19 +566,49 @@ namespace dxvk {
     VkComputePipelineCreateInfo pipeInfo;
     pipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipeInfo.pNext = nullptr;
-    pipeInfo.flags = 0;
+    pipeInfo.flags = RtxPipelineStats::captureFlags();
     pipeInfo.stage = stageInfo;
     pipeInfo.layout = pipelineLayout;
     pipeInfo.basePipelineHandle = VK_NULL_HANDLE;
     pipeInfo.basePipelineIndex = -1;
 
+    // The persisted pipeline cache serves these on later runs. NRD creates them on the frame that first denoises,
+    // so the creation is reported like any pipeline the startup prewarm does not cover.
+    DxvkPipelineCache* cache = device()->getCommon()->pipelineManager().pipelineCache();
+    VkPipelineCreationFeedback feedback = {};
+    VkPipelineCreationFeedbackCreateInfo feedbackInfo = { VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO };
+    feedbackInfo.pPipelineCreationFeedback = &feedback;
+    if (cache->feedbackSupported()) {
+      pipeInfo.pNext = &feedbackInfo;
+    }
+
     VkPipeline result = VK_NULL_HANDLE;
-    const VkResult status = m_vkd->vkCreateComputePipelines(m_vkd->device(), VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &result);
+    const auto createStart = std::chrono::steady_clock::now();
+    VkResult status;
+    {
+      const auto cacheLock = cache->lockForCreate();
+      status = m_vkd->vkCreateComputePipelines(m_vkd->device(), cache->handle(), 1, &pipeInfo, nullptr, &result);
+    }
 
     m_vkd->vkDestroyShaderModule(m_vkd->device(), shaderModule, nullptr);
 
     if (status != VK_SUCCESS) {
       throw DxvkError("Dxvk: Failed to create meta clear compute pipeline");
+    }
+
+    RtxPipelineStats::logCreation(cache, "compute", str::format("nrd_", nrdPipelineDesc.shaderFileName ? nrdPipelineDesc.shaderFileName : "unnamed"),
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStart).count(),
+      (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) == 0 ? -1
+        : (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0 ? 1 : 0,
+      false);
+
+    if (unlikely(pipeInfo.flags & VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR)) {
+      std::string name = str::format("nrd_", nrdPipelineDesc.shaderFileName ? nrdPipelineDesc.shaderFileName : "unnamed");
+      for (char& c : name) {
+        if (c == ' ' || c == '=')
+          c = '_';
+      }
+      RtxPipelineStats::logPipeline(*m_vkd, result, name);
     }
 
     return result;
@@ -785,10 +820,10 @@ namespace dxvk {
 
           descriptorWriteSets.emplace_back(DxvkDescriptor::texture(descriptorSet, &imageDesc[i], *imageView, binding.descriptorType, binding.binding));
 
-          // Create a barrier
+          // The source accesses are the image's tracked ones, so the source stages must be its tracked stages too.
           barriers.accessImage(
             texture->image, imageView->imageSubresources(),
-            imageView->imageInfo().layout, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, imageView->imageInfo().access,
+            imageView->imageInfo().layout, imageView->imageInfo().stages, imageView->imageInfo().access,
             imageView->imageInfo().layout, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             bStorage ? VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_SHADER_READ_BIT);
 

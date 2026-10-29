@@ -24,7 +24,6 @@
 #include "rtx/utility/shader_types.h"
 #include "rtx/pass/volume_args.h"
 #include "rtx/pass/raytrace_args.h"
-#include "rtx/pass/atmosphere/atmosphere_args.h"
 #include "rtx/algorithm/accumulate.h"
 
 #define DENOISER_MODE_OFF 0
@@ -38,8 +37,6 @@ struct CompositeArgs {
   VolumeArgs volumeArgs;
   AccumulationArgs accumulationArgs;
   SparseRenderingArgs sparseRenderingArgs;
-  // Needed for the aerial perspective volume's frustum basis and depth range.
-  AtmosphereArgs atmosphereArgs;
 
   // -- Struct objects should go above this line to preserve alignment --
 
@@ -77,15 +74,15 @@ struct CompositeArgs {
   uint8_t compositeSecondaryCombinedSpecular;
   // The number of active Ray Portals (Used for Ray Portal sampling). Always <= RAY_PORTAL_MAX_COUNT
   uint8_t numActiveRayPortals;
-  uint8_t pad0;
+  // NV-DXVK start: Independent sky fog compatibility control; reuses padding.
+  uint8_t fogApplyToSky;
+  // NV-DXVK end
 
   uint enableSeparatedDenoisers;
   uint frameIdx;
 
-  uint outputSecondarySignalToParticleLayer;
-  uint compositeVolumetricLight;
-  uint outputParticleLayer;
-  uint enableDemodulateAttenuation;
+  vec3 clearColorFinalColor;
+  uint useRayReconstruction;
 
   uint enableStochasticAlphaBlend;
   uint stochasticAlphaBlendEnableFilter;
@@ -107,11 +104,39 @@ struct CompositeArgs {
   uint enhanceAlbedo;
   float skyBrightness;
 
-  vec3 clearColorFinalColor;
-  uint timeSinceStartMS;
-
   float alphaBlendSurfacePackMult; // for packing/unpacking hitT into Float16 in AlphaBlendSurface
   float postFilterThreshold;
   uint writeRayReconstructionHitDistance;
-  float pad1;
+  uint timeSinceStartMS;
+  uint enableDlssNrVolumetricControlMask;
+
+  // The sky provider replaces the rasterized skybox while rtx.skyMode is 1,
+  // and the composite lays its clouds and aerial perspective over the image.
+  uint skyProviderActive;
+  // World units per km of the foreground split (AtmosphereForeground.w). The shader uses
+  // numosKmToWorld(skyArgs) instead, and the host keeps this for layout and diagnostics.
+  float skyWorldUnitsPerKm;
+  // The sky provider's pre-exposure (FrameOutputs::radianceScale), in which its composite works.
+  float skyRadianceScale;
+  // A dome light replaces the sky, so there is no aerial perspective.
+  uint skyHostSkyOverride;
+  // Set when the cloud render ran this frame. An unwritten cloud texture would read as an opaque black cloud.
+  uint skyCloudsValid;
+  // Writes BiasCurrentColorMask with the share of each pixel's radiance from the sky provider's temporally
+  // filtered layer, so the upscaler does not reproject it with surface motion. 0 when no upscaler reads it.
+  uint skyWriteBiasMask;
+  // Keeps the geometry resolver's unordered-emissive bits in the mask. When off, the mask holds the sky layer only.
+  uint skyBiasMaskKeepUnorderedEmissive;
+  // The camera starts inside a medium, such as water (RaytraceArgs::startInMediumMaterialIndex).
+  // The aerial perspective assumes air, so the composite skips it.
+  uint skyCameraInMedium;
+
+  // Replaces the primary depth and screen-space motion vectors with the cloud's where the sky provider's
+  // clouds hide the surface (rtx.numos.cloudMotionVectors). See applyCloudMotionVectors in composite.comp.slang.
+  uint cloudMotionVectors;
+  // The cloud opacity from which the cloud's motion and depth take over (rtx.numos.cloudMotionVectorCoverage).
+  float cloudMotionVectorCoverage;
+  // The depth a primary miss writes (RaytraceArgs::clearColorDepth). Cloud depth never lies beyond it.
+  float cloudMotionVectorMissDepth;
+  uint cloudMotionVectorPad;
 };

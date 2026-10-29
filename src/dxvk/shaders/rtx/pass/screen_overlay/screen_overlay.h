@@ -29,10 +29,22 @@
 
 #define SCREEN_OVERLAY_TILE_SIZE 8
 
+// Overlay RGB is already multiplied by its alpha (a host render target
+// cleared to transparent black and drawn with SrcAlpha/InvSrcAlpha).
+#define SCREEN_OVERLAY_FLAG_PREMULTIPLIED 0x1u
+
 struct ScreenOverlayArgs {
   uint2 imageSize;
   float opacity;
-  float _pad;
+  uint flags;       // SCREEN_OVERLAY_FLAG_*
+  // Destination rectangle as fractions of the output (x, y, width, height).
+  float rectX;
+  float rectY;
+  float rectW;
+  float rectH;
+  // > 0: overlay pixels whose sampled alpha is <= this are dropped (the output
+  // keeps its colour), matching a host-side alpha cutoff. 0 = off.
+  float alphaCutoff;
 };
 
 #endif // SCREEN_OVERLAY_H

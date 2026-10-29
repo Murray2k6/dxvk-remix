@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -19,22 +19,24 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <algorithm>
 #include <assert.h>
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <ppl.h>
 #include <vector>
 
 #include "rtx_context.h"
 #include "rtx_scene_manager.h"
 #include "rtx_instance_manager.h"
+#include "rtx_fork_material_derivation.h"
 #include "rtx_camera_manager.h"
 #include "rtx_options.h"
 #include "rtx_materials.h"
 #include "rtx_ray_portal_manager.h"
 #include "rtx_terrain_baker.h"
 
-#include "../d3d9/d3d9_state.h"
 #include "rtx_matrix_helpers.h"
 #include "dxvk_scoped_annotation.h"
 
@@ -63,7 +65,7 @@ namespace dxvk {
     return dot(cross(x, y), z) < 0;
   }
 
-  static uint32_t determineInstanceFlags(const DrawCallState& drawCall, const RtSurface& surface) {
+  static uint32_t determineInstanceFlags(const SceneDraw& drawCall, const RtSurface& surface) {
     // Determine if the view inverts face winding globally
     const Matrix4 worldToProjection = drawCall.getTransformData().viewToProjection * drawCall.getTransformData().worldToView;
     const bool worldToProjectionMirrored = isMirrorTransform(worldToProjection);
@@ -156,7 +158,7 @@ namespace dxvk {
   namespace {
     template<int RtInstanceSize> struct CheckRtInstanceSize {
       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
-      static_assert(RtInstanceSize == 776, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      static_assert(RtInstanceSize == 824,"RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -164,6 +166,30 @@ namespace dxvk {
 
   void RtInstance::setBlas(BlasEntry& blas) {
     m_linkedBlas = &blas;
+    syncBufferIndicesFromBlas();
+  }
+
+  void RtInstance::syncBufferIndicesFromBlas() {
+    if (m_linkedBlas == nullptr) {
+      return;
+    }
+    const RaytraceGeometry& geo = m_linkedBlas->modifiedGeometryData;
+    surface.positionBufferIndex = geo.positionBufferIndex;
+    surface.positionOffset      = geo.positionBuffer.offsetFromSlice();
+    surface.positionStride      = geo.positionBuffer.stride();
+    surface.normalBufferIndex   = geo.normalBufferIndex;
+    surface.normalOffset        = geo.normalBuffer.offsetFromSlice();
+    surface.normalStride        = geo.normalBuffer.stride();
+    surface.normalFormat        = geo.normalBuffer.vertexFormat();
+    surface.color0BufferIndex   = geo.color0BufferIndex;
+    surface.color0Offset        = geo.color0Buffer.offsetFromSlice();
+    surface.color0Stride        = geo.color0Buffer.stride();
+    surface.texcoordBufferIndex = geo.texcoordBufferIndex;
+    surface.texcoordOffset      = geo.texcoordBuffer.offsetFromSlice();
+    surface.texcoordStride      = geo.texcoordBuffer.stride();
+    surface.previousPositionBufferIndex = geo.previousPositionBufferIndex;
+    surface.indexBufferIndex    = geo.indexBufferIndex;
+    surface.indexStride         = geo.indexBuffer.stride();
   }
 
   void RtInstance::copyInstanceDataFrom(const RtInstance& src) {
@@ -204,7 +230,8 @@ namespace dxvk {
     //   OMM request registration state,
     //   m_primInstanceOwner, buildGeometries, buildRanges,
     //   billboardIndices, indexOffsets, m_blasDirty,
-    //   m_billboardGeometryDirty, m_emitterMotionState
+    //   m_billboardGeometryDirty, m_emitterMotionState,
+    //   m_accelBucketUid, m_retainedPinHandle, m_retainedPinGeneration
   }
 
   void RtInstance::updateFromReference(const RtInstance& src, const bool preserveTransforms) {
@@ -228,10 +255,14 @@ namespace dxvk {
       m_vkInstance.transform = savedVkTransform;
     }
 
+    // Clones are not linked into BlasEntry::m_linkedInstances (see createInstanceCopy), so
+    // updateBufferCache's push never reaches them. Re-derive from the BLAS rather than relying on
+    // the reference instance having been refreshed first.
+    syncBufferIndicesFromBlas();
+
     // Mark dirty so the incremental BLAS cache treats this instance as changed.
     m_blasDirty = true;
     m_billboardGeometryDirty = true;
-
   }
 
   void RtInstance::onTransformChanged() {
@@ -266,12 +297,28 @@ namespace dxvk {
     return memcmp(surface.prevObjectToWorld.data, surface.objectToWorld.data, sizeof(Matrix4)) != 0;
   }
 
+  void RtInstance::shiftOrigin(const Matrix4& objectToWorld, const Matrix4& prevObjectToWorld) {
+    surface.objectToWorld = objectToWorld;
+    surface.normalObjectToWorld = transpose(inverse(Matrix3(surface.objectToWorld)));
+    surface.prevObjectToWorld = prevObjectToWorld;
+    onTransformChanged();
+  }
+
   void RtInstance::teleportWithHistory(const Matrix4& oldToNew) {
     surface.objectToWorld = oldToNew * surface.objectToWorld;
     surface.normalObjectToWorld = transpose(inverse(Matrix3(surface.objectToWorld)));
     surface.prevObjectToWorld = oldToNew * surface.prevObjectToWorld;
     onTransformChanged();
     m_blasDirty = true;
+
+    if (surface.eyeParams) {
+      // eyeParams are baked in world space (see RtEyeParams), so they follow the instance through the
+      // portal too. Assumes oldToNew is rigid (rotation + translation only), true for every caller today.
+      const Matrix3 oldToNewRotation(oldToNew);
+      surface.eyeParams->eyeballOrigin = (oldToNew * Vector4(surface.eyeParams->eyeballOrigin, 1.0f)).xyz();
+      surface.eyeParams->eyeRightU = oldToNewRotation * surface.eyeParams->eyeRightU;
+      surface.eyeParams->eyeUpV = oldToNewRotation * surface.eyeParams->eyeUpV;
+    }
 
     if (m_primInstanceOwner.isRoot(this)) {
       // this is the root of a replacement - need to update the transform history for all the instances in the replacement.
@@ -327,8 +374,11 @@ namespace dxvk {
     return false;
   }
 
+  std::atomic<uint64_t> RtInstance::s_gcMarkCount { 0 };
+
   void RtInstance::markForGarbageCollection() const {
     m_isMarkedForGC = true;
+    s_gcMarkCount.fetch_add(1, std::memory_order_relaxed);
   }
 
 
@@ -351,6 +401,13 @@ namespace dxvk {
 
   bool RtInstance::getCustomIndexBit(uint32_t oneBitMask) const {
     return m_vkInstance.instanceCustomIndex & oneBitMask;
+  }
+
+  bool RtInstance::hiddenByAlphaToggles() const {
+    // The alpha state is tested first so that opaque instances skip the option getters, which lock the option mutex.
+    const RtSurface::AlphaState& alphaState = surface.alphaState;
+    return (alphaState.alphaTestType != AlphaTestType::kAlways && !RtxOptions::enableAlphaTest()) ||
+           (!alphaState.isBlendingDisabled && !RtxOptions::enableAlphaBlend());
   }
 
   bool RtInstance::isOpaque() const {
@@ -400,10 +457,10 @@ namespace dxvk {
       m_linkedBlas->printDebugInfo("(from RtInstance)");
       Logger::warn("=== End BLAS Entry Debug Info ===");
       
-      // Print DrawCallState info
-      Logger::warn("=== DrawCallState Debug Info ===");
+      // Print SceneDraw info
+      Logger::warn("=== SceneDraw Debug Info ===");
       m_linkedBlas->input.printDebugInfo("(from RtInstance)");
-      Logger::warn("=== End DrawCallState Debug Info ===");
+      Logger::warn("=== End SceneDraw Debug Info ===");
     }
     
     // Print RtSurface info
@@ -510,6 +567,54 @@ namespace dxvk {
 #endif
   }
 
+  void InstanceManager::setInstanceHiddenExternally(RtInstance& instance, bool hidden) {
+    if (instance.m_isHidden == hidden) {
+      return;
+    }
+    instance.m_isHidden = hidden;
+    instance.m_blasDirty = true;
+    // Lets the accel manager give geometry that is hidden and shown often its own BLAS
+    // (rtx.ownBlasForToggledInstancesFrames) instead of rebuilding a merged bucket.
+    if (instance.getBlas() != nullptr) {
+      instance.getBlas()->frameLastInstanceToggled = m_device->getCurrentFrameId();
+    }
+    notifySceneChanged();
+  }
+
+  bool InstanceManager::relocateExternally(RtInstance& instance, const Matrix4& objectToWorld, CameraType::Enum cameraType,
+                                           float worldSpaceUiOffset, bool notifyScene, bool* outMoved) {
+    *outMoved = false;
+    const uint32_t frame = m_device->getCurrentFrameId();
+    BlasEntry* blas = instance.getBlas();
+    // Everything updateInstance would derive differently from a plain move goes to the caller's full path:
+    // - already updated this frame (updateInstance would merge / moveAgain instead of move),
+    // - geometry rebuilt this frame (previous positions would feed motion vectors),
+    // - the world-space UI background offset (applied to the transform on the full path),
+    // - a mirroring change (m_isObjectToWorldMirrored feeds the merged-BLAS facing).
+    if (blas == nullptr ||
+        instance.getFrameLastUpdated() == frame ||
+        blas->frameLastUpdated == frame ||
+        (worldSpaceUiOffset != 0.f && instance.testCategoryFlags(InstanceCategories::WorldMatte)) ||
+        isMirrorTransform(objectToWorld) != instance.m_isObjectToWorldMirrored) {
+      return false;
+    }
+
+    instance.setFrameLastUpdated(frame);  // first update this frame: resets the per-frame camera set
+    instance.surface.isPreservePath = false;
+    const bool moved = instance.move(objectToWorld);
+    instance.surface.isStatic = !moved || instance.m_materialType == MaterialDataType::RayPortal;
+    if (moved) {
+      instance.m_blasDirty = true;
+      blas->frameLastInstanceMoved = frame;
+      if (notifyScene) {
+        notifySceneChanged();
+      }
+    }
+    instance.registerCamera(cameraType, frame);
+    *outMoved = moved;
+    return true;
+  }
+
   void InstanceManager::removeEventHandler(void* eventHandlerOwnerAddress) {
     for (auto eventIter = m_eventHandlers.begin(); eventIter != m_eventHandlers.end(); eventIter++) {
       if (eventIter->eventHandlerOwnerAddress == eventHandlerOwnerAddress) {
@@ -585,6 +690,15 @@ namespace dxvk {
 #endif
 
   void InstanceManager::destroyInstanceAllocation(RtInstance* instance) {
+    // The view-model and player-model lists are filled while instances are updated and read after garbage collection,
+    // so an instance updated and then collected in the same frame would be left in them.
+    m_viewModelCandidates.erase(std::remove(m_viewModelCandidates.begin(), m_viewModelCandidates.end(), instance),
+                                m_viewModelCandidates.end());
+    m_playerModelInstances.erase(std::remove(m_playerModelInstances.begin(), m_playerModelInstances.end(), instance),
+                                 m_playerModelInstances.end());
+    if (m_instanceFreedHook) {
+      m_instanceFreedHook(instance);
+    }
 #ifndef NDEBUG
     instance->~RtInstance();
     std::memset(instance, kDestroyedRtInstanceMemoryPattern, sizeof(RtInstance));
@@ -594,10 +708,32 @@ namespace dxvk {
 #endif
   }
 
-  void InstanceManager::garbageCollection() {
+  void InstanceManager::garbageCollection(bool parallelScan) {
+    // rtx.parallelScenePrepScans: the marked instances are found on worker threads (a cache miss per
+    // instance, few marked); the loop below then only reads the flags of the rest. The flags move
+    // with the instances when the loop swap-removes one.
+    std::vector<uint8_t>& marked = m_gcMarkedScratch;
+    const bool useMarkedFlags = parallelScan && m_instances.size() >= 4096;
+    if (useMarkedFlags) {
+      const uint32_t count = uint32_t(m_instances.size());
+      marked.resize(count);
+      constexpr uint32_t kChunk = 1024;
+      concurrency::parallel_for<uint32_t>(0, (count + kChunk - 1) / kChunk, [&](uint32_t chunk) {
+        const uint32_t end = std::min(count, (chunk + 1) * kChunk);
+        for (uint32_t i = chunk * kChunk; i < end; ++i) {
+          marked[i] = m_instances[i]->m_isMarkedForGC ? 1 : 0;
+        }
+      });
+    }
+
     // All instance lifetimes are managed externally: tracked instances are marked
     // for GC by ReplacementInstance::clear(), ephemeral copies are marked on creation.
+    const uint64_t marksBefore = RtInstance::gcMarkCount();
     for (uint32_t i = 0; i < m_instances.size();) {
+      if (useMarkedFlags && marked[i] == 0) {
+        ++i;
+        continue;
+      }
       RtInstance*& pInstance = m_instances[i];
       assert(pInstance != nullptr);
 
@@ -614,9 +750,19 @@ namespace dxvk {
         m_instances[i]->m_instanceVectorId = i;
         destroyInstanceAllocation(m_instances.back());
         m_instances.pop_back();
+        if (useMarkedFlags) {
+          marked[i] = marked.back();
+          marked.pop_back();
+        }
         continue;
       }
       ++i;
+    }
+
+    // Removing an instance can mark others (erasePersistentMapEntries marks a clone whose reference
+    // went away). The flags above predate those marks, so a sequential sweep runs if anything was marked since.
+    if (useMarkedFlags && RtInstance::gcMarkCount() != marksBefore) {
+      garbageCollection(false);
     }
   }
 
@@ -631,7 +777,8 @@ namespace dxvk {
 
   RtInstance* InstanceManager::processSceneObject(
     const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
-    BlasEntry& blas, const DrawCallState& drawCall, const MaterialData& materialData, RtInstance* existingInstance) {
+    BlasEntry& blas, const SceneDraw& drawCall, const MaterialData& materialData, RtInstance* existingInstance,
+    const RtSurface::AlphaState* alphaOverride, const LegacySurfaceDesc* legacyOverride) {
 
     // If no existing instance is provided, this is a genuinely new draw call and we need to create a fresh instance.
     RtInstance* currentInstance = existingInstance;
@@ -650,223 +797,17 @@ namespace dxvk {
       notifySceneChanged();
     }
 
-    updateInstance(*currentInstance, cameraManager, blas, drawCall, &materialData);
+    updateInstance(*currentInstance, cameraManager, blas, drawCall, &materialData, alphaOverride, legacyOverride);
    
     return currentInstance;
   }
 
-  RtSurface::AlphaState InstanceManager::calculateAlphaState(const DrawCallState& drawCall, const MaterialData& materialData) {
-    RtSurface::AlphaState out{};
-
-    // Handle Alpha State for non-Opaque materials
-
-    if (materialData.getType() == MaterialDataType::Translucent) {
-      // Note: Explicitly ensure translucent materials are not considered fully opaque (even though this is the
-      // default in the alpha state).
-      out.isFullyOpaque = false;
-
-      return out;
-    } else if (materialData.getType() != MaterialDataType::Opaque) {
-      return out;
-    }
-
-    // Determine if the Legacy Alpha State should be used based on the material data
-    // Note: The Material Data may be either Legacy or Opaque here, both use the Opaque Surface Material.
-
-    const auto& opaqueMaterialData = materialData.getOpaqueMaterialData();
-
-    const bool useLegacyAlphaState = opaqueMaterialData.getUseLegacyAlphaState();
-
-    // Handle Alpha Test State
-
-    // Note: Even if the Alpha Test enable flag is set, we consider it disabled if the actual test type is set to always.
-    const bool forceCutoutAlphaTest = drawCall.testCategoryFlags(InstanceCategories::AlphaBlendToCutout);
-    const bool forceHairCardAlphaTest = drawCall.testCategoryFlags(InstanceCategories::HairCards);
-    const bool forceAlphaTest = forceCutoutAlphaTest || forceHairCardAlphaTest;
-    const bool legacyAlphaTestEnabled = (AlphaTestType)drawCall.getMaterialData().alphaTestCompareOp != AlphaTestType::kAlways;
-    const bool materialAlphaTestEnabled = opaqueMaterialData.getAlphaTestType() != AlphaTestType::kAlways;
-
-    // Note: Use the Opaque Material Data's alpha test state information directly if requested,
-    // otherwise derive the alpha test state from the drawcall (via its legacy material data).
-    if (forceCutoutAlphaTest) {
-      out.alphaTestType = AlphaTestType::kGreater;
-      out.alphaTestReferenceValue = static_cast<uint8_t>(RtxOptions::forceCutoutAlpha() * 255.0);
-    } else if (forceHairCardAlphaTest) {
-      if (!useLegacyAlphaState && materialAlphaTestEnabled) {
-        out.alphaTestType = opaqueMaterialData.getAlphaTestType();
-        out.alphaTestReferenceValue = opaqueMaterialData.getAlphaTestReferenceValue();
-      } else if (legacyAlphaTestEnabled) {
-        out.alphaTestType = (AlphaTestType)drawCall.getMaterialData().alphaTestCompareOp;
-        out.alphaTestReferenceValue = drawCall.getMaterialData().alphaTestReferenceValue;
-      } else {
-        out.alphaTestType = AlphaTestType::kGreater;
-        out.alphaTestReferenceValue = static_cast<uint8_t>(RtxOptions::forceCutoutAlpha() * 255.0);
-      }
-    } else if (!useLegacyAlphaState) {
-      out.alphaTestType = opaqueMaterialData.getAlphaTestType();
-      out.alphaTestReferenceValue = opaqueMaterialData.getAlphaTestReferenceValue();
-    } else if (legacyAlphaTestEnabled) {
-      out.alphaTestType = (AlphaTestType)drawCall.getMaterialData().alphaTestCompareOp;
-      out.alphaTestReferenceValue = drawCall.getMaterialData().alphaTestReferenceValue;
-    }
-
-    // Handle Alpha Blend State
-
-    bool blendEnabled = false;
-    BlendType blendType = BlendType::kColor;
-    bool invertedBlend = false;
-
-    // Note: Use the Opaque Material Data's blend state information directly if requested,
-    // otherwise derive the alpha blend state from the drawcall (via its legacy material data).
-    if (forceAlphaTest) {
-      blendEnabled = false;
-    } else if (!useLegacyAlphaState) {
-      blendEnabled = opaqueMaterialData.getBlendEnabled();
-      blendType = opaqueMaterialData.getBlendType();
-      invertedBlend = opaqueMaterialData.getInvertedBlend();
-    } else if (drawCall.getMaterialData().blendMode.enableBlending) {
-      const auto srcColorBlendFactor = drawCall.getMaterialData().blendMode.colorSrcFactor;
-      const auto dstColorBlendFactor = drawCall.getMaterialData().blendMode.colorDstFactor;
-      const auto colorBlendOp = drawCall.getMaterialData().blendMode.colorBlendOp;
-
-      blendEnabled = true; // Note: Set to false later for cases which don't need it
-
-      if (colorBlendOp == VkBlendOp::VK_BLEND_OP_ADD) {
-        if (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ZERO) {
-          // Opaque Alias
-          blendEnabled = false;
-        } else if (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_SRC_ALPHA && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA) {
-          // Standard Alpha Blending
-          blendType = BlendType::kAlpha;
-          invertedBlend = false;
-        } else if (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_SRC_ALPHA) {
-          // Inverted Alpha Blending
-          blendType = BlendType::kAlpha;
-          invertedBlend = true;
-        } else if (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_SRC_ALPHA && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE) {
-          // Standard Emissive Alpha Blending
-          blendType = RtxOptions::enableEmissiveBlendModeTranslation() ? BlendType::kAlphaEmissive : BlendType::kAlpha;
-          invertedBlend = false;
-        } else if (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE) {
-          // Inverted Emissive Alpha Blending
-          blendType = RtxOptions::enableEmissiveBlendModeTranslation() ? BlendType::kAlphaEmissive : BlendType::kAlpha;
-          invertedBlend = true;
-        } else if (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_SRC_ALPHA) {
-          // Standard Reverse Emissive Alpha Blending
-          blendType = RtxOptions::enableEmissiveBlendModeTranslation() ? BlendType::kReverseAlphaEmissive : BlendType::kReverseAlpha;
-          invertedBlend = false;
-        } else if (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA) {
-          // Premultiplied Alpha vs Inverted Reverse Emissive Alpha Blending
-          const auto srcAlphaBlendFactor = drawCall.getMaterialData().blendMode.alphaSrcFactor;
-          const auto dstAlphaBlendFactor = drawCall.getMaterialData().blendMode.alphaDstFactor;
-          const auto alphaBlendOp = drawCall.getMaterialData().blendMode.alphaBlendOp;
-          const auto colorWriteMask = drawCall.getMaterialData().blendMode.writeMask;
-          const bool alphaWritesDisabled = (colorWriteMask & VK_COLOR_COMPONENT_A_BIT) == 0;
-
-          const bool looksPremultiplied =
-            (alphaBlendOp == VkBlendOp::VK_BLEND_OP_ADD &&
-             srcAlphaBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE &&
-             dstAlphaBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA) ||
-            alphaWritesDisabled;
-
-          if (looksPremultiplied) {
-            // Premultiplied Alpha (ONE, ONE_MINUS_SRC_ALPHA)
-            blendType = RtxOptions::enableEmissiveBlendModeTranslation() ? BlendType::kAlphaEmissive : BlendType::kAlpha;
-            invertedBlend = false;
-          } else {
-            // Inverted Reverse Emissive Alpha Blending
-            blendType = RtxOptions::enableEmissiveBlendModeTranslation() ? BlendType::kReverseAlphaEmissive : BlendType::kReverseAlpha;
-            invertedBlend = true;
-          }
-        } else if (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_SRC_COLOR && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR) {
-          // Standard Color Blending
-          blendType = BlendType::kColor;
-          invertedBlend = false;
-        } else if (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_SRC_COLOR) {
-          // Inverted Color Blending
-          blendType = BlendType::kColor;
-          invertedBlend = true;
-        } else if (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_SRC_COLOR && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE) {
-          // Standard Emissive Color Blending
-          blendType = RtxOptions::enableEmissiveBlendModeTranslation() ? BlendType::kColorEmissive : BlendType::kColor;
-          invertedBlend = false;
-        } else if (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE) {
-          // Inverted Emissive Color Blending
-          blendType = RtxOptions::enableEmissiveBlendModeTranslation() ? BlendType::kColorEmissive : BlendType::kColor;
-          invertedBlend = true;
-        } else if (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_SRC_COLOR) {
-          // Standard Reverse Emissive Color Blending
-          blendType = RtxOptions::enableEmissiveBlendModeTranslation() ? BlendType::kReverseColorEmissive : BlendType::kReverseColor;
-          invertedBlend = false;
-        } else if (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR) {
-          // Emissive Color Blending: Src + Dst*(1-SrcColor) — bright source is emissive, dark is transparent
-          blendType = RtxOptions::enableEmissiveBlendModeTranslation() ? BlendType::kColorEmissive : BlendType::kColor;
-          invertedBlend = false;
-        } else if (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE) {
-          // Emissive Blending
-          blendType = RtxOptions::enableEmissiveBlendModeTranslation() ? BlendType::kEmissive : BlendType::kColor;
-          invertedBlend = false;
-        } else if (
-          (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_DST_COLOR && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ZERO) ||
-          (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ZERO && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_SRC_COLOR)
-          ) {
-          // Standard Multiplicative Blending
-          blendType = BlendType::kMultiplicative;
-          invertedBlend = false;
-        } else if (srcColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_DST_COLOR && dstColorBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_SRC_COLOR) {
-          // Double Multiplicative Blending
-          blendType = BlendType::kDoubleMultiplicative;
-          invertedBlend = false;
-        } else {
-          blendEnabled = false;
-        }
-      } else {
-        blendEnabled = false;
-      }
-    }
-
-    // Special case for the player model eyes in Portal:
-    // They are rendered with blending enabled but 1.0 is added to alpha from the texture.
-    // Detect this case here and turn such geometry into non-alpha-blended, otherwise
-    // the eyes end up in the unordered TLAS and are not rendered correctly.
-    const auto& drawMaterialData = drawCall.getMaterialData();
-    if (blendEnabled && blendType == BlendType::kAlpha && !invertedBlend &&
-        drawMaterialData.textureAlphaOperation == DxvkRtTextureOperation::Add &&
-        drawMaterialData.textureAlphaArg1Source == RtTextureArgSource::Texture &&
-        drawMaterialData.textureAlphaArg2Source == RtTextureArgSource::TFactor &&
-        (drawMaterialData.tFactor >> 24) == 0xff) {
-      blendEnabled = false;
-    }
-
-    if (blendEnabled) {
-      out.blendType = blendType;
-      out.invertedBlend = invertedBlend;
-      // Note: Emissive blend flag must match which blend types are expected to use emissive override in the shader to appear emissive.
-      out.emissiveBlend = isBlendTypeEmissive(blendType);
-
-      // Handle Particle/Decal Flags
-      // Note: Particles/Decals currently require blending be enabled, be it through the game's original draw call (if legacy alpha state is used),
-      // or through the manually specified alpha state.
-
-      // Note: Particles are differentiated from typical objects with opacity by labeling their source material textures as being particle textures.
-      out.isParticle = drawCall.testCategoryFlags(InstanceCategories::Particle);
-      out.isDecal = drawCall.testCategoryFlags(DECAL_CATEGORY_FLAGS);
-    } else {
-      out.invertedBlend = false;
-      out.emissiveBlend = false;
-    }
-    
-    // Set the fully opaque flag
-    // Note: Fully opaque surfaces can only be signaled when no blending or alpha testing is done as well as no translucency material wise is used.
-    // This is important for signaling when to not use the opacity channel in materials when it is not being used for anything.
-
-    out.isFullyOpaque = !blendEnabled && out.alphaTestType == AlphaTestType::kAlways; // use the blend/test type from the output, rather than legacy for this so replacements can override
-    out.isBlendingDisabled = !blendEnabled;
-
-    return out;
+  RtSurface::AlphaState InstanceManager::calculateAlphaState(const SceneDraw& drawCall, const MaterialData& materialData) {
+    // The derivation is shared with frontends (rtx_fork_material_derivation.h).
+    return deriveAlphaState(FixedFunctionAlphaInput::fromLegacyMaterial(drawCall.getMaterialData()), materialData, drawCall.getCategoryFlags());
   }
 
-  void InstanceManager::mergeInstanceHeuristics(RtInstance& instanceToModify, const DrawCallState& drawCall, const RtSurface::AlphaState& alphaState) const {
+  void InstanceManager::mergeInstanceHeuristics(RtInstance& instanceToModify, const SceneDraw& drawCall, const RtSurface::AlphaState& alphaState) const {
     // "Opaqueness" takes priority!
     if (
       (alphaState.isFullyOpaque || alphaState.alphaTestType == AlphaTestType::kAlways) &&
@@ -922,30 +863,17 @@ namespace dxvk {
     m_instances.push_back(newInstance);
     notifySceneChanged();
 
+    // Renderer-created clones (view model, player model, ray-portal virtual instances) deliberately
+    // skip onInstanceAdded, so BlasEntry::linkInstance is never called for them and
+    // updateBufferCache's propagation will not reach them. Derive the indices straight from the BLAS
+    // instead of trusting the indices copied from the reference instance.
+    newInstance->syncBufferIndicesFromBlas();
+
     return newInstance;
   }
 
-  void InstanceManager::processInstanceBuffers(const BlasEntry& blas, RtInstance& currentInstance) const {
-    currentInstance.surface.positionBufferIndex = blas.modifiedGeometryData.positionBufferIndex;
-    currentInstance.surface.positionOffset = blas.modifiedGeometryData.positionBuffer.offsetFromSlice();
-    currentInstance.surface.positionStride = blas.modifiedGeometryData.positionBuffer.stride();
-    currentInstance.surface.normalBufferIndex = blas.modifiedGeometryData.normalBufferIndex;
-    currentInstance.surface.normalOffset = blas.modifiedGeometryData.normalBuffer.offsetFromSlice();
-    currentInstance.surface.normalStride = blas.modifiedGeometryData.normalBuffer.stride();
-    currentInstance.surface.normalFormat = blas.modifiedGeometryData.normalBuffer.vertexFormat();
-    currentInstance.surface.color0BufferIndex = blas.modifiedGeometryData.color0BufferIndex;
-    currentInstance.surface.color0Offset = blas.modifiedGeometryData.color0Buffer.offsetFromSlice();
-    currentInstance.surface.color0Stride = blas.modifiedGeometryData.color0Buffer.stride();
-    currentInstance.surface.texcoordBufferIndex = blas.modifiedGeometryData.texcoordBufferIndex;
-    currentInstance.surface.texcoordOffset = blas.modifiedGeometryData.texcoordBuffer.offsetFromSlice();
-    currentInstance.surface.texcoordStride = blas.modifiedGeometryData.texcoordBuffer.stride();
-    currentInstance.surface.previousPositionBufferIndex = blas.modifiedGeometryData.previousPositionBufferIndex;
-    currentInstance.surface.indexBufferIndex = blas.modifiedGeometryData.indexBufferIndex;
-    currentInstance.surface.indexStride = blas.modifiedGeometryData.indexBuffer.stride();
-  }
-
   // Returns true if the instance was modified
-  bool InstanceManager::applyDeveloperOptions(RtInstance& currentInstance, const DrawCallState& drawCall) {
+  bool InstanceManager::applyDeveloperOptions(RtInstance& currentInstance, const SceneDraw& drawCall) {
     if (!RtxOptions::enableInstanceDebuggingTools()) {
       return false;
     }
@@ -992,8 +920,10 @@ namespace dxvk {
   void InstanceManager::updateInstance(RtInstance& currentInstance,
                                        const CameraManager& cameraManager,
                                        const BlasEntry& blas,
-                                       const DrawCallState& drawCall,
-                                       const MaterialData* materialData) {
+                                       const SceneDraw& drawCall,
+                                       const MaterialData* materialData,
+                                       const RtSurface::AlphaState* alphaOverride,
+                                       const LegacySurfaceDesc* legacyOverride) {
     const CategoryFlags previousCategoryFlags = currentInstance.m_categoryFlags;
     const uint8_t previousInstanceMask = currentInstance.m_vkInstance.mask;
     const uint32_t previousCustomIndexFlags = currentInstance.m_vkInstance.instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK);
@@ -1007,6 +937,7 @@ namespace dxvk {
 
     currentInstance.m_categoryFlags = drawCall.getCategoryFlags();
     currentInstance.surface.instancesToObject = drawCall.getTransformData().instancesToObject;
+    currentInstance.surface.instancesFromHost = drawCall.getTransformData().instancesFromHost;
 
     // setFrameLastUpdated() must be called first as it resets instance's state on a first call in a frame
     const bool isFirstUpdateThisFrame = currentInstance.setFrameLastUpdated(m_device->getCurrentFrameId());
@@ -1035,7 +966,11 @@ namespace dxvk {
        // Don't overwrite transform from when the instance was seen with the main camera
        !currentInstance.isCameraRegistered(CameraType::Main));
 
-    const RtSurface::AlphaState alphaState = calculateAlphaState(drawCall, *materialData);
+    // A frontend's translated alpha / legacy state when it handed one over, else derived from the draw with the
+    // same functions the translator calls (rtx_fork_material_derivation.h).
+    const RtSurface::AlphaState alphaState = alphaOverride != nullptr ? *alphaOverride : calculateAlphaState(drawCall, *materialData);
+    const LegacySurfaceDesc legacySurface = legacyOverride != nullptr ? *legacyOverride
+      : deriveLegacySurface(drawCall.getMaterialData(), drawCall.getTransformData());
     bool hasTransformChanged = false;
     bool hasPreviousPositions = false;
 
@@ -1044,12 +979,13 @@ namespace dxvk {
       mergeInstanceHeuristics(currentInstance, drawCall, alphaState);
     }
     
+    // A material override below points materialData here, and preserveInstance() reads it at the end of this function.
+    MaterialData tmpMaterialData;
+
     // Updates done only once a frame unless overriden due to an explicit state
     if (isFirstUpdateThisFrame || overridePreviousCameraUpdate) {
 
       if (isFirstUpdateThisFrame) {
-        processInstanceBuffers(blas, currentInstance);
-
         currentInstance.m_materialType = materialData->getType();
 
         const XXH64_hash_t materialInstanceHash = materialData->getHash();
@@ -1067,24 +1003,20 @@ namespace dxvk {
         // Surface meta data
         currentInstance.surface.isEmissive = false;
         currentInstance.surface.isMatte = false;
-        currentInstance.surface.textureColorArg1Source = drawCall.getMaterialData().textureColorArg1Source;
-        currentInstance.surface.textureColorArg2Source = drawCall.getMaterialData().textureColorArg2Source;
-        currentInstance.surface.textureColorOperation = drawCall.getMaterialData().textureColorOperation;
-        currentInstance.surface.textureAlphaArg1Source = drawCall.getMaterialData().textureAlphaArg1Source;
-        currentInstance.surface.textureAlphaArg2Source = drawCall.getMaterialData().textureAlphaArg2Source;
-        currentInstance.surface.textureAlphaOperation = drawCall.getMaterialData().textureAlphaOperation;
-        currentInstance.surface.texgenMode = drawCall.getTransformData().texgenMode; // NOTE: Make it material data...
-        currentInstance.surface.tFactor = drawCall.getMaterialData().tFactor;
+        currentInstance.surface.textureColorArg1Source = legacySurface.textureColorArg1Source;
+        currentInstance.surface.textureColorArg2Source = legacySurface.textureColorArg2Source;
+        currentInstance.surface.textureColorOperation = legacySurface.textureColorOperation;
+        currentInstance.surface.textureAlphaArg1Source = legacySurface.textureAlphaArg1Source;
+        currentInstance.surface.textureAlphaArg2Source = legacySurface.textureAlphaArg2Source;
+        currentInstance.surface.textureAlphaOperation = legacySurface.textureAlphaOperation;
+        currentInstance.surface.texgenMode = legacySurface.texgenMode; // NOTE: Make it material data...
+        currentInstance.surface.tFactor = legacySurface.tFactor;
         currentInstance.surface.alphaState = alphaState;
         currentInstance.surface.isAnimatedWater = currentInstance.testCategoryFlags(InstanceCategories::AnimatedWater);
-        // Surface::isDecalCategory (fork — 2026-06-18) removed 2026-06-19 with the
-        // cloud-shadow zenith gate that consumed it; the cloud shadow now folds
-        // onto the sun term in the NEE and needs no per-surface geometry test.
         currentInstance.surface.associatedGeometryHash = drawCall.getHash(RtxOptions::geometryAssetHashRule());
-        currentInstance.surface.isTextureFactorBlend = drawCall.getMaterialData().isTextureFactorBlend;
-        currentInstance.surface.isVertexColorBakedLighting = drawCall.getMaterialData().isVertexColorBakedLighting;
+        currentInstance.surface.isTextureFactorBlend = legacySurface.isTextureFactorBlend;
+        currentInstance.surface.isVertexColorBakedLighting = legacySurface.isVertexColorBakedLighting;
         currentInstance.surface.isMotionBlurMaskOut = currentInstance.testCategoryFlags(InstanceCategories::IgnoreMotionBlur);
-        currentInstance.surface.ignoreTransparencyLayer = currentInstance.testCategoryFlags(InstanceCategories::IgnoreTransparencyLayer);
 
         // Note: Skip the spritesheet adjustment logic in the surface interaction when using Ray Portal materials as this logic
         // is done later in the Surface Material Interaction (and doing it in both places will just double up the animation).
@@ -1092,22 +1024,9 @@ namespace dxvk {
 
         currentInstance.surface.blendModeState = drawCall.getMaterialData().blendMode;
 
-        if (drawCall.isEye()) {
-          // assume that the texture transform has eye parameters encoded
-          const Matrix4& texTransform = drawCall.getTransformData().textureTransform;
-          RtEyeParams eyeParams{};
-          eyeParams.eyeballOrigin = Vector3{ texTransform.data[0].w, texTransform.data[1].w, texTransform.data[2].w };
-          eyeParams.eyeRightU = Vector3{ texTransform.data[0].x, texTransform.data[1].x, texTransform.data[2].x };
-          eyeParams.eyeUpV = Vector3{ texTransform.data[0].y, texTransform.data[1].y, texTransform.data[2].y };
-          currentInstance.surface.eyeParams = eyeParams;
-        }
-
         materialData->getSpriteSheetData(currentInstance.surface.spriteSheetRows, currentInstance.surface.spriteSheetCols, currentInstance.surface.spriteSheetFPS);
         currentInstance.m_isAnimated = currentInstance.surface.spriteSheetFPS != 0;
         currentInstance.surface.objectPickingValue = drawCall.drawCallID;
-
-        // Temp storage for the case we need to patch the material data
-        MaterialData tmpMaterialData;
 
         if (materialData->getType() == MaterialDataType::Opaque)
         {
@@ -1126,13 +1045,65 @@ namespace dxvk {
             tmpMaterialData = *materialData;
             materialData = &tmpMaterialData;
             // If the user has decided to override the legacy alpha state, assume they know what they are doing and allow for explicit emission controls.
+            // With rtx.emissiveBlendOverrideScaleByMaterial, a material that enables emission scales the override by its own intensity.
+            float overrideIntensity = RtxOptions::emissiveBlendOverrideEmissiveIntensity();
+            if (RtxOptions::emissiveBlendOverrideScaleByMaterial() &&
+                tmpMaterialData.getOpaqueMaterialData().getEnableEmission() &&
+                tmpMaterialData.getOpaqueMaterialData().getEmissiveIntensity() > 0.f) {
+              overrideIntensity *= tmpMaterialData.getOpaqueMaterialData().getEmissiveIntensity();
+            }
             tmpMaterialData.getOpaqueMaterialData().setEnableEmission(true);
-            tmpMaterialData.getOpaqueMaterialData().setEmissiveIntensity(RtxOptions::emissiveBlendOverrideEmissiveIntensity());
+            tmpMaterialData.getOpaqueMaterialData().setEmissiveIntensity(overrideIntensity);
             tmpMaterialData.getOpaqueMaterialData().setEmissiveColorTexture(tmpMaterialData.getOpaqueMaterialData().getAlbedoOpacityTexture());
           }
 
           currentInstance.m_isSubsurface = materialData->getOpaqueMaterialData().getSubsurfaceDiffusionProfile();
         }
+      }
+
+      if (drawCall.isEye()) {
+        // Re-derived on every draw call this frame, since the game recomputes this data per eye pose.
+        //
+        // texTransform is the D3D9 texture-stage transform matrix, repurposed by the game as a vessel
+        // to smuggle out eye data unrelated to any real texture transform (see SceneDraw::isEye()
+        // for how this gets detected). Laid out row-major (texTransform.data[row], row 0-3; each row's
+        // .x/.y/.z/.w are its 4 columns), the rows/columns mean:
+        //  - data[0..2].x: eyeRightU, a world-space "right" basis direction for the eye's flat UV
+        //    projection (see eye.slangh). Unnormalized; magnitude is inversely related to iris size.
+        //  - data[0..2].y: eyeUpV, the corresponding "up" basis direction.
+        //  - data[0..2].z: always (0, 0, 1) - fixed padding with no eye data, never used.
+        //  - data[0..2].w: the game's own eye-origin field, expressed in this instance's local/bone
+        //    space rather than world space.
+        //  - data[3] (the whole last row): (u0, v0, 0, 1), the plane-equation constants pinning down
+        //    where the eye center (UV 0.5, 0.5) lies along eyeRightU/eyeUpV: dot(origin, eyeRightU) =
+        //    0.5 - u0, dot(origin, eyeUpV) = 0.5 - v0. This determines the eye center's position within
+        //    the eyeRightU/eyeUpV plane, but not along their shared normal (eyeAxis below); eyeCalcNormalFrame
+        //    (eye.slangh) only needs the former.
+        const Matrix4& texTransform = drawCall.getTransformData().textureTransform;
+
+        const Vector3 eyeRightU = Vector3{ texTransform.data[0].x, texTransform.data[1].x, texTransform.data[2].x };
+        const Vector3 eyeUpV = Vector3{ texTransform.data[0].y, texTransform.data[1].y, texTransform.data[2].y };
+        const Vector3 eyeAxis = cross(eyeRightU, eyeUpV);
+
+        // Guard against a degenerate (zero or parallel) basis, which would otherwise divide by zero below.
+        constexpr float kMinEyeBasisAreaSqr = 1e-8f;
+        if (lengthSqr(eyeAxis) > kMinEyeBasisAreaSqr) {
+          const Vector3 eyeAxisNormalized = eyeAxis / length(eyeAxis);
+
+          // Third component (eyeballOrigin's depth along eyeAxis) is arbitrary; see the layout comment above.
+          const Vector3 planeConstants = Vector3{ 0.5f - texTransform.data[3].x, 0.5f - texTransform.data[3].y, 0.0f };
+          const Matrix3 basis(eyeRightU, eyeUpV, eyeAxisNormalized);
+
+          RtEyeParams eyeParams{};
+          eyeParams.eyeballOrigin = transpose(inverse(basis)) * planeConstants;
+          eyeParams.eyeRightU = eyeRightU;
+          eyeParams.eyeUpV = eyeUpV;
+          currentInstance.surface.eyeParams = eyeParams;
+        } else {
+          currentInstance.surface.eyeParams.reset();
+        }
+      } else {
+        currentInstance.surface.eyeParams.reset();
       }
 
       // Update transform
@@ -1142,7 +1113,14 @@ namespace dxvk {
                                    || currentInstance.testCategoryFlags(InstanceCategories::Particle)
                                    || currentInstance.testCategoryFlags(InstanceCategories::WorldUI);
 
-        hasPreviousPositions = blas.modifiedGeometryData.previousPositionBuffer.defined() && !isMotionUnstable;
+        // previousPositionBuffer is only re-pointed at historyBuffer[1] by processGeometryInfo on a
+        // kUpdateBVH frame. On any later frame it still holds that older slice - e.g. a preserved
+        // BLAS, or the kUpdateInstance early-out in onSceneObjectUpdated when a sibling draw already
+        // touched this BlasEntry. Gate on frameLastUpdated so stale vertices never feed motion vectors.
+        const bool previousPositionsValidThisFrame = blas.frameLastUpdated == m_device->getCurrentFrameId();
+        hasPreviousPositions = previousPositionsValidThisFrame
+                            && blas.modifiedGeometryData.previousPositionBuffer.defined()
+                            && !isMotionUnstable;
         const bool isFirstUpdateAfterCreation = currentInstance.isCreatedThisFrame(m_device->getCurrentFrameId()) && isFirstUpdateThisFrame;
 
         // Note: objectToView is aliased on updates, since findSimilarInstance() doesn't discern it
@@ -1168,14 +1146,19 @@ namespace dxvk {
         if (hasTransformChanged) {
           notifySceneChanged();
           currentInstance.m_blasDirty = true;
+          // Lets the accel manager give recently moved geometry its own BLAS
+          // (rtx.ownBlasForMovedInstancesFrames) instead of rebuilding a merged bucket.
+          if (currentInstance.getBlas() != nullptr) {
+            currentInstance.getBlas()->frameLastInstanceMoved = m_device->getCurrentFrameId();
+          }
         }
 
-        currentInstance.surface.textureTransform = drawCall.getTransformData().textureTransform;
+        currentInstance.surface.textureTransform = legacySurface.textureTransform;
 
         currentInstance.surface.isStatic = !(hasTransformChanged || hasPreviousPositions) || currentInstance.m_materialType == MaterialDataType::RayPortal;
 
-        currentInstance.surface.isClipPlaneEnabled = drawCall.getTransformData().enableClipPlane;
-        currentInstance.surface.clipPlane = drawCall.getTransformData().clipPlane;
+        currentInstance.surface.isClipPlaneEnabled = legacySurface.enableClipPlane;
+        currentInstance.surface.clipPlane = legacySurface.clipPlane;
 
         // Apply developer options
         if (isFirstUpdateThisFrame)
@@ -1285,6 +1268,12 @@ namespace dxvk {
         }
       }
 
+      // API hosts have no draw that the D3D9 alpha test / blend skip could drop, so the instance is hidden instead.
+      // Every API lane builds its instances here, and a change of either option sends preserved instances back here for a frame.
+      if (!currentInstance.m_isHidden && currentInstance.hiddenByAlphaToggles()) {
+        currentInstance.m_isHidden = true;
+      }
+
       if (currentInstance.m_isHidden)
         mask = 0;
 
@@ -1303,6 +1292,18 @@ namespace dxvk {
                                      drawCall.cameraType,
                                      cameraManager.getMainCamera().getDirection(false));
     const bool billboardsGotGenerated = currentInstance.m_billboardCount != 0;
+
+    // An API host hands over a newly allocated transform list for a GPU-instanced draw every frame, so the
+    // contents are compared, not the pointers. On a match the previous list is kept, so everything downstream
+    // sees a stable pointer and the scene generation and BLAS-dirty flag stay put.
+    if (previousInstancesToObject != nullptr &&
+        currentInstance.surface.instancesToObject != nullptr &&
+        previousInstancesToObject != currentInstance.surface.instancesToObject &&
+        previousInstancesToObject->size() == currentInstance.surface.instancesToObject->size() &&
+        std::memcmp(previousInstancesToObject->data(), currentInstance.surface.instancesToObject->data(),
+                    previousInstancesToObject->size() * sizeof(Matrix4)) == 0) {
+      currentInstance.surface.instancesToObject = previousInstancesToObject;
+    }
 
     const auto currentInstancesToObject = currentInstance.surface.instancesToObject;
     const size_t currentInstancesToObjectSize = currentInstancesToObject ? currentInstancesToObject->size() : 0;
@@ -1355,22 +1356,39 @@ namespace dxvk {
     m_playerModelInstances.push_back(&instance);
   }
 
+  bool InstanceManager::hasTranslucentDynamicInstance(uint32_t frameId) const {
+    // Conservative: a stale player-model list (onFrameEnd skipped) still counts.
+    for (const RtInstance* instance : m_playerModelInstances) {
+      if (instance->getMaterialType() == MaterialDataType::Translucent) {
+        return true;
+      }
+    }
+    for (const auto& viewModels : { &m_persistentViewModelInstances, &m_persistentVirtualViewModelInstances }) {
+      for (const auto& [reference, instance] : *viewModels) {
+        if (instance->getFrameLastUpdated() == frameId && instance->getMaterialType() == MaterialDataType::Translucent) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   void InstanceManager::preserveInstance(
       RtInstance& instance,
-      const DrawCallState& drawCall,
+      const SceneDraw& drawCall,
       const MaterialData* materialData,
       bool hasTransformChanged,
       bool hasPreviousPositions,
       bool isFirstUpdateThisFrame,
       bool fireEvents) {
-    // Camera registration. Idempotent (RtInstance::m_seenCameraTypes is cumulative and never
-    // cleared), so calling it from updateInstance and again here is harmless. We need it on
-    // the preserve path because that path bypasses updateInstance entirely.
-    instance.registerCamera(drawCall.cameraType, m_device->getCurrentFrameId());
+    // Camera registration. This is per-instance, so this detects the first time an instance
+    // is drawn with a given camera each frame.
+    const bool isNewCameraTypeThisFrame =
+        instance.registerCamera(drawCall.cameraType, m_device->getCurrentFrameId());
 
     // Re-register view-model candidates every frame; m_viewModelCandidates is cleared in
     // onFrameEnd, and createViewModelInstances() iterates the list later in the frame.
-    if (drawCall.cameraType == CameraType::ViewModel && !instance.isHidden() && isFirstUpdateThisFrame) {
+    if (drawCall.cameraType == CameraType::ViewModel && !instance.isHidden() && isNewCameraTypeThisFrame) {
       registerViewModelCandidate(instance);
     }
 
@@ -1477,6 +1495,15 @@ namespace dxvk {
       }
     }
 
+    // The copy is never static, so it cannot drop stale previous positions through isStatic as the reference instance does.
+    // Without a geometry update this frame, the previous-position slice holds positions from two updates ago.
+    if (RtxOptions::ViewModel::gatePreviousPositions()) {
+      const BlasEntry* viewModelBlas = viewModelInstance->getBlas();
+      if (viewModelBlas == nullptr || viewModelBlas->frameLastUpdated != frameId) {
+        viewModelInstance->surface.previousPositionBufferIndex = kSurfaceInvalidBufferIndex;
+      }
+    }
+
     // ViewModel should never be considered static
     viewModelInstance->surface.isStatic = false;
     viewModelInstance->surface.isPreservePath = false;
@@ -1552,11 +1579,11 @@ namespace dxvk {
     std::unordered_set<RtInstance*> activeViewModelReferences;
     for (auto* candidateInstance : m_viewModelCandidates) {
 
-      // Valid view model instances must be associated only with the view model camera
-      // Check: exactly one bit set (power-of-two check via raw bitmask)
-      const auto seenMask = candidateInstance->m_seenCameraTypes.raw();
-      if (seenMask == 0 || (seenMask & (seenMask - 1)) != 0)
+      // A valid view-model reference must have been drawn with the view-model camera this
+      // frame.
+      if (!candidateInstance->isCameraRegistered(CameraType::ViewModel)) {
         continue;
+      }
 
       // Hide the reference instance since we'll create a separate instance for the view model 
       candidateInstance->m_vkInstance.mask = 0;
@@ -2068,10 +2095,12 @@ namespace dxvk {
     // intentionally clear bits from the mask (for player-model particles the mask ends up
     // at 0), so re-checking mask on the next frame would skip the very instances that
     // still need their billboards re-populated on the preserve path.
-    if (!(RtxOptions::enableSeparateUnorderedApproximations() &&
+    // The instance flags are tested before the option: the getter locks the global option mutex,
+    // and this runs for every preserved instance every frame, nearly all of them not unordered.
+    if (!(currentInstance.m_isUnordered &&
+          !currentInstance.m_isHidden &&
           (cameraType == CameraType::Main || cameraType == CameraType::ViewModel) &&
-          currentInstance.m_isUnordered &&
-          !currentInstance.m_isHidden)) {
+          RtxOptions::enableSeparateUnorderedApproximations())) {
       return;
     }
 

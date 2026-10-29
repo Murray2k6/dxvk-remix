@@ -22,11 +22,13 @@
 #include <locale>
 #include <codecvt>
 #include <cassert>
+#include <cfloat>
 #include <cmath>
 #include <filesystem>
 #include <Shlwapi.h>
 
 #include "rtx.h"
+#include "rtx_pre_exposure.h"
 #include "rtx_context.h"
 #include "rtx_options.h"
 #include "dxvk_device.h"
@@ -40,6 +42,7 @@
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx_imgui.h"
 #include "rtx_auto_exposure.h"
+#include "rtx_matrix_helpers.h"
 #include "../../util/util_math.h"
 #include "../util/util_string.h"
 #include "../util/log/log.h"
@@ -48,57 +51,30 @@
 
 namespace dxvk {
 
-  // Convert VkFormat to FFX API surface format
-  static FfxApiSurfaceFormat vkFormatToFfxFormat(VkFormat format) {
-    switch (format) {
-    case VK_FORMAT_R32G32B32A32_SFLOAT:
-      return FFX_API_SURFACE_FORMAT_R32G32B32A32_FLOAT;
-    case VK_FORMAT_R16G16B16A16_SFLOAT:
-      return FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT;
-    case VK_FORMAT_R32G32_SFLOAT:
-      return FFX_API_SURFACE_FORMAT_R32G32_FLOAT;
-    case VK_FORMAT_R8_UNORM:
-      return FFX_API_SURFACE_FORMAT_R8_UNORM;
-    case VK_FORMAT_R32_UINT:
-      return FFX_API_SURFACE_FORMAT_R32_UINT;
-    case VK_FORMAT_R8G8B8A8_UNORM:
-      return FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
-    case VK_FORMAT_B8G8R8A8_UNORM:
-      return FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM; // Treat as same for FFX
-    case VK_FORMAT_R8G8B8A8_SRGB:
-      return FFX_API_SURFACE_FORMAT_R8G8B8A8_SRGB;
-    case VK_FORMAT_B8G8R8A8_SRGB:
-      return FFX_API_SURFACE_FORMAT_R8G8B8A8_SRGB; // Treat as same for FFX
-    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
-      return FFX_API_SURFACE_FORMAT_R11G11B10_FLOAT;
-    case VK_FORMAT_R16G16_SFLOAT:
-      return FFX_API_SURFACE_FORMAT_R16G16_FLOAT;
-    case VK_FORMAT_R16G16_UINT:
-      return FFX_API_SURFACE_FORMAT_R16G16_UINT;
-    case VK_FORMAT_R16_SFLOAT:
-      return FFX_API_SURFACE_FORMAT_R16_FLOAT;
-    case VK_FORMAT_R16_UINT:
-      return FFX_API_SURFACE_FORMAT_R16_UINT;
-    case VK_FORMAT_R16_UNORM:
-      return FFX_API_SURFACE_FORMAT_R16_UNORM;
-    case VK_FORMAT_R16_SNORM:
-      return FFX_API_SURFACE_FORMAT_R16_SNORM;
-    case VK_FORMAT_R8_UINT:
-      return FFX_API_SURFACE_FORMAT_R8_UINT;
-    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
-      return FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM;
-    case VK_FORMAT_R32_SFLOAT:
-      return FFX_API_SURFACE_FORMAT_R32_FLOAT;
-    case VK_FORMAT_D32_SFLOAT:
-      return FFX_API_SURFACE_FORMAT_R32_FLOAT; // Depth as R32_FLOAT for FFX
-    case VK_FORMAT_D32_SFLOAT_S8_UINT:
-      return FFX_API_SURFACE_FORMAT_R32_FLOAT; // Depth portion
-    case VK_FORMAT_D24_UNORM_S8_UINT:
-      return FFX_API_SURFACE_FORMAT_R32_FLOAT; // Approximate as R32
-    default:
-      Logger::warn(str::format("FSR3: Unknown VkFormat for FFX conversion: ", static_cast<uint32_t>(format), ", defaulting to R8G8B8A8_UNORM"));
-      return FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
-    }
+  namespace {
+    // Remix render targets live in VK_IMAGE_LAYOUT_GENERAL, which is FFX's UNORDERED_ACCESS state.
+    // FFX transitions registered resources from this state and back after the dispatch.
+    constexpr uint32_t kRemixImageState = FFX_API_RESOURCE_STATE_UNORDERED_ACCESS;
+
+    // A far plane this many times the near plane is treated as infinite.
+    constexpr float kInfiniteFarRatio = 1.0e6f;
+
+    constexpr uint64_t kLogIntervalDispatches = 600;
+  }
+
+  FfxDepthConvention getFfxDepthConvention(const RtCamera& camera) {
+    DecomposeProjectionParams projection;
+    decomposeProjection(camera.getViewToProjectionf(), projection);
+
+    FfxDepthConvention convention;
+    convention.inverted = projection.isReverseZ;
+    const float nearPlane = std::min(std::fabs(projection.nearPlane), std::fabs(projection.farPlane));
+    const float farPlane = std::max(std::fabs(projection.nearPlane), std::fabs(projection.farPlane));
+    convention.cameraNear = nearPlane > 0.0f && std::isfinite(nearPlane) ? nearPlane : camera.getNearPlane();
+    convention.infinite = !std::isfinite(farPlane) || farPlane >= convention.cameraNear * kInfiniteFarRatio;
+    convention.cameraFar = convention.infinite ? FLT_MAX : farPlane;
+    convention.viewSpaceToMeters = 1.0f / RtxOptions::getMeterToWorldUnitScale();
+    return convention;
   }
 
   const char* fsrPresetToString(FSRPreset preset) {
@@ -123,7 +99,6 @@ namespace dxvk {
       m_targetExtent{0, 0, 0},
       m_inputSize{0, 0},
       m_fsrOutputSize{0, 0},
-      m_jitterIndex(0),
       m_hFFX(nullptr) {
   }
 
@@ -169,19 +144,6 @@ namespace dxvk {
     } else {
       return getUpscaleFactor(FSROptions::preset());
     }
-  }
-
-  float DxvkFSR::calcRecommendedMipBias() const {
-    // FSR formula: -log2(upscale_factor)
-    float upscaleFactor = calcUpscaleFactor();
-    return -std::log2(upscaleFactor);
-  }
-
-  uint32_t DxvkFSR::calcRecommendedJitterSequenceLength() const {
-    // FSR3 recommendation: use standard Halton sequence length based on upscale ratio
-    const float upscaleFactor = calcUpscaleFactor();
-    uint32_t recommendedLength = static_cast<uint32_t>(std::ceil(upscaleFactor * upscaleFactor * 8.0f));
-    return std::clamp(recommendedLength, 8u, 64u);
   }
 
   VkExtent3D DxvkFSR::getInputSize(const VkExtent3D& targetExtent) const {
@@ -256,7 +218,7 @@ namespace dxvk {
                               " preset=", fsrPresetToString(actualPreset)));
   }
 
-  void DxvkFSR::createFSRContext(const VkExtent3D& targetExtent) {
+  void DxvkFSR::createFSRContext(const VkExtent3D& targetExtent, const FfxDepthConvention& depthConvention) {
     ScopedCpuProfileZone();
     
     if (m_upscalingContext) {
@@ -276,18 +238,15 @@ namespace dxvk {
     ffx::CreateContextDescUpscale createDesc{};
     createDesc.maxUpscaleSize = { targetExtent.width, targetExtent.height };
     createDesc.maxRenderSize = { targetExtent.width, targetExtent.height };
-    createDesc.flags = 0;
-    
-    if (FSROptions::useAutoExposure()) {
-      createDesc.flags |= FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    // The input is the linear HDR composite, as for DLSS and XeSS. The exposure comes in through the
+    // pre-exposure value in dispatch(), so FSR's own auto exposure stays off.
+    createDesc.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE;
+    if (depthConvention.inverted) {
+      createDesc.flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
     }
-    
-    if (FSROptions::enableHDR()) {
-      createDesc.flags |= FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE;
+    if (depthConvention.infinite) {
+      createDesc.flags |= FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
     }
-    
-    // Assume inverted infinite depth (common in modern renderers)
-    createDesc.flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED | FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
 
     ffx::ReturnCode retCode = ffx::CreateContext(m_upscalingContext, nullptr, createDesc, backendDesc);
     
@@ -299,9 +258,10 @@ namespace dxvk {
     }
 
     m_initialized = true;
-    m_jitterIndex = 0;
-    
-    Logger::info(str::format("FSR3: Created context ", targetExtent.width, "x", targetExtent.height));
+    m_contextDepth = depthConvention;
+
+    Logger::info(str::format("[FSR] context created: display=", targetExtent.width, "x", targetExtent.height,
+      " depthInverted=", depthConvention.inverted, " depthInfinite=", depthConvention.infinite, " hdr=1"));
   }
 
   void DxvkFSR::destroyFSRContext() {
@@ -310,10 +270,6 @@ namespace dxvk {
       m_upscalingContext = nullptr;
     }
     m_initialized = false;
-  }
-
-  void DxvkFSR::initialize(Rc<DxvkContext> renderContext, const VkExtent3D& targetExtent) {
-    createFSRContext(targetExtent);
   }
 
   void DxvkFSR::dispatch(
@@ -339,6 +295,13 @@ namespace dxvk {
       return;
     }
 
+    // The depth convention is fixed at context creation.
+    const FfxDepthConvention depthConvention = getFfxDepthConvention(camera);
+    if (m_initialized &&
+        (depthConvention.inverted != m_contextDepth.inverted || depthConvention.infinite != m_contextDepth.infinite)) {
+      m_recreate = true;
+    }
+
     // Initialize FSR if needed
     if (m_recreate || !m_initialized) {
       VkExtent3D targetExtent;
@@ -355,8 +318,9 @@ namespace dxvk {
           1
         };
       }
-      initialize(renderContext, targetExtent);
+      createFSRContext(targetExtent, depthConvention);
       m_recreate = false;
+      resetHistory = true;
     }
 
     if (!m_initialized || !m_upscalingContext) {
@@ -377,56 +341,45 @@ namespace dxvk {
     auto motionView = rtOutput.m_primaryScreenSpaceMotionVector.view;
     auto depthView = rtOutput.m_primaryDepth.view;
     auto outputView = rtOutput.m_finalOutput.view(Resources::AccessType::Write);
+    // NUMOS's clouds and aerial perspective (already temporally filtered, moving with the wind rather
+    // than the motion vectors), as the share of each pixel FSR should take from this frame: the
+    // composite's bias mask (RtxNumos::writesUpscalerBiasMask).
+    Rc<DxvkImageView> reactiveView;
+    if (device()->getCommon()->metaNumos().writesUpscalerBiasMask()) {
+      reactiveView = rtOutput.m_sharedBiasCurrentColorMask.view(Resources::AccessType::Read);
+    }
 
-    // Input barriers
-    barriers.accessImage(
-      colorView->image(),
-      colorView->imageSubresources(),
-      colorView->imageInfo().layout,
-      colorView->imageInfo().stages,
-      colorView->imageInfo().access,
-      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_ACCESS_SHADER_READ_BIT);
+    // The inputs and the output stay in their layout. FFX is told that layout and returns them to it.
+    for (const Rc<DxvkImageView>& input : { colorView, motionView, depthView, reactiveView }) {
+      if (input == nullptr) {
+        continue;
+      }
+      barriers.accessImage(
+        input->image(),
+        input->imageSubresources(),
+        input->imageInfo().layout,
+        input->imageInfo().stages,
+        input->imageInfo().access,
+        input->imageInfo().layout,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_READ_BIT);
+    }
 
-    barriers.accessImage(
-      motionView->image(),
-      motionView->imageSubresources(),
-      motionView->imageInfo().layout,
-      motionView->imageInfo().stages,
-      motionView->imageInfo().access,
-      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_ACCESS_SHADER_READ_BIT);
-
-    barriers.accessImage(
-      depthView->image(),
-      depthView->imageSubresources(),
-      depthView->imageInfo().layout,
-      depthView->imageInfo().stages,
-      depthView->imageInfo().access,
-      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_ACCESS_SHADER_READ_BIT);
-
-    // Output barrier
     barriers.accessImage(
       outputView->image(),
       outputView->imageSubresources(),
       outputView->imageInfo().layout,
       outputView->imageInfo().stages,
       outputView->imageInfo().access,
-      VK_IMAGE_LAYOUT_GENERAL,
+      outputView->imageInfo().layout,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
       VK_ACCESS_SHADER_WRITE_BIT);
 
     barriers.recordCommands(renderContext->getCommandList());
 
-    // Get jitter from camera
+    // The pixel jitter applied to the projection, the same value DLSS and XeSS get.
     float jitterOffset[2];
     camera.getJittering(jitterOffset);
-    m_jitterX = jitterOffset[0];
-    m_jitterY = jitterOffset[1];
 
     // Get resolution info
     uint32_t renderWidth = m_inputSize.width > 0 ? m_inputSize.width : rtOutput.m_compositeOutputExtent.width;
@@ -435,6 +388,8 @@ namespace dxvk {
     uint32_t displayHeight = m_fsrOutputSize.height > 0 ? m_fsrOutputSize.height : outputView->imageInfo().extent.height;
 
     // Helper function to create FFX resource from Vulkan image using SDK helper
+    // The depth input is an R32_SFLOAT color image. FFX's depth-target usage would make it create a D32_SFLOAT view
+    // with the depth aspect, so every input is described as a read-only color texture.
     auto createFfxResource = [](Rc<DxvkImageView> view, uint32_t state, uint32_t additionalUsages = FFX_API_RESOURCE_USAGE_READ_ONLY) -> FfxApiResource {
       // Build a VkImageCreateInfo from the image info for the SDK helper
       VkImageCreateInfo createInfo = {};
@@ -460,19 +415,19 @@ namespace dxvk {
     // Set up FSR dispatch parameters
     ffx::DispatchDescUpscale dispatchDesc{};
     dispatchDesc.commandList = renderContext->getCommandList()->getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
-    dispatchDesc.color = createFfxResource(colorView, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY);
-    dispatchDesc.depth = createFfxResource(depthView, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ, FFX_API_RESOURCE_USAGE_DEPTHTARGET);
-    dispatchDesc.motionVectors = createFfxResource(motionView, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY);
-    dispatchDesc.exposure = {}; // Auto-exposure
-    dispatchDesc.reactive = {}; // No reactive mask
-    dispatchDesc.transparencyAndComposition = {}; // No T&C mask
-    // Output is written as UAV - use UNORDERED_ACCESS state so FFX leaves it ready for subsequent reads
-    dispatchDesc.output = createFfxResource(outputView, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, FFX_API_RESOURCE_USAGE_UAV);
+    dispatchDesc.color = createFfxResource(colorView, kRemixImageState);
+    dispatchDesc.depth = createFfxResource(depthView, kRemixImageState);
+    dispatchDesc.motionVectors = createFfxResource(motionView, kRemixImageState);
+    // No exposure texture: the pre-exposure below already scales the input to the exposed range.
+    dispatchDesc.exposure = {};
+    dispatchDesc.reactive = reactiveView != nullptr
+      ? createFfxResource(reactiveView, kRemixImageState)
+      : FfxApiResource {};
+    dispatchDesc.transparencyAndComposition = {};
+    dispatchDesc.output = createFfxResource(outputView, kRemixImageState, FFX_API_RESOURCE_USAGE_UAV);
 
-    // Pass jitter values directly to FSR - no negation needed
-    // FSR expects the same jitter values that were applied to the projection matrix
-    dispatchDesc.jitterOffset.x = m_jitterX;
-    dispatchDesc.jitterOffset.y = m_jitterY;
+    dispatchDesc.jitterOffset.x = jitterOffset[0];
+    dispatchDesc.jitterOffset.y = jitterOffset[1];
     
     // Motion vectors are already in absolute pixel units (like DLSS), so scale is 1.0
     dispatchDesc.motionVectorScale.x = 1.f;
@@ -488,18 +443,38 @@ namespace dxvk {
     dispatchDesc.enableSharpening = sharpness > 0.0f;
     dispatchDesc.sharpness = sharpness;
     dispatchDesc.frameTimeDelta = deltaTimeMs;
-    dispatchDesc.preExposure = 1.0f;
+
+    // The input is radiance times the pre-exposure P (rtx_pre_exposure.h). FSR divides the input by this value and
+    // multiplies its output by it again, so passing P / E makes FSR work on radiance times the exposure E, the
+    // range its luminance heuristics are tuned for, while the output keeps the input's scale.
+    const float exposure = PreExposure::trackedExposure();
+    const float safeExposure = std::isfinite(exposure) && exposure > 0.0f ? exposure : 1.0f;
+    dispatchDesc.preExposure = PreExposure::get() / safeExposure;
     dispatchDesc.reset = resetHistory;
-    
-    // Pass actual near/far values - FFX_UPSCALE_ENABLE_DEPTH_INVERTED flag handles the inversion
-    // SDK internally handles the near/far based on the inverted flag
-    dispatchDesc.cameraNear = camera.getNearPlane();
-    dispatchDesc.cameraFar = camera.getFarPlane();
+
+    dispatchDesc.cameraNear = depthConvention.cameraNear;
+    dispatchDesc.cameraFar = depthConvention.cameraFar;
     dispatchDesc.cameraFovAngleVertical = camera.getFov();
+    dispatchDesc.viewSpaceToMetersFactor = depthConvention.viewSpaceToMeters;
     dispatchDesc.flags = 0;
-    
-    // Increment jitter index
-    m_jitterIndex++;
+
+    ++m_dispatches;
+    if (resetHistory) {
+      ++m_resets;
+    }
+    if (m_dispatches % kLogIntervalDispatches == 0) {
+      Logger::info(str::format("[FSR] dispatches=", kLogIntervalDispatches, " resets=", m_resets,
+        " render=", renderWidth, "x", renderHeight, " display=", displayWidth, "x", displayHeight,
+        " preset=", fsrPresetToString(m_actualPreset),
+        " jitter=", jitterOffset[0], ",", jitterOffset[1], " mvScale=1,1",
+        " depthInverted=", m_contextDepth.inverted, " depthInfinite=", m_contextDepth.infinite,
+        " near=", depthConvention.cameraNear, " far=", depthConvention.cameraFar,
+        " metersPerUnit=", depthConvention.viewSpaceToMeters,
+        " preExposure=", PreExposure::get(), " exposure=", safeExposure,
+        " frameTimeMs=", deltaTimeMs, " reactive=", reactiveView != nullptr,
+        " sharpness=", sharpness));
+      m_resets = 0;
+    }
 
     // Execute FSR
     ffx::ReturnCode retCode = ffx::Dispatch(m_upscalingContext, dispatchDesc);
@@ -517,13 +492,24 @@ namespace dxvk {
         { 0, 0, 0 },
         rtOutput.m_compositeOutputExtent);
     }
+
+    barriers.accessImage(
+      outputView->image(),
+      outputView->imageSubresources(),
+      outputView->imageInfo().layout,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_WRITE_BIT,
+      outputView->imageInfo().layout,
+      outputView->imageInfo().stages,
+      outputView->imageInfo().access);
+    renderContext->getCommandList()->trackResource<DxvkAccess::Write>(outputView->image());
   }
 
   // ---------------------------------------------------------------------------
   // fork_hooks entry points
   //
-  // Everything below is what upstream files call into, so that their fork
-  // footprint stays a one-line dispatch. See docs/fork-touchpoints.md.
+  // Everything below is what upstream files call into, so that each call
+  // site stays a one-line dispatch.
   // ---------------------------------------------------------------------------
   namespace fork_hooks {
 
@@ -568,25 +554,9 @@ namespace dxvk {
 
       DxvkFSR& fsr = ctx.m_common->metaFSR();
       RtCamera& mainCamera = ctx.getSceneManager().getCamera();
+      // The real frame time, so FSR's history decay does not stop while game time is paused.
       fsr.dispatch(&ctx, ctx.m_execBarriers, rtOutput, mainCamera, ctx.m_resetHistory,
-                   GlobalTime::get().deltaTimeMs());
-    }
-
-    float fsrUpscalingMipBias(DxvkDevice* device) {
-      if (!RtxOptions::isFSREnabled() || device == nullptr) {
-        return 0.0f;
-      }
-
-      // FSR developer guide formula: -log2(upscale_factor).
-      Resources& resourceManager = device->getCommon()->getResources();
-      float mipBias = -std::log2(resourceManager.getUpscaleRatio());
-
-      DxvkFSR& fsr = device->getCommon()->metaFSR();
-      if (fsr.isActive()) {
-        mipBias += fsr.calcRecommendedMipBias();
-      }
-
-      return mipBias;
+                   GlobalTime::get().realDeltaTimeMs());
     }
 
     uint32_t fsrJitterSequenceLength(uint32_t finalWidth, uint32_t renderWidth) {

@@ -71,11 +71,11 @@ void AngleToMesh::updateRange(const Rc<DxvkContext>& context, const size_t start
     float angleRadians = 0.0f;
     Vector3 dirToCentroid(0.0f, 0.0f, 0.0f);
 
-    const PrimInstance* meshPrim = m_batch.resolvePrimTarget(context, i, m_target[i]);
+    const PrimInstance meshPrim = m_batch.resolvePrimTarget(context, i, m_target[i]);
 
-    if (meshPrim != nullptr && meshPrim->getType() == PrimInstance::Type::Instance) {
+    if (meshPrim.getType() == PrimInstance::Type::Instance) {
       // Get the RtInstance from the PrimInstance
-      RtInstance* rtInstance = meshPrim->getInstance();
+      RtInstance* rtInstance = meshPrim.getInstance();
       
       if (rtInstance != nullptr) {
         // Get the BlasEntry from the RtInstance - this represents the mesh asset

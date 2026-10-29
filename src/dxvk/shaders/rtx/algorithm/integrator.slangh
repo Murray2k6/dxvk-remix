@@ -43,7 +43,8 @@ struct IndirectSampleData
   float firstSampledLobePdf;
   float firstSampledSolidAnglePdf;
   bool firstSampledLobeIsSpecular;
-  bool insideMedium; 
+  // The first sampled lobe passed straight through an opaque surface's cutout.
+  bool firstSampledLobeIsOpacityTransmission; 
 
   [mutating] void unpack(const uint encodedData) 
   {
@@ -51,7 +52,7 @@ struct IndirectSampleData
     firstSampledSolidAnglePdf = abs(unpackFloat2x16(encodedData)).y;
 
     firstSampledLobeIsSpecular = packedFlagGet(encodedData, 1 << 15);
-    insideMedium = packedFlagGet(encodedData, 1 << 31);
+    firstSampledLobeIsOpacityTransmission = packedFlagGet(encodedData, 1 << 31);
   } 
 
   uint pack()
@@ -61,7 +62,7 @@ struct IndirectSampleData
     // Note: Encode flags into the sign bits of each float. This must be done manually because -0 may not be properly
     // stored if the value is 0 as -0 and +0 tend to be treated the same. Assumes the pdfs are always 0 or greater
     // Lobe pdf and and solid angle pdfs are expected to be >= 0
-    encodedData = packedFlagSet(encodedData, (uint(firstSampledLobeIsSpecular) << 15) | (uint(insideMedium) << 31));
+    encodedData = packedFlagSet(encodedData, (uint(firstSampledLobeIsSpecular) << 15) | (uint(firstSampledLobeIsOpacityTransmission) << 31));
 
     return encodedData;
   }
@@ -212,6 +213,14 @@ bool evalMediumChange(
   return false;
 }
 
+// rtx.integrateIndirect.slimVariants. INDIRECT_SLIM_LEAN_VISIBILITY=1 drops the translucent and thin-opaque
+// subsurface handling from the secondary NEE visibility ray. The host binds such a variant only when
+// rtx.enableIndirectTranslucentShadows is off (translucent instances are outside the ray mask), no view-model or
+// player-model instance is translucent (dynamic mask bits) and no thin-opaque material was ever created.
+#ifndef INDIRECT_SLIM_LEAN_VISIBILITY
+#define INDIRECT_SLIM_LEAN_VISIBILITY 0
+#endif
+
 bool evalNEESecondary(
   LightSample lightSample,
   uint8_t sampledTransportPortalIndex, 
@@ -225,7 +234,8 @@ bool evalNEESecondary(
   OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction,
   inout vec3 diffuseLight,
   inout vec3 specularLight,
-  uint surfaceIndex, float2 texcoords)
+  // SharedTextureCoord in full (sccrSharedTextureCoord).
+  uint surfaceIndex, float4 texcoords)
 {
 
   // Setup and trace the visibility ray
@@ -234,7 +244,11 @@ bool evalNEESecondary(
   rayMask |= (cb.enableIndirectTranslucentShadows) ? OBJECT_MASK_TRANSLUCENT : 0;
   rayMask |= (cb.enableIndirectAlphaBlendShadows) ? OBJECT_MASK_ALPHA_BLEND : 0;
 
+#if INDIRECT_SLIM_LEAN_VISIBILITY
+  const bool isThinOpaqueSubsurface = false;
+#else
   const bool isThinOpaqueSubsurface = isThinOpaqueSubsurfaceMaterial(opaqueSurfaceMaterialInteraction);
+#endif
 
   // The visibility test function applies an offset to the surface position to avoid self
   // intersection, so the actual length is slightly different from the estimatedLength here.
@@ -247,7 +261,12 @@ bool evalNEESecondary(
   const uint floatOffset = 4096;
   float ratio = max(0.98, asfloat(asuint(estimatedLength) - floatOffset) / estimatedLength);
 
-  VisibilityResult visibility = traceVisibilityRay<visibilityModeEnablePom | visibilityModeEnableTranslucentMaterials>(minimalSurfaceInteraction,
+  // Secondary surfaces and the NEE cache are lit indirectly, so they take coarse POM self-shadows (visibilityModePomIndirect).
+#if INDIRECT_SLIM_LEAN_VISIBILITY
+  VisibilityResult visibility = traceVisibilityRay<visibilityModeEnablePom | visibilityModePomIndirect>(minimalSurfaceInteraction,
+#else
+  VisibilityResult visibility = traceVisibilityRay<visibilityModeEnablePom | visibilityModeEnableTranslucentMaterials | visibilityModePomIndirect>(minimalSurfaceInteraction,
+#endif
     lightSample.position, rayMask,
     sampledTransportPortalIndex, portalSpace, pomOpaqueSurfaceEncountered,
     minimalRayInteraction.coneRadius, viewRay.spreadAngle, ratio, isViewModelSurface, false,

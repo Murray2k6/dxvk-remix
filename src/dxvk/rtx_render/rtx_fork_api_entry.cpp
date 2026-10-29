@@ -1,40 +1,8 @@
-// src/dxvk/rtx_render/rtx_fork_api_entry.cpp
-//
-// Fork-owned file. Contains the implementations of fork_hooks:: functions
-// lifted from rtx_remix_api.cpp during the 2026-04-18 fork touchpoint-pattern
-// refactor.
-//
-// See docs/fork-touchpoints.md for the full fork-hooks catalogue.
-//
-// This file is populated in four passes:
-//   #7a  — infrastructure / foundation blocks:
-//           * textureHashPathLookup
-//           * mutateTextureHashOption
-//   #7b  — API function implementations:
-//           * drawScreenOverlay   — stages pixel data into s_pendingScreenOverlay
-//           * presentScreenOverlayFlush — drains s_pendingScreenOverlay each frame
-//           * getUiState / setUiState
-//           * getSharedD3D11TextureHandle (stub)
-//           * dxvkGetTextureHash
-//           * createTexture / destroyTexture
-//   #7c  — interception + vtable init + frame-boundary callback infrastructure:
-//           * notifyBeginScene    — fires s_beginCallback on first frame submission
-//           * registerCallbacks   — stores begin/end/present callbacks
-//           * shutdownCallbacks   — clears all four callback-state vars
-//           * presentCallbackDispatch — fires end/present callbacks + resets s_inFrame
-//           * remixApiVtableInit  — populates all fork-added vtable slots
-//   #7d  — VRAM telemetry + compaction hooks (this pass):
-//           * requestVramCompaction  — sets SceneManager atomic flag
-//           * requestTextureVramFree — sets SceneManager atomic flag
-//           * getVramStats           — fills remixapi_VramStats (DXVK + driver-view)
-//
-// PendingScreenOverlay state (struct + s_pendingScreenOverlay) lives in the
-// anonymous namespace of THIS translation unit so both the writer
-// (drawScreenOverlay) and the reader (presentScreenOverlayFlush) can reference
-// it directly without coupling through the fork-hooks header. The upstream copy
-// of this struct and optional was removed in migration #7b.
+// Implements the Remix API fork_hooks declared in rtx_fork_hooks.h: texture hash paths and sets,
+// the screen overlay, UI state, texture creation, the bridge frame callbacks and VRAM requests.
 
 #include "rtx_fork_hooks.h"
+#include "rtx_remix_api_device.h"
 
 #include "rtx_context.h"                  // DxvkContext::getCommonObjects(), RtxContext
 #include "rtx_option.h"                   // RtxOption, RtxOptionImpl, fast_unordered_set
@@ -51,22 +19,14 @@
 #include "../dxvk_util.h"                 // util::computeMipLevelExtent, computeImageDataSize
 #include "../imgui/dxvk_imgui.h"          // ImGUI::switchMenu, ImGUI::AddTexture
 #include "rtx_scene_manager.h"            // SceneManager::requestVramCompaction, requestTextureVramFree
-
-#include "../../d3d9/d3d9_device.h"       // D3D9DeviceEx, LockDevice, EmitCs, GetDXVKDevice
-#include "../../d3d9/d3d9_texture.h"      // D3D9CommonTexture, GetCommonTexture
+#include "rtx_asset_replacer.h"           // AssetReplacer::noteTextureReplaced
 
 #include "../../util/xxHash/xxhash.h"     // XXH64_hash_t
 
 #include <remix/remix_c.h>                // remixapi_ErrorCode, REMIXAPI_ERROR_CODE_*
 
-// Forward declarations for the three extern-"C" fork-exported functions that
-// remixApiVtableInit registers into the vtable. These have external linkage
-// (REMIXAPI = __declspec(dllexport)) so they are visible across translation
-// units; all anonymous-namespace functions in rtx_remix_api.cpp are NOT.
-//
-// NOTE: remixapi_CreateLightBatched is in the anonymous namespace (no REMIXAPI
-// prefix) so it has internal linkage and cannot be named here. It is assigned
-// inline in the vtable init block in rtx_remix_api.cpp.
+// The exported entry points remixApiVtableInit assigns.
+// The anonymous-namespace entry points in rtx_remix_api.cpp have internal linkage and cannot be named here.
 extern "C" {
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_RegisterCallbacks(
     PFN_remixapi_BridgeCallback beginSceneCallback,
@@ -88,19 +48,8 @@ extern "C" {
 namespace dxvk {
 namespace {
 
-  // -------------------------------------------------------------------------
-  // PendingScreenOverlay — fork-canonical definition (migration #7b)
-  //
-  // Shared state between the API thread and the render thread for the
-  // DrawScreenOverlay / Present path.  Written by drawScreenOverlay (staging a
-  // pixel buffer from the API thread), drained by presentScreenOverlayFlush
-  // (handing the staging buffer to the render thread via EmitCs /
-  // setScreenOverlayData).
-  //
-  // TU-local (anonymous namespace).  The upstream copy of this struct and
-  // optional in rtx_remix_api.cpp was deleted in migration #7b; this is now
-  // the sole definition.
-  // -------------------------------------------------------------------------
+  // Holds the screen overlay that drawScreenOverlay stages until presentScreenOverlayFlush
+  // hands it to the command stream.
   struct PendingScreenOverlay {
     Rc<DxvkBuffer> stagingBuffer;
     uint32_t width;
@@ -111,18 +60,8 @@ namespace {
 
   std::optional<PendingScreenOverlay> s_pendingScreenOverlay;
 
-  // -------------------------------------------------------------------------
-  // Frame-boundary callback state (migration #7c)
-  //
-  // Lifted from rtx_remix_api.cpp anonymous namespace. Written by
-  // registerCallbacks (remixapi_RegisterCallbacks delegate) and shutdownCallbacks
-  // (remixapi_Shutdown). Read by notifyBeginScene (DrawInstance /
-  // DrawLightInstance call sites), presentCallbackDispatch (remixapi_Present),
-  // and shutdownCallbacks (remixapi_Shutdown).
-  //
-  // s_inFrame is atomic because remixapi_DrawInstance and remixapi_Present can
-  // race on the exchange/load under multi-threaded plugin usage.
-  // -------------------------------------------------------------------------
+  // These hold the bridge's frame callbacks and whether a frame is open.
+  // s_inFrame is atomic because a multi-threaded host can draw and present concurrently.
   std::atomic<bool>              s_inFrame       { false };
   PFN_remixapi_BridgeCallback    s_beginCallback  { nullptr };
   PFN_remixapi_BridgeCallback    s_endCallback    { nullptr };
@@ -130,25 +69,13 @@ namespace {
 
 } // anonymous namespace
 
+  // Drops a destroyed texture from the copy-on-write registry of in-place DEFAULT imports.
+  // It is defined in rtx_remix_api.cpp and runs on the CS thread.
+  void remixHostImportForgetShared(uint64_t hash, const DxvkImage* image);
+
 namespace fork_hooks {
 
-  // ---------------------------------------------------------------------------
-  // textureHashPathLookup
-  //
-  // Called from the preloadTexture lambda inside convert::toRtMaterialFinalized
-  // (rtx_remix_api.cpp). Supports referencing API-uploaded textures by their
-  // image hash via a "0x<hex>" pseudo-path, so material JSON authored by a
-  // plugin can name a CreateTexture'd texture without inventing a real file
-  // path on disk.
-  //
-  // Returns true and writes outRef when the path parses as a hex string and
-  // a texture with that image hash is registered in the texture manager.
-  // Returns false otherwise (including the common case of a real file path);
-  // the caller falls back to the regular AssetDataManager lookup.
-  //
-  // ACCESS NOTE: uses only the public TextureManager::getTextureTable() and
-  // TextureRef::getImageHash(). No friend declaration required.
-  // ---------------------------------------------------------------------------
+  // Lets a host material name an API-created texture by a "0x<hex>" image-hash path.
   bool textureHashPathLookup(
       DxvkContext& ctx,
       const std::filesystem::path& path,
@@ -162,7 +89,16 @@ namespace fork_hooks {
       if (hash == 0) {
         return false;
       }
-      const auto& textureTable = ctx.getCommonObjects()->getTextureManager().getTextureTable();
+      // API-created and imported textures use their hash as the unique key, so the cache's map finds them.
+      // This runs for every texture slot of every host material, so it must not scan the table.
+      auto& textureManager = ctx.getCommonObjects()->getTextureManager();
+      TextureRef keyed;
+      if (textureManager.findTextureByUniqueKey(hash, keyed) &&
+          keyed.isValid() && keyed.getImageHash() == hash) {
+        outRef = keyed;
+        return true;
+      }
+      const auto& textureTable = textureManager.getTextureTable();
       for (const auto& ref : textureTable) {
         if (ref.isValid() && ref.getImageHash() == hash) {
           outRef = ref;
@@ -170,36 +106,16 @@ namespace fork_hooks {
         }
       }
     } catch (...) {
-      // stoull threw — fall through and return false so the caller can try
-      // the normal asset-path resolver instead.
+      // The path is not a hex number, so the caller uses the asset-path lookup.
     }
     return false;
   }
 
-  // ---------------------------------------------------------------------------
-  // mutateTextureHashOption
+  // Removal uses removeHash rather than clearHash, so the user layer records a negative opinion
+  // and lower-priority layers such as rtx.conf cannot bring the hash back.
   //
-  // Implements the per-category texture-hash add/remove operation used by
-  // remixapi_AddTextureHash and remixapi_RemoveTextureHash. Looks up a
-  // named RtxOption<fast_unordered_set>, parses the incoming hash string as
-  // hex, and mutates the set via the user config layer.
-  //
-  // Remove uses removeHash (not clearHash): records a negative opinion on the
-  // user layer so lower-priority layers (config files, rtx.conf defaults)
-  // cannot re-contribute the hash. This matches the fork's hard-delete
-  // semantic — clearHash would only drop the user-layer opinion and let the
-  // underlying default win.
-  //
-  // LOCK ORDER: the caller must hold the remix-api static mutex (s_mutex in
-  // rtx_remix_api.cpp). This function then acquires the RtxOptionImpl update
-  // mutex internally via addHash/removeHash. Inverting that order (taking
-  // the RtxOption mutex first and then s_mutex) would deadlock against the
-  // EmitCs path, which runs lambdas holding the RtxOption mutex and must
-  // never re-enter s_mutex.
-  //
-  // ACCESS NOTE: uses only public RtxOption APIs. No friend declaration
-  // required.
-  // ---------------------------------------------------------------------------
+  // The caller holds s_mutex, and addHash and removeHash then take the RtxOption update mutex.
+  // The reverse order deadlocks against command-stream lambdas that hold the RtxOption mutex.
   remixapi_ErrorCode mutateTextureHashOption(
       const char* textureCategory,
       const char* textureHash,
@@ -238,24 +154,14 @@ namespace fork_hooks {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
-  // ---------------------------------------------------------------------------
-  // drawScreenOverlay (migration #7b)
-  //
-  // Copies pPixelData into a host-visible staging buffer and stores it in
-  // s_pendingScreenOverlay. A null pPixelData or zero dims clears the pending
-  // overlay.  presentScreenOverlayFlush drains this state to the render thread
-  // at the next present boundary.
-  //
-  // Reverted [RTX-Diag] FIRST-CALL log block is intentionally absent.
-  // ---------------------------------------------------------------------------
   remixapi_ErrorCode drawScreenOverlay(
-      D3D9DeviceEx* remixDevice,
+      RemixApiDevice* remixDevice,
       const void*   pPixelData,
       uint32_t      width,
       uint32_t      height,
       remixapi_Format format,
       float         opacity) {
-    // Null / zero-dim pixel data clears the overlay for this frame.
+    // Null pixel data or a zero dimension clears the overlay.
     if (!pPixelData || width == 0 || height == 0) {
       s_pendingScreenOverlay.reset();
       return REMIXAPI_ERROR_CODE_SUCCESS;
@@ -288,7 +194,6 @@ namespace fork_hooks {
       return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
     }
 
-    // Copy pixel data to staging buffer.
     DxvkBufferSlice stagingSlice { stagingBuffer };
     memcpy(stagingSlice.mapPtr(0), pPixelData, dataSize);
 
@@ -302,14 +207,7 @@ namespace fork_hooks {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
-  // ---------------------------------------------------------------------------
-  // presentScreenOverlayFlush (migration #7b)
-  //
-  // Drains s_pendingScreenOverlay (if set) to the render thread via EmitCs.
-  // Called from both remixapi_Present paths after the light/mesh flush EmitCs
-  // and before the endScene callback dispatch.
-  // ---------------------------------------------------------------------------
-  void presentScreenOverlayFlush(D3D9DeviceEx* remixDevice) {
+  void presentScreenOverlayFlush(RemixApiDevice* remixDevice) {
     if (!s_pendingScreenOverlay.has_value()) {
       return;
     }
@@ -324,14 +222,7 @@ namespace fork_hooks {
     });
   }
 
-  // ---------------------------------------------------------------------------
-  // getUiState (migration #7b)
-  //
-  // Reads RtxOptions::showUI() and maps the internal UIType enum to
-  // remixapi_UIState.  Returns REMIXAPI_UI_STATE_NONE if the device is not
-  // registered.
-  // ---------------------------------------------------------------------------
-  remixapi_UIState getUiState(D3D9DeviceEx* remixDevice) {
+  remixapi_UIState getUiState(RemixApiDevice* remixDevice) {
     if (!remixDevice) {
       return REMIXAPI_UI_STATE_NONE;
     }
@@ -343,13 +234,7 @@ namespace fork_hooks {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // setUiState (migration #7b)
-  //
-  // Maps remixapi_UIState to UIType, acquires the device lock, and calls
-  // getImgui().switchMenu(uiType).
-  // ---------------------------------------------------------------------------
-  remixapi_ErrorCode setUiState(D3D9DeviceEx* remixDevice, remixapi_UIState state) {
+  remixapi_ErrorCode setUiState(RemixApiDevice* remixDevice, remixapi_UIState state) {
     if (!remixDevice) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
     }
@@ -367,75 +252,17 @@ namespace fork_hooks {
     if (!dxvkDevice.ptr() || !dxvkDevice->getCommon()) {
       return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
     }
+    // switchMenu writes RtxOptions that the command-stream thread applies at frame end,
+    // and a D3D11 host calls this from its render thread while that thread runs, so switch on the command stream.
     auto devLock = remixDevice->LockDevice();
-    dxvkDevice->getCommon()->getImgui().switchMenu(uiType);
+    remixDevice->EmitCs([uiType](DxvkContext* ctx) {
+      ctx->getCommonObjects()->getImgui().switchMenu(uiType);
+    });
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
-  // ---------------------------------------------------------------------------
-  // getSharedD3D11TextureHandle (migration #7b)
-  //
-  // Stub. The DX11 shared-memory export backbuffer path (gmod commit 098a7471)
-  // is not ported to this fork. This code path is only exercised when the host
-  // app opts into external-swapchain mode via dxvk_CreateD3D9(forceNoVkSwapchain
-  // == TRUE). Separate-window mode (used by Skyrim) never calls this. Returns
-  // GENERAL_FAILURE so callers fall back; the vtable slot is populated so the
-  // struct layout matches the header the plugin was built against.
-  // ---------------------------------------------------------------------------
-  remixapi_ErrorCode getSharedD3D11TextureHandle(
-      D3D9DeviceEx* remixDevice,
-      void**        out_sharedHandle,
-      uint32_t*     out_width,
-      uint32_t*     out_height) {
-    if (!remixDevice) {
-      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
-    }
-    if (!out_sharedHandle || !out_width || !out_height) {
-      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
-    }
-    return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
-  }
-
-  // ---------------------------------------------------------------------------
-  // dxvkGetTextureHash (migration #7b)
-  //
-  // Retrieves the D3D9CommonTexture from the D3D9 texture pointer, gets the
-  // underlying DxvkImage, and returns image->getHash() in out_hash.
-  // ---------------------------------------------------------------------------
-  remixapi_ErrorCode dxvkGetTextureHash(
-      IDirect3DTexture9* texture,
-      uint64_t*          out_hash) {
-    if (!texture || !out_hash) {
-      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
-    }
-
-    D3D9CommonTexture* commonTexture = GetCommonTexture(texture);
-    if (!commonTexture) {
-      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
-    }
-
-    // Get the underlying DXVK image.
-    const Rc<DxvkImage>& image = commonTexture->GetImage();
-    if (image == nullptr) {
-      // Texture might be in system memory (not GPU).
-      return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
-    }
-
-    *out_hash = image->getHash();
-    return REMIXAPI_ERROR_CODE_SUCCESS;
-  }
-
-  // ---------------------------------------------------------------------------
-  // createTexture (migration #7b)
-  //
-  // Creates a DxvkImage + view + staging buffer for the supplied pixel data,
-  // copies data into staging, and schedules an EmitCs lambda that transitions
-  // the image, uploads all mip levels using block-aware size helpers, transitions
-  // to shader-read, and registers the texture with the texture manager and
-  // ImGui catalog.
-  // ---------------------------------------------------------------------------
   remixapi_ErrorCode createTexture(
-      D3D9DeviceEx*            remixDevice,
+      RemixApiDevice*         remixDevice,
       const remixapi_TextureInfo* info,
       remixapi_TextureHandle*  out_handle) {
     if (!remixDevice) {
@@ -450,10 +277,7 @@ namespace fork_hooks {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
 
-    // 3D textures not supported by this API yet; caller must use depth=1.
-    // The image below is hardcoded to VK_IMAGE_TYPE_2D, so depth > 1 would
-    // create an invalid VkImage. The header documents "Set to 1 for 2D textures";
-    // treat any other value as unsupported until real 3D-texture support lands.
+    // The image is always VK_IMAGE_TYPE_2D, so a depth above 1 would create an invalid VkImage.
     if (info->depth > 1) {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
@@ -463,9 +287,29 @@ namespace fork_hooks {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
 
-    // Convert remixapi_Format to VkFormat.
+    const remixapi_TextureInfoHostImportEXT* hostImport = nullptr;
+    for (auto* p = static_cast<const remixapi_TextureInfoHostImportEXT*>(info->pNext); p != nullptr;
+         p = static_cast<const remixapi_TextureInfoHostImportEXT*>(p->pNext)) {
+      if (p->sType == REMIXAPI_STRUCT_TYPE_TEXTURE_INFO_HOST_IMPORT_EXT) {
+        hostImport = p;
+        break;
+      }
+    }
+    HostTextureEncoding hostEncoding = HostTextureEncoding::None;
+    if (hostImport) {
+      if (hostImport->encoding > REMIXAPI_TEXTURE_ENCODING_SMOOTHNESS_IN_GREEN) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+      hostEncoding = static_cast<HostTextureEncoding>(hostImport->encoding);
+    }
+
     VkFormat vkFormat = VK_FORMAT_UNDEFINED;
-    switch (info->format) {
+    if (hostImport && hostImport->vkFormat) {
+      vkFormat = static_cast<VkFormat>(hostImport->vkFormat);
+      if (imageFormatInfo(vkFormat) == nullptr) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+    } else switch (info->format) {
       case REMIXAPI_FORMAT_R8G8B8A8_UNORM: vkFormat = VK_FORMAT_R8G8B8A8_UNORM;       break;
       case REMIXAPI_FORMAT_R8G8B8A8_SRGB:  vkFormat = VK_FORMAT_R8G8B8A8_SRGB;        break;
       case REMIXAPI_FORMAT_B8G8R8A8_UNORM: vkFormat = VK_FORMAT_B8G8R8A8_UNORM;       break;
@@ -481,7 +325,6 @@ namespace fork_hooks {
         return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
 
-    // Create VkImage.
     DxvkImageCreateInfo imageInfo = {};
     imageInfo.type        = VK_IMAGE_TYPE_2D;
     imageInfo.format      = vkFormat;
@@ -507,7 +350,6 @@ namespace fork_hooks {
       return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
     }
 
-    // Create staging buffer for upload.
     DxvkBufferCreateInfo stagingInfo = {};
     stagingInfo.size   = info->dataSize;
     stagingInfo.usage  = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
@@ -524,11 +366,9 @@ namespace fork_hooks {
       return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
     }
 
-    // Copy texture data to staging buffer.
     auto stagingSlice = DxvkBufferSlice { stagingBuffer };
     memcpy(stagingSlice.mapPtr(0), info->data, info->dataSize);
 
-    // Create image view.
     DxvkImageViewCreateInfo viewInfo = {};
     viewInfo.type      = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format    = vkFormat;
@@ -545,7 +385,6 @@ namespace fork_hooks {
       return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
     }
 
-    // Schedule upload on render thread.
     auto devLock = remixDevice->LockDevice();
 
     remixDevice->EmitCs([
@@ -556,16 +395,14 @@ namespace fork_hooks {
       cBaseExtent    = imageInfo.extent,
       cMipLevels     = imageInfo.mipLevels,
       cDataSize      = info->dataSize,
-      cFormat        = vkFormat
+      cFormat        = vkFormat,
+      cEncoding      = hostEncoding,
+      cReplace       = hostImport && (hostImport->flags & REMIXAPI_TEXTURE_HOST_IMPORT_FLAG_REPLACE) != 0
     ](DxvkContext* ctx) mutable {
 
-      // Transition image to transfer dst.
       ctx->changeImageLayout(cImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
-      // Upload each mip level. Use upstream's block-aware helpers so the
-      // per-mip byte count is correct for compressed formats (BC1 = 8
-      // bytes / 4x4 block, BC3/5/7 = 16 bytes / 4x4 block) as well as
-      // uncompressed formats.
+      // The block-aware size helpers give the correct per-mip byte count for BC formats too.
       VkDeviceSize offset = 0;
 
       for (uint32_t mip = 0; mip < cMipLevels; ++mip) {
@@ -579,8 +416,7 @@ namespace fork_hooks {
         const VkDeviceSize mipSize = util::computeImageDataSize(cFormat, extent);
 
         if (offset + mipSize > cDataSize) {
-          // Source data truncated for this mip; stop uploading rather than
-          // read past the staging buffer.
+          // The source data ends inside this mip, so stop rather than read past the staging buffer.
           break;
         }
 
@@ -594,26 +430,27 @@ namespace fork_hooks {
         }
       }
 
-      // Transition to shader read.
       ctx->changeImageLayout(cImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
-      // Register texture with texture manager using hash.
       auto& textureManager = ctx->getCommonObjects()->getTextureManager();
 
-      // TextureRef's getImageHash() uses the DxvkImage's hash (computed from
-      // data), not the uniqueKey we provide. Set the image's hash to our
-      // provided hash so the texture table lookup by image hash matches the
-      // API-supplied value.
+      // TextureRef::getImageHash reads the image's own hash, not the unique key,
+      // so set it to the API hash for lookups by image hash.
       cImage->setHash(cHash);
 
-      auto textureRef = TextureRef(cImageView, cHash);
+      auto textureRef = TextureRef(cImageView, cHash, 0, cEncoding);
 
-      // Add to texture table so materials can reference it by hash.
-      uint32_t textureIndex;
-      textureManager.addTexture(textureRef, 0, false, textureIndex);
+      TextureRef live;
+      if (cReplace && textureManager.findTextureByUniqueKey(size_t(cHash), live)) {
+        textureManager.replaceTexture(textureRef);
+        ctx->getCommonObjects()->getSceneManager().getAssetReplacer()->noteTextureReplaced(textureRef);
+        ctx->getCommonObjects()->getImgui().ReleaseTexture(cHash);
+      } else {
+        uint32_t textureIndex;
+        textureManager.addTexture(textureRef, 0, false, textureIndex);
+      }
 
-      // Register with ImGui for categorization UI.
-      // Flag 1 (kTextureFlagsDefault) allows assignment to texture categories.
+      // Flag 1 (kTextureFlagsDefault) lets the texture be assigned to categories in the UI.
       ctx->getCommonObjects()->getImgui().AddTexture(cHash, cImageView, 1);
     });
 
@@ -621,17 +458,8 @@ namespace fork_hooks {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
-  // ---------------------------------------------------------------------------
-  // destroyTexture (migration #7b)
-  //
-  // Schedules an EmitCs lambda that searches the texture table by hash and
-  // releases the texture reference via RtxTextureManager::releaseTexture.
-  // releaseTexture drops the entry from the SparseUniqueCache's internal map,
-  // releasing the held Rc<DxvkImageView> / Rc<ManagedTexture> references. Once
-  // no other holders remain, the GPU resources are refcount-released by DXVK.
-  // ---------------------------------------------------------------------------
   remixapi_ErrorCode destroyTexture(
-      D3D9DeviceEx*        remixDevice,
+      RemixApiDevice*     remixDevice,
       remixapi_TextureHandle handle) {
     if (!remixDevice) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
@@ -645,26 +473,29 @@ namespace fork_hooks {
     remixDevice->EmitCs([cHash = reinterpret_cast<uint64_t>(handle)](DxvkContext* ctx) {
       auto& textureManager = ctx->getCommonObjects()->getTextureManager();
 
-      // Find the texture entry registered for this hash and release it via
-      // RtxTextureManager::releaseTexture. releaseTexture drops the entry
-      // from the SparseUniqueCache's internal map, which in turn releases
-      // the held Rc<DxvkImageView> / Rc<ManagedTexture> references.
-      //
-      // The cache's ref is NOT the only holder: createTexture also pushes
-      // the image view into the ImGui texture-tagging catalog at
-      // g_imguiTextureMap (see ImGUI::AddTexture above), which retains its
-      // own Rc<DxvkImageView>. Without releasing that too, every plugin
-      // CreateTexture permanently retains its VkImage -- a monotonic VRAM
-      // leak under cell-reload workloads (plugin destroys, re-uploads,
-      // destroys again; ImGui keeps every generation alive). Match the
-      // AddTexture call with its corresponding ReleaseTexture here.
+      // The ImGui texture catalog holds its own reference from createTexture's AddTexture.
+      // Release it too, or the image is never freed.
       ctx->getCommonObjects()->getImgui().ReleaseTexture(cHash);
+
+      // CreateTexture and ImportD3D11Texture register under the hash as the unique key, so look it up directly.
+      // A host can release hundreds of textures at once, so the table scan below is only a fallback
+      // for entries registered under another key.
+      {
+        TextureRef found;
+        if (textureManager.findTextureByUniqueKey(size_t(cHash), found) &&
+            found.getImageHash() == cHash) {
+          if (const DxvkImageView* view = found.getImageView()) {
+            remixHostImportForgetShared(cHash, view->image().ptr());
+          }
+          textureManager.releaseTexture(found);
+          return;
+        }
+      }
 
       const auto& textureTable = textureManager.getTextureTable();
       for (const auto& textureRef : textureTable) {
         if (textureRef.isValid() && textureRef.getImageHash() == cHash) {
-          // releaseTexture takes a non-const reference for lookup only; copy
-          // so we don't alias an entry that releaseTexture will invalidate.
+          // Copy, because releaseTexture invalidates the table entry it is given.
           TextureRef toRelease = textureRef;
           textureManager.releaseTexture(toRelease);
           break;
@@ -675,16 +506,8 @@ namespace fork_hooks {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
-  // ---------------------------------------------------------------------------
-  // notifyBeginScene (migration #7c)
-  //
-  // Fires s_beginCallback on the first API submission of the frame.
-  // Uses an atomic exchange so only the first caller per frame triggers the
-  // callback regardless of which API path (DrawInstance / DrawLightInstance)
-  // reaches it first. Called while the remix-api s_mutex is NOT held (the
-  // exchange itself is atomic; callback must be re-read after the exchange to
-  // avoid a null race).
-  // ---------------------------------------------------------------------------
+  // The exchange lets only the first submission of a frame fire the callback.
+  // The callback is read after the exchange, because callers do not hold s_mutex.
   void notifyBeginScene() {
     if (!s_inFrame.exchange(true)) {
       auto cb = s_beginCallback;
@@ -694,12 +517,6 @@ namespace fork_hooks {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // registerCallbacks (migration #7c)
-  //
-  // Stores the three per-frame bridge callbacks into fork-owned state.
-  // Called from the one-liner remixapi_RegisterCallbacks delegate in upstream.
-  // ---------------------------------------------------------------------------
   void registerCallbacks(
       PFN_remixapi_BridgeCallback beginSceneCallback,
       PFN_remixapi_BridgeCallback endSceneCallback,
@@ -709,12 +526,6 @@ namespace fork_hooks {
     s_presentCallback = presentCallback;
   }
 
-  // ---------------------------------------------------------------------------
-  // shutdownCallbacks (migration #7c)
-  //
-  // Resets all four frame-boundary state variables to null/false. Called from
-  // remixapi_Shutdown before the device is released.
-  // ---------------------------------------------------------------------------
   void shutdownCallbacks() {
     s_beginCallback   = nullptr;
     s_endCallback     = nullptr;
@@ -722,13 +533,6 @@ namespace fork_hooks {
     s_inFrame.store(false);
   }
 
-  // ---------------------------------------------------------------------------
-  // presentEndSceneDispatch (migration #7c)
-  //
-  // Fires the endScene callback if s_inFrame indicates a frame was started.
-  // Called from remixapi_Present immediately BEFORE the native Present so the
-  // endScene callback fires before the GPU flip.
-  // ---------------------------------------------------------------------------
   void presentEndSceneDispatch() {
     if (s_inFrame.load()) {
       auto cb = s_endCallback;
@@ -738,15 +542,7 @@ namespace fork_hooks {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // presentCallbackDispatch (migration #7c)
-  //
-  // Fires the present callback and resets s_inFrame to false. Called from
-  // remixapi_Present immediately AFTER the native Present call returns
-  // successfully. The present callback fires post-flip; s_inFrame is reset
-  // here rather than in presentEndSceneDispatch so that any code between the
-  // two hooks can still query the in-frame state if needed.
-  // ---------------------------------------------------------------------------
+  // s_inFrame is reset here rather than in presentEndSceneDispatch, so the frame stays open between the two.
   void presentCallbackDispatch() {
     {
       auto cb = s_presentCallback;
@@ -757,36 +553,13 @@ namespace fork_hooks {
     s_inFrame.store(false);
   }
 
-  // ---------------------------------------------------------------------------
-  // remixApiVtableInit (migration #7c)
-  //
-  // Populates the three fork-added extern-"C"-linked function-pointer slots
-  // in the remixapi_Interface vtable. Called from remixapi_InitializeLibrary
-  // after the upstream and anonymous-namespace fork slots are assigned inline.
-  //
-  // Only extern-"C" REMIXAPI-exported functions can be named from this TU.
-  // Anonymous-namespace additions (AddTextureHash, CreateTexture, GetUIState,
-  // CreateLightBatched, etc.) are assigned inline in rtx_remix_api.cpp where
-  // their symbols are visible.
-  //
-  // The sizeof(interf) static_assert sentinel is retained inline in upstream;
-  // it is not repeated here.
-  // ---------------------------------------------------------------------------
   void remixApiVtableInit(remixapi_Interface& interf) {
     interf.RegisterCallbacks              = remixapi_RegisterCallbacks;
     interf.AutoInstancePersistentLights   = remixapi_AutoInstancePersistentLights;
     interf.UpdateLightDefinition          = remixapi_UpdateLightDefinition;
   }
 
-  // ---------------------------------------------------------------------------
-  // requestVramCompaction (migration #7d)
-  //
-  // Sets an atomic flag that the render thread consumes in
-  // SceneManager::manageTextureVram on the next tick. Flag mutation is
-  // lock-free; the remix-api static mutex is deliberately NOT taken by the
-  // caller.
-  // ---------------------------------------------------------------------------
-  remixapi_ErrorCode requestVramCompaction(D3D9DeviceEx* remixDevice) {
+  remixapi_ErrorCode requestVramCompaction(RemixApiDevice* remixDevice) {
     if (!remixDevice) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
     }
@@ -794,17 +567,8 @@ namespace fork_hooks {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
-  // ---------------------------------------------------------------------------
-  // requestTextureVramFree (migration #7d)
-  //
-  // Sets an atomic flag that the render thread consumes in
-  // SceneManager::manageTextureVram on the next tick. The tick calls
-  // textureManager.clear() (SparseUniqueCache wipe + budget-gated streaming
-  // demotion), matching the DX9 path's scene-transition behavior exposed to
-  // plugins. Lock-free atomic mutation so the remix-api static mutex is not
-  // taken by the caller.
-  // ---------------------------------------------------------------------------
-  remixapi_ErrorCode requestTextureVramFree(D3D9DeviceEx* remixDevice) {
+  // The clear matches what the D3D9 path does on a scene transition.
+  remixapi_ErrorCode requestTextureVramFree(RemixApiDevice* remixDevice) {
     if (!remixDevice) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
     }
@@ -812,24 +576,10 @@ namespace fork_hooks {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
-  // ---------------------------------------------------------------------------
-  // getVramStats (migration #7d)
-  //
-  // Fills a remixapi_VramStats struct with DXVK per-category totals plus
-  // driver-view heap info (matches Task Manager / nvidia-smi; gap vs
-  // totalAllocatedBytes exposes non-DXVK allocations such as NGX, RT pipeline
-  // state, descriptor pools, NRC, etc.) and the fork-side texture manager's
-  // table size.
-  //
-  // forkTextureCacheCount comes from RtxTextureManager::getTextureTable()
-  // (the backing SparseUniqueCache's object vector). Its length is the cache's
-  // high-water mark rather than the live entry count (freed slots become
-  // sentinels rather than being removed), but growth here is a proxy for
-  // "more textures are getting tracked by the fork," useful for catching
-  // fork-side native-texture accumulation when plugin caches are stable.
-  // ---------------------------------------------------------------------------
+  // forkTextureCacheCount is the texture table's length, which is a high-water mark
+  // because freed slots stay as sentinels. Growth while the host's caches are stable still shows accumulation.
   remixapi_ErrorCode getVramStats(
-      D3D9DeviceEx*        remixDevice,
+      RemixApiDevice*     remixDevice,
       remixapi_VramStats*  out_stats) {
     if (!out_stats) {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
@@ -852,7 +602,8 @@ namespace fork_hooks {
       out_stats->totalUsedBytes                    += stats.totalUsed();
       out_stats->usedReplacementGeometryBytes      += stats.usedByCategory(DxvkMemoryStats::Category::RTXReplacementGeometry);
       out_stats->usedBufferBytes                   += stats.usedByCategory(DxvkMemoryStats::Category::RTXBuffer);
-      out_stats->usedAccelerationStructureBytes    += stats.usedByCategory(DxvkMemoryStats::Category::RTXAccelerationStructure);
+      out_stats->usedAccelerationStructureBytes    += stats.usedByCategory(DxvkMemoryStats::Category::RTXAccelerationStructure)
+                                                    + stats.usedByCategory(DxvkMemoryStats::Category::RTXSceneGeometry);
       out_stats->usedOpacityMicromapBytes          += stats.usedByCategory(DxvkMemoryStats::Category::RTXOpacityMicromap);
       out_stats->usedMaterialTextureBytes          += stats.usedByCategory(DxvkMemoryStats::Category::RTXMaterialTexture);
       out_stats->usedRenderTargetBytes             += stats.usedByCategory(DxvkMemoryStats::Category::RTXRenderTarget);

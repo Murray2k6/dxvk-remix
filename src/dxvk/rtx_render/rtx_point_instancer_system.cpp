@@ -30,6 +30,9 @@
 
 #include <rtx_shaders/point_instancer_culling.h>
 
+#include <algorithm>
+#include <cstring>
+
 namespace dxvk {
 
   namespace {
@@ -42,8 +45,12 @@ namespace dxvk {
         RW_STRUCTURED_BUFFER(POINT_INSTANCER_CULLING_BINDING_INSTANCE_BUFFER)
         RW_STRUCTURED_BUFFER(POINT_INSTANCER_CULLING_BINDING_SURFACE_BUFFER)
         RW_STRUCTURED_BUFFER(POINT_INSTANCER_CULLING_BINDING_MATERIAL_BUFFER)
+        STRUCTURED_BUFFER(POINT_INSTANCER_CULLING_BINDING_BATCHES)
+        STRUCTURED_BUFFER(POINT_INSTANCER_CULLING_BINDING_THREAD_BATCH)
       END_PARAMETER()
     };
+
+    PREWARM_SHADER_PIPELINE(PointInstancerCullingShader);
   }
 
   RtxPointInstancerSystem::RtxPointInstancerSystem(DxvkDevice* device)
@@ -62,6 +69,10 @@ namespace dxvk {
       RemixGui::DragFloat("Fade Start Radius", &fadeStartRadiusObject(), 10.f, 0.f, cullingRadius(), "%.0f");
 
       ImGui::EndDisabled();
+
+      RemixGui::Checkbox("Cull Host (API) Instancers", &cullHostInstancersObject());
+      RemixGui::Checkbox("Single Dispatch For All Batches", &singleDispatchObject());
+      RemixGui::Checkbox("Skip Unchanged Uploads", &skipUnchangedUploadsObject());
       ImGui::Unindent();
       ImGui::PopID();
     }
@@ -94,64 +105,161 @@ namespace dxvk {
                                "RTX PointInstancer - Constant Buffer");
     }
 
-    for (const PointInstancerBatch& batch : batches) {
-      const uint32_t count = batch.instanceCount;
-      if (count == 0) {
-        continue;
+    // --- Build the frame's batch table, transform list and thread list (CPU) ---
+    // With rtx.pointInstancer.singleDispatch all batches share one transform upload and one dispatch. Per-batch
+    // uploads and dispatches need a barrier pair between each, and GPU-instanced content can arrive as thousands
+    // of small batches.
+    const size_t batchCount = batches.size();
+    m_batchScratch.clear();
+    m_batchScratch.reserve(batchCount);
+    m_transformFirstScratch.resize(batchCount);
+
+    const bool cullHost = cullHostInstancers();
+    uint32_t threadCount = 0;
+    uint32_t transformCount = 0;
+    for (size_t i = 0; i < batchCount; ++i) {
+      const PointInstancerBatch& batch = batches[i];
+      // The SSS twin of a batch (recorded right after it by addPointInstancerBlas) shares its
+      // transforms and surface slots: reuse the primary's transforms, and let only the
+      // primary write the surface/material slots.
+      const bool isTwin = i > 0 &&
+        batches[i - 1].transforms == batch.transforms &&
+        batches[i - 1].baseSurfaceIndex == batch.baseSurfaceIndex &&
+        batches[i - 1].instanceCount == batch.instanceCount;
+      if (isTwin) {
+        m_transformFirstScratch[i] = m_transformFirstScratch[i - 1];
+      } else {
+        m_transformFirstScratch[i] = transformCount;
+        transformCount += batch.instanceCount;
       }
 
-      // Upload source transforms to GPU
-      const size_t transformsSize = count * sizeof(Matrix4);
-      if (m_transformsGpu.ptr() == nullptr || m_transformsGpu->info().size < transformsSize) {
+      PointInstancerCullingBatch gpu {};
+      gpu.objectToWorld        = batch.objectToWorld;
+      gpu.prevObjectToWorld    = batch.prevObjectToWorld;
+      gpu.baseSurfaceIndex     = batch.baseSurfaceIndex;
+      gpu.instanceCount        = batch.instanceCount;
+      gpu.customIndexFlags     = batch.customIndexFlags;
+      gpu.instanceMask         = batch.instanceMask;
+      gpu.sbtOffsetAndFlags    = batch.sbtOffsetAndFlags;
+      gpu.blasRefLo            = static_cast<uint32_t>(batch.blasReference & 0xFFFFFFFFull);
+      gpu.blasRefHi            = static_cast<uint32_t>(batch.blasReference >> 32);
+      gpu.instanceBufferOffset = batch.instanceBufferByteOffset;
+      gpu.firstThread          = threadCount;
+      gpu.firstTransform       = m_transformFirstScratch[i];
+      gpu.writeSurfaceData     = isTwin ? 0u : 1u;
+      gpu.cullable             = (!batch.fromHost || cullHost) ? 1u : 0u;
+      m_batchScratch.push_back(gpu);
+
+      threadCount += batch.instanceCount;
+    }
+
+    if (threadCount == 0) {
+      return;
+    }
+
+    // --- Upload what changed ---
+    const bool skipUnchanged = skipUnchangedUploads();
+
+    m_transformScratch.resize(transformCount);
+    for (size_t i = 0; i < batchCount; ++i) {
+      if (m_batchScratch[i].writeSurfaceData == 0) {
+        continue; // twin: shares the primary's transforms
+      }
+      memcpy(&m_transformScratch[m_transformFirstScratch[i]], batches[i].transforms->data(),
+             size_t(batches[i].instanceCount) * sizeof(Matrix4));
+    }
+
+    bool transformsUnchanged = skipUnchanged && m_transformsGpu.ptr() != nullptr &&
+      m_uploadedTransforms.size() == transformCount &&
+      memcmp(m_uploadedTransforms.data(), m_transformScratch.data(), size_t(transformCount) * sizeof(Matrix4)) == 0;
+
+    const bool batchesUnchanged = skipUnchanged && m_batchesGpu.ptr() != nullptr &&
+      m_uploadedThreadCount == threadCount &&
+      m_uploadedBatches.size() == batchCount &&
+      memcmp(m_uploadedBatches.data(), m_batchScratch.data(), batchCount * sizeof(PointInstancerCullingBatch)) == 0;
+
+    const auto ensureBuffer = [&](Rc<DxvkBuffer>& buffer, size_t size, const char* name) {
+      if (buffer.ptr() == nullptr || buffer->info().size < size) {
         DxvkBufferCreateInfo info;
         info.usage  = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         info.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-        info.size   = align(transformsSize, 256);
-        m_transformsGpu = dev->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                                            DxvkMemoryStats::Category::RTXBuffer,
-                                            "RTX PointInstancer - Transforms Input");
+        info.size   = align(size + size / 4, 256); // headroom: the scene grows while streaming
+        buffer = dev->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                   DxvkMemoryStats::Category::RTXBuffer, name);
+        return true;
       }
+      return false;
+    };
 
-      ctx->writeToBuffer(m_transformsGpu, 0, transformsSize, batch.transforms->data());
+    const size_t transformsSize = size_t(transformCount) * sizeof(Matrix4);
+    if (ensureBuffer(m_transformsGpu, transformsSize, "RTX PointInstancer - Transforms Input")) {
+      transformsUnchanged = false;
+    }
+    if (!transformsUnchanged) {
+      ctx->writeToBuffer(m_transformsGpu, 0, transformsSize, m_transformScratch.data());
+      m_uploadedTransforms.swap(m_transformScratch);
+    }
 
-      // Fill constant buffer
-      // When culling is disabled, use FLT_MAX so every instance passes the distance test.
-      const bool cullingEnabled = enable();
-      PointInstancerCullingConstants constants {};
-      memcpy(&constants.objectToWorld, &batch.objectToWorld, sizeof(mat4));
-      memcpy(&constants.prevObjectToWorld, &batch.prevObjectToWorld, sizeof(mat4));
-      constants.cameraPosition    = { cameraPosition.x, cameraPosition.y, cameraPosition.z };
-      constants.cullingRadius     = cullingEnabled ? cullingRadius() : FLT_MAX;
-      constants.totalInstanceCount = count;
-      constants.baseSurfaceIndex  = batch.baseSurfaceIndex;
-      constants.fadeStartRadius   = cullingEnabled ? fadeStartRadius() : 0.f;
-      constants.customIndexFlags  = batch.customIndexFlags;
-      constants.instanceMask      = batch.instanceMask;
-      constants.sbtOffsetAndFlags = batch.sbtOffsetAndFlags;
-      constants.blasRefLo         = static_cast<uint32_t>(batch.blasReference & 0xFFFFFFFFull);
-      constants.blasRefHi         = static_cast<uint32_t>(batch.blasReference >> 32);
-      constants.instanceBufferOffset = batch.instanceBufferByteOffset;
+    const size_t batchesSize = batchCount * sizeof(PointInstancerCullingBatch);
+    const size_t threadBatchSize = size_t(threadCount) * sizeof(uint32_t);
+    const bool batchRealloc = ensureBuffer(m_batchesGpu, batchesSize, "RTX PointInstancer - Batches");
+    const bool threadRealloc = ensureBuffer(m_threadBatchGpu, threadBatchSize, "RTX PointInstancer - Thread Batch");
+    if (!batchesUnchanged || batchRealloc || threadRealloc) {
+      ctx->writeToBuffer(m_batchesGpu, 0, batchesSize, m_batchScratch.data());
+
+      m_threadBatchScratch.resize(threadCount);
+      for (size_t i = 0; i < batchCount; ++i) {
+        std::fill_n(m_threadBatchScratch.begin() + m_batchScratch[i].firstThread,
+                    m_batchScratch[i].instanceCount, static_cast<uint32_t>(i));
+      }
+      ctx->writeToBuffer(m_threadBatchGpu, 0, threadBatchSize, m_threadBatchScratch.data());
+
+      m_uploadedBatches = m_batchScratch;
+      m_uploadedThreadCount = threadCount;
+    }
+
+    // --- Dispatch ---
+    // When culling is disabled, use FLT_MAX so every instance passes the distance test.
+    const bool cullingEnabled = enable();
+    PointInstancerCullingConstants constants {};
+    constants.cameraPosition  = { cameraPosition.x, cameraPosition.y, cameraPosition.z };
+    constants.cullingRadius   = cullingEnabled ? cullingRadius() : FLT_MAX;
+    constants.fadeStartRadius = cullingEnabled ? fadeStartRadius() : 0.f;
+
+    ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_TRANSFORMS_INPUT,
+                            DxvkBufferSlice(m_transformsGpu, 0, std::max<size_t>(transformsSize, sizeof(Matrix4))));
+    ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_BATCHES, DxvkBufferSlice(m_batchesGpu, 0, batchesSize));
+    ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_THREAD_BATCH, DxvkBufferSlice(m_threadBatchGpu, 0, threadBatchSize));
+    ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_INSTANCE_BUFFER, DxvkBufferSlice(instanceBuffer));
+    ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_SURFACE_BUFFER, DxvkBufferSlice(surfaceBuffer));
+    ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_MATERIAL_BUFFER, DxvkBufferSlice(surfaceMaterialBuffer));
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PointInstancerCullingShader::getShader());
+
+    const auto dispatchRange = [&](uint32_t firstThread, uint32_t count) {
+      constants.firstThread = firstThread;
+      constants.threadCount = count;
 
       const DxvkBufferSliceHandle cSlice = m_cb->allocSlice();
       ctx->invalidateBuffer(m_cb, cSlice);
       ctx->writeToBuffer(m_cb, 0, sizeof(PointInstancerCullingConstants), &constants);
-
-      // Bind resources
       ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_CONSTANTS, DxvkBufferSlice(m_cb));
-      ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_TRANSFORMS_INPUT,
-                              DxvkBufferSlice(m_transformsGpu, 0, transformsSize));
-      ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_INSTANCE_BUFFER, DxvkBufferSlice(instanceBuffer));
-      ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_SURFACE_BUFFER, DxvkBufferSlice(surfaceBuffer));
-      ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_MATERIAL_BUFFER, DxvkBufferSlice(surfaceMaterialBuffer));
-
-      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PointInstancerCullingShader::getShader());
 
       const VkExtent3D workgroups = util::computeBlockCount(
         VkExtent3D { count, 1, 1 },
         VkExtent3D { 64, 1, 1 });
-
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+    };
+
+    if (singleDispatch()) {
+      dispatchRange(0, threadCount);
+    } else {
+      // One dispatch per batch (same data, same output).
+      for (const PointInstancerCullingBatch& batch : m_batchScratch) {
+        if (batch.instanceCount != 0) {
+          dispatchRange(batch.firstThread, batch.instanceCount);
+        }
+      }
     }
   }
 }

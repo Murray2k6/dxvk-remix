@@ -1,6 +1,7 @@
 #include "dxvk_cmdlist.h"
 #include "dxvk_device.h"
 #include "dxvk_scoped_annotation.h"
+#include "dxvk_perf_counters.h"
 
 namespace dxvk {
     
@@ -162,22 +163,118 @@ namespace dxvk {
     }
     // NV-DXVK end
 
+    m_perfInfo.submitNs = perf::nowNs(); // NV-DXVK: [GpuStall] watchdog context
     return submitToQueue(graphics.queueHandle, m_fence, info);
   }
   
   
+  // NV-DXVK start: [GpuStall] watchdog
+  std::string DxvkCommandList::describeForStallLog() const {
+    const char* content = m_perfInfo.injectRtx ? "Remix ray tracing frame (injectRTX)"
+                        : m_perfInfo.preGate ? "Remix ray tracing frame start, before the present-wait gate (injectRTX pre-gate)"
+                        : (m_perfInfo.accelBuilds != 0 || m_perfInfo.micromapBuilds != 0) ? "Remix AS/OMM builds without injectRTX"
+                        : "game/raster work";
+    const uint64_t now = perf::nowNs();
+    std::string s = str::format("cmdlist frame ", m_perfInfo.frameId, " (device frame now ", m_device->getCurrentFrameId(), ")",
+      ", content: ", content,
+      ", accel builds ", m_perfInfo.accelBuilds, ", OMM builds ", m_perfInfo.micromapBuilds,
+      ", draws ", m_statCounters.getCtr(DxvkStatCounter::CmdDrawCalls),
+      ", dispatches ", m_statCounters.getCtr(DxvkStatCounter::CmdDispatchCalls),
+      ", trace rays ", m_statCounters.getCtr(DxvkStatCounter::CmdTraceRaysCalls),
+      ", last Remix GPU stage recorded: ", m_perfInfo.lastStage ? m_perfInfo.lastStage : "(none)",
+      ", submitted ", m_perfInfo.submitNs != 0 && now > m_perfInfo.submitNs ? (now - m_perfInfo.submitNs) / 1000000ull : 0ull, " ms ago");
+
+    // [OmmBake] which OMM bake items this command list holds; with Aftermath the per-item checkpoint
+    // below names the exact one the GPU reached.
+    if (m_perfInfo.ommBakeItems != 0) {
+      s += str::format(", OMM bake items ", m_perfInfo.ommBakeItems, " (", m_perfInfo.ommBakeMicroTriangles,
+                       " micro-triangles), last recorded: [", m_perfInfo.lastOmmBake ? m_perfInfo.lastOmmBake : "?", "]");
+    } else {
+      s += ", OMM bake items 0";
+    }
+
+    // NV_device_diagnostic_checkpoints (only enabled with dxvk.enableAftermath): markers the GPU passed.
+    if (m_device->extensions().nvDeviceDiagnosticCheckpoints) {
+      uint32_t count = 0;
+      const VkQueue queue = m_device->queues().graphics.queueHandle;
+      m_vkd->vkGetQueueCheckpointDataNV(queue, &count, nullptr);
+      if (count != 0) {
+        std::vector<VkCheckpointDataNV> data(std::min(count, 16u));
+        for (auto& d : data) {
+          d.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+          d.pNext = nullptr;
+        }
+        count = uint32_t(data.size());
+        m_vkd->vkGetQueueCheckpointDataNV(queue, &count, data.data());
+        s += " | GPU checkpoints:";
+        for (uint32_t i = 0; i < count; ++i) {
+          s += str::format(" [stage ", uint32_t(data[i].stage), " ",
+                           data[i].pCheckpointMarker ? static_cast<const char*>(data[i].pCheckpointMarker) : "?", "]");
+        }
+      }
+    } else {
+      s += " | GPU checkpoints unavailable (set dxvk.enableAftermath = True for pass markers)";
+    }
+    return s;
+  }
+
+
   VkResult DxvkCommandList::synchronize() {
     ScopedCpuProfileZone();
     VkResult status = VK_TIMEOUT;
-    
+
+    // Poll in slices no longer than the warn threshold so a stall is reported promptly. Past
+    // rtx.gpuStallTimeoutSeconds the wait gives up and reports device loss: a GPU that stops
+    // completing work without a TDR otherwise hangs the process silently, while
+    // VK_ERROR_DEVICE_LOST takes the existing crash path (accel crash state, Aftermath dump
+    // wait, crash report, exit).
+    const uint64_t start = perf::nowNs();
+    uint64_t nextReportMs = 0;
+    bool stalled = false;
+
     while (status == VK_TIMEOUT) {
+      const uint32_t warnMs = perf::g_gpuStallWarnMs.load(std::memory_order_relaxed);
+      const uint64_t sliceNs = warnMs != 0 ? std::min<uint64_t>(uint64_t(warnMs) * 1000000ull, 1'000'000'000ull) : 1'000'000'000ull;
       status = m_vkd->vkWaitForFences(
         m_vkd->device(), 1, &m_fence, VK_FALSE,
-        1'000'000'000ull);
+        sliceNs);
+
+      if (status != VK_TIMEOUT) {
+        break;
+      }
+
+      const uint64_t waitedMs = (perf::nowNs() - start) / 1000000ull;
+      const uint32_t timeoutMs = perf::g_gpuStallTimeoutMs.load(std::memory_order_relaxed);
+      if (warnMs != 0 && waitedMs >= warnMs && waitedMs >= nextReportMs) {
+        if (!stalled) {
+          perf::g_gpuStallCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        stalled = true;
+        Logger::warn(str::format("[GpuStall] fence wait ", waitedMs, " ms and counting (watchdog timeout ",
+          timeoutMs != 0 ? str::format(timeoutMs / 1000, " s") : std::string("off"), ") | ", describeForStallLog()));
+        // Report at 1 s, then every 5 s.
+        nextReportMs = std::max<uint64_t>(waitedMs, warnMs) + 5000;
+      }
+      if (timeoutMs != 0 && waitedMs >= timeoutMs) {
+        Logger::err(str::format("[GpuStall] GPU made no progress for ", waitedMs, " ms (rtx.gpuStallTimeoutSeconds = ",
+          timeoutMs / 1000, "): treating as device loss so the GPU crash path runs | ", describeForStallLog()));
+        return VK_ERROR_DEVICE_LOST;
+      }
     }
-    
+
+    const uint64_t waitedMs = (perf::nowNs() - start) / 1000000ull;
+    uint32_t prevMax = perf::g_gpuStallMaxWaitMs.load(std::memory_order_relaxed);
+    while (uint32_t(waitedMs) > prevMax && !perf::g_gpuStallMaxWaitMs.compare_exchange_weak(prevMax, uint32_t(waitedMs))) { }
+    if (stalled) {
+      Logger::warn(str::format("[GpuStall] recovered: fence signaled after ", waitedMs, " ms (cmdlist frame ",
+        m_perfInfo.frameId, ", injectRTX ", m_perfInfo.injectRtx ? 1 : 0, m_perfInfo.preGate ? " (pre-gate)" : "",
+        ", accel builds ", m_perfInfo.accelBuilds,
+        ", last stage ", m_perfInfo.lastStage ? m_perfInfo.lastStage : "(none)", ")"));
+    }
+
     return status;
   }
+  // NV-DXVK end
   
   
   void DxvkCommandList::beginRecording() {
@@ -202,6 +299,11 @@ namespace dxvk {
     // Unconditionally mark the exec buffer as used. There
     // is virtually no use case where this isn't correct.
     m_cmdBuffersUsed = DxvkCmdBuffer::ExecBuffer;
+
+    // NV-DXVK start: [GpuStall] watchdog context
+    m_perfInfo = PerfInfo();
+    m_perfInfo.frameId = m_device->getCurrentFrameId();
+    // NV-DXVK end
   }
   
   

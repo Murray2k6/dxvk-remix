@@ -258,9 +258,14 @@ namespace dxvk {
      * \param [in] enabledFeatures Device features
      * \returns Device handle
      */
+    // NV-DXVK start: Unified frontend device ownership
+    // Returns the module-owned device for this adapter. initRtx upgrades a
+    // previously raster-only device before returning it to a Remix client.
+    // NV-DXVK end
     Rc<DxvkDevice> createDevice(
       const Rc<DxvkInstance>&   instance,
-            DxvkDeviceFeatures  enabledFeatures);
+            DxvkDeviceFeatures  enabledFeatures,
+            bool                initRtx = true);
     
     /**
      * \brief Registers memory allocation
@@ -307,7 +312,7 @@ namespace dxvk {
      * and general troubleshooting.
      */
     void logAdapterInfo() const;
-    
+
     /**
      * \brief Checks whether this is a UMA system
      *
@@ -316,9 +321,19 @@ namespace dxvk {
      * \returns \c true if the system has unified memory.
      */
     bool isUnifiedMemoryArchitecture() const;
-    
 
     // NV-DXVK start: Device filtering
+
+    /**
+     * \brief Checks whether a device extension is supported
+     *
+     * \param [in] pName Extension name
+     * \returns \c true if the extension is supported
+     */
+    bool supportsExtension(const char* pName) const {
+      return m_deviceExtensions.supports(pName) != 0;
+    }
+
     /**
      * \brief Checks if adapter is emulated
      *

@@ -59,7 +59,11 @@
 
 
 #define INTEGRATE_DIRECT_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT                    65
-#define INTEGRATE_DIRECT_BINDING_SPARSE_RENDERING_INDIRECT_ACTIVE_PIXEL_MASK_INPUT  66
+#define INTEGRATE_DIRECT_BINDING_ACTIVE_PIXEL_LIST_INPUT                            66
+
+#define INTEGRATE_DIRECT_BINDING_NRC_TRAINING_QUERY_RESERVOIR_INPUT                     69
+#define INTEGRATE_DIRECT_BINDING_PRIMARY_HIT_DISTANCE_INPUT                         70
+#define INTEGRATE_DIRECT_BINDING_SECONDARY_HIT_DISTANCE_INPUT                       71
 
 // Inputs/Outputs
 
@@ -80,6 +84,35 @@
 #define INTEGRATE_DIRECT_BINDING_INDIRECT_THROUGHPUT_CONE_RADIUS_OUTPUT             99
 
 #define INTEGRATE_DIRECT_BINDING_NEE_CACHE_SAMPLE                                   100
+
+#define INTEGRATE_DIRECT_BINDING_NRC_QUERY_PATH_INFO_OUTPUT                         101
+#define INTEGRATE_DIRECT_BINDING_NRC_TRAINING_PATH_INFO_OUTPUT                      102
+#define INTEGRATE_DIRECT_BINDING_NRC_TRAINING_PATH_VERTICES_OUTPUT                  103
+#define INTEGRATE_DIRECT_BINDING_NRC_QUERY_RADIANCE_PARAMS_OUTPUT                   104
+#define INTEGRATE_DIRECT_BINDING_NRC_COUNTERS_OUTPUT                                105
+#define INTEGRATE_DIRECT_BINDING_NRC_QUERY_PATH_DATA0_OUTPUT                        106
+#define INTEGRATE_DIRECT_BINDING_NRC_TRAINING_PATH_DATA1_OUTPUT                     107
+
+// The per-pixel record the split shade kernel writes and the split trace kernel reads.
+#define INTEGRATE_DIRECT_BINDING_SPLIT_RECORDS                                      108
+
+// The record layout: uint4 planes of (camera width * height) entries each, so neighbouring pixels are adjacent.
+// Plane 0 is written for every pixel whose selected surface is a hit, the others only as the header flags say.
+// Pixels whose selected surface missed get nothing, and the trace kernel skips them by the same G-buffer test.
+// The comments on the plane defines below give the packing of each plane.
+#define INTEGRATE_DIRECT_SPLIT_PLANE_LIGHT     0  // x: header, yzw: local light sample position (fp32)
+#define INTEGRATE_DIRECT_SPLIT_PLANE_RADIANCE  1  // xyz: local diffuse rgb + specular rgb (fp16), w: illuminance or origin position error
+#define INTEGRATE_DIRECT_SPLIT_PLANE_SUN       2  // xyz: sun diffuse rgb + specular rgb (fp16), w: sun direction (snorm16x2 octahedral)
+// A secondary integration surface's G-buffer origin is aliased with outputs the shade kernel writes, so the record carries
+// it. The sun sample is taken on primary surfaces only, so the two never meet.
+#define INTEGRATE_DIRECT_SPLIT_PLANE_ORIGIN    2  // encoded world position / triangle TBN, aliasing the sun plane
+#define INTEGRATE_DIRECT_SPLIT_PLANE_COUNT     3
+
+// The header: these flags, the sampled transport portal index << 8 and the light index << 16.
+#define INTEGRATE_DIRECT_SPLIT_FLAG_LOCAL      (1u << 0) // a valid local light sample (RTXDI / RIS / light BVH)
+#define INTEGRATE_DIRECT_SPLIT_FLAG_RTXDI      (1u << 1) // the local sample came from the RTXDI reservoir
+#define INTEGRATE_DIRECT_SPLIT_FLAG_SUN        (1u << 2) // a valid dedicated sun sample
+#define INTEGRATE_DIRECT_SPLIT_FLAG_ORIGIN     (1u << 3) // the origin plane holds the secondary surface's origin
 
 // Aliased Inputs/Outputs
 

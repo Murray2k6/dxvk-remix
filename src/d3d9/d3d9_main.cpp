@@ -13,6 +13,8 @@
 #include "version.h"
 // NV-DXVK end
 
+#include "../dxvk/rtx_render/rtx_session_log.h"
+
 #include <windows.h>
 
 class D3DFE_PROCESSVERTICES;
@@ -34,25 +36,7 @@ namespace dxvk {
     if (!ppDirect3D9Ex)
       return D3DERR_INVALIDCALL;
       
-// NV-DXVK start: Set up rtx filesystem and Sentry crash reporting
-    // If Direct3DCreate9 is invoked more than once, we want our static
-    // state to remain.
-    ONCE(
-      if (!util::RtxFileSys::isInitialized()) {
-        const auto exePath = env::getExePath();
-        const auto exeDir = std::filesystem::path(exePath).parent_path();
-        util::RtxFileSys::init(exeDir.string());
-      }
-      Logger::initRtxLog();
-      util::RtxFileSys::print();
-      
-      // Initialize Sentry crash reporting (safe to call outside DllMain)
-      const auto remixVersion = std::string("dxvk-remix@") + DXVK_VERSION;
-      sentry::initialize(remixVersion.c_str());
-      // Prompt for crash report upload as early as possible (before any code that might crash on launch)
-      sentry::showCrashReportDialogIfNeeded();
-    );
-// NV-DXVK end
+
 
 // NV-DXVK start: external API / provide error code on exception
     try {
@@ -146,12 +130,13 @@ constexpr bool strings_equal(char const * a, char const * b) {
 }
 
 extern "C" {
-  DLLEXPORT void __stdcall RtxSentryRunUploadHelper(const char* sentryDatabasePathUtf8, const char* crashType) {
-    dxvk::sentry::runUploadHelper(sentryDatabasePathUtf8, crashType);
-  }
-
   DLLEXPORT void __stdcall RtxSentryShutdown() {
     dxvk::sentry::shutdown();
+  }
+
+  // The bridge server calls this when the game ends the session, before it ends its own process.
+  DLLEXPORT void __stdcall RtxLogSessionEnd(const char* reason) {
+    dxvk::RtxSessionLog::logShutdown(reason);
   }
 
   DLLEXPORT uint64_t __stdcall QueryFeatureVersion(version::Feature feat) {

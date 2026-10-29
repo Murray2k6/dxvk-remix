@@ -128,7 +128,19 @@ namespace dxvk {
     uint32_t remixShaderCompilationCount() const {
       return m_workerCompilingRemixShaders.load();
     }
+
+    // Remix pipelines a worker has been creating for longer than kSlowCompileMs. A pipeline served from the
+    // pipeline cache (or the driver's) takes a few ms, so these are real compiles; queued pipelines and cache hits
+    // do not count. VK_PIPELINE_CREATION_FEEDBACK only reports a hit after the creation, too late for an in-flight
+    // count, so the HUD uses this time test while the logs and the summary use the feedback.
+    static constexpr int64_t kSlowCompileMs = 50;
+    uint32_t remixShaderSlowCompileCount() const;
 // NV-DXVK end
+
+    // Remix pipelines queued for the workers since the device was created, finished or not.
+    uint32_t remixShaderQueuedCount() const {
+      return m_remixItemsQueued.load();
+    }
 
   private:
 
@@ -155,6 +167,24 @@ namespace dxvk {
         return cp.hash() ^ gp.hash();
       }
       // NV-DXVK end
+
+      // The key of m_workerItemsInFlight. It adds the shader objects to hash(), because two shader objects with
+      // identical SPIR-V (two variant names that compile to one binary) have separate pipeline objects, and each
+      // must be compiled.
+      size_t inFlightKey() const {
+        DxvkHashState state;
+        state.add(hash());
+        state.add(reinterpret_cast<size_t>(cp.cs.ptr()));
+        for (const DxvkShader* shader : { gp.vs.ptr(), gp.tcs.ptr(), gp.tes.ptr(), gp.gs.ptr(), gp.fs.ptr() })
+          state.add(reinterpret_cast<size_t>(shader));
+        for (const auto& group : rt.groups) {
+          state.add(reinterpret_cast<size_t>(group.generalShader.ptr()));
+          state.add(reinterpret_cast<size_t>(group.closestHitShader.ptr()));
+          state.add(reinterpret_cast<size_t>(group.anyHitShader.ptr()));
+          state.add(reinterpret_cast<size_t>(group.intersectionShader.ptr()));
+        }
+        return state;
+      }
     };
 
     DxvkPipelineManager*              m_pipeManager;
@@ -187,7 +217,11 @@ namespace dxvk {
     // NV-DXVK start
     std::atomic<uint32_t>             m_workerCompilingRemixShaders;
     // NV-DXVK end
+    std::atomic<uint32_t>             m_remixItemsQueued = { 0 };
     std::vector<dxvk::thread>         m_workerThreads;
+    // Per worker, the steady_clock time (ms) its current Remix pipeline started, 0 when idle.
+    std::unique_ptr<std::atomic<int64_t>[]> m_workerRemixStartMs;
+    uint32_t                          m_workerCount = 0;
 
     dxvk::mutex                       m_writerLock;
     dxvk::condition_variable          m_writerCond;
@@ -247,7 +281,7 @@ namespace dxvk {
       const DxvkStateCacheEntryV6&    in,
             DxvkStateCacheEntry&      out) const;
     
-    void workerFunc();
+    void workerFunc(uint32_t workerIndex);
 
     void writerFunc();
 

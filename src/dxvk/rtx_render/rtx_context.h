@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -29,8 +29,12 @@
 
 #include <cstdint>
 #include <chrono>
+#include <functional>
 #include <optional>
+#include <array>
 #include "rtx_options.h"
+#include "rtx_perf_log.h"
+#include "rtx_fork_frame_features.h"
 
 struct VolumeArgs;
 struct RaytraceArgs;
@@ -42,40 +46,39 @@ namespace dxvk {
   class TerrainBaker;
   struct ExternalDrawState;
 
-  struct D3D9RtxVertexCaptureData;
-  struct D3D9SharedPS;
-  
-  struct DrawParameters {
-    uint32_t vertexCount = 0;
-    uint32_t indexCount = 0;
-    uint32_t instanceCount = 0;
-    uint32_t firstIndex = 0;
-    uint32_t vertexOffset = 0;
-  };
+  namespace frontend {
+    struct RasterDrawInfo;
+    struct RasterPass;
+    struct RasterResult;
+  }
 
-  // Forward declarations of fork_hooks functions that require friend access to
-  // RtxContext private members, so the friend declarations inside the class body
-  // can name them. See rtx_fork_hooks.h for the full hook catalogue.
-  // Note: Resources::RaytracingOutput is fully defined via #include "rtx_resources.h"
-  // above; RtxContext is forward-declared here so the fork_hooks signatures compile
-  // before the class definition is encountered.
+  // Forward declarations of the hooks that need friend access to RtxContext private members.
+  // See rtx_fork_hooks.h.
   class RtxContext;
+  class RtxPostProcessingStack;
   namespace fork_hooks {
+    void dispatchPostProcessingStack(
+      Rc<RtxContext> ctx,
+      Resources::RaytracingOutput& rtOutput,
+      bool performSRGBConversion,
+      bool updateAutoExposure);
     void dispatchScreenOverlay(RtxContext&, Resources::RaytracingOutput&);
     bool isFsrUpscalerActive(RtxContext&);
     void dispatchFsrUpscale(RtxContext&, const Resources::RaytracingOutput&);
     void dispatchRcasSharpening(RtxContext&, const Resources::RaytracingOutput&);
-    void dispatchFsrFrameGeneration(RtxContext&, const Rc<DxvkImage>& hudLessBackBuffer);
     void setFsrDownscaleExtent(RtxContext&, const VkExtent3D& upscaleExtent, VkExtent3D& downscaleExtent);
   } // namespace fork_hooks
-
-  /**
+  /** 
    * \brief RTX context
-   *
+   * 
    * Tracks pipeline state and records command lists.
    * This is where the actual rendering commands are
    * recorded.
    */
+
+  // The bound a scene-command drain emitted now on `device`'s command stream applies retained commands up to
+  // (SceneCommandQueue::issued). API threads only.
+  uint64_t sceneCommandsIssued(DxvkDevice& device);
 
   class RtxContext : public DxvkContext {
 
@@ -108,32 +111,47 @@ namespace dxvk {
 
     void onPresent(Rc<DxvkImage> targetImage = nullptr);
 
-    /**
-      * \brief Set D3D9 specific constant buffers
-      *
-      * \param [in] vsFixedFunctionConstants: resource idx of the constant buffer for FF vertex shaders
-      * \param [in] psFixedFunctionConstants: resource idx of the constant buffer for FF pixel shaders
-      * \param [in] vertexCaptureCB: constant buffer for vertex capture
-      */
-    void setConstantBuffers(const uint32_t vsFixedFunctionConstants, const uint32_t psFixedFunctionConstants, Rc<DxvkBuffer> vertexCaptureCB);
-
-    /**
-      * \brief Adds a batch of lights to the scene context
-      *
-      * \param [in] pLights: array of light structures
-      * \param [in] numLights: number of lights
-      */
-    void addLights(const D3DLIGHT9* pLights, const uint32_t numLights);
-
     void clearRenderTarget(const Rc<DxvkImageView>& imageView, VkImageAspectFlags clearAspects, VkClearValue clearValue);
     void clearImageView(const Rc<DxvkImageView>& imageView, VkOffset3D offset, VkExtent3D extent, VkImageAspectFlags aspect, VkClearValue value);
 
-    void commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState);
+    // The raster services' passes (frontend::RasterService). Each calls draw once per pass, with the pass's target
+    // bound, and restores the render targets and viewports afterwards.
+    void rasterizeSky(const frontend::RasterDrawInfo& info, const std::function<void(const frontend::RasterPass&)>& draw);
+    void bakeTerrain(const frontend::RasterDrawInfo& info, const std::function<void(const frontend::RasterPass&)>& draw,
+                     frontend::RasterResult& result);
     void commitExternalGeometryToRT(std::unique_ptr<ExternalDrawState> state);
+    void commitRetainedExternalGeometry(const Vector3& sceneOrigin);
+    // Applies every retained command queued by the API threads, in order; a frame marker
+    // among them runs commitRetainedExternalGeometry. CS thread.
+    // Applies the retained commands queued up to `bound`, a SceneCommandQueue::issued() value taken on the API thread
+    // when the drain was emitted.
+    void drainSceneCommands(uint64_t bound);
+
+    // The bound of the next injectRTX drain, taken on the thread that emitted the injection.
+    void setInjectionSceneCommandBound(uint64_t bound) { m_injectionSceneCommandBound = bound; }
+
+    // An image handed over from another API was written with barriers that
+    // did not name ray tracing. The next frame emits one barrier for all.
+    void requestImportedImageBarrier() { m_importedImageBarrierPending = true; }
 
     // Queue a pixel buffer to be alpha-composited over the final tone-mapped image in the next frame.
     // Used by remixapi_DrawScreenOverlay. Ownership of stagingBuffer transfers here.
     void setScreenOverlayData(Rc<DxvkBuffer> stagingBuffer, uint32_t width, uint32_t height, VkFormat format, float opacity);
+
+    // GPU screen overlay (remixapi_DrawScreenOverlayD3D11). Copies mip 0 of
+    // each source into a persistent per-slot image, recreated only when the
+    // slot's size or format changes, and replaces the composited layer set.
+    // The set keeps compositing every frame until the next call; an empty
+    // set clears it and frees the slot images.
+    struct GpuScreenOverlaySource {
+      Rc<DxvkImage> image;
+      uint32_t flags = 0;     // SCREEN_OVERLAY_FLAG_*
+      float opacity = 1.0f;
+      float rect[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+      float alphaCutoff = 0.0f; // > 0: drop pixels whose sampled alpha is <= this
+    };
+    static constexpr uint32_t kMaxGpuScreenOverlayLayers = 8;
+    void setGpuScreenOverlayLayers(std::vector<GpuScreenOverlaySource>&& layers);
 
     static void blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const Rc<DxvkImage>& dstImage, VkFilter filter);
 
@@ -142,7 +160,6 @@ namespace dxvk {
     SceneManager& getSceneManager();
     Resources& getResourceManager();
   
-    static void triggerScreenshot() { s_triggerScreenshot = true; }
     static void triggerUsdCapture() { s_triggerUsdCapture = true; }
 
     void bindCommonRayTracingResources(const Resources::RaytracingOutput& rtOutput);
@@ -152,14 +169,7 @@ namespace dxvk {
     void getDenoiseArgs(NrdArgs& outPrimaryDirectNrdArgs, NrdArgs& outPrimaryIndirectNrdArgs, NrdArgs& outSecondaryNrdArgs);
     void updateRaytraceArgsConstantBuffer(Resources::RaytracingOutput& rtOutput, const VkExtent3D& downscaledExtent, const VkExtent3D& targetExtent);
 
-    D3D9RtxVertexCaptureData& allocAndMapVertexCaptureConstantBuffer();
-    D3D9FixedFunctionVS& allocAndMapFixedFunctionVSConstantBuffer();
-    D3D9SharedPS& allocAndMapPSSharedStateConstantBuffer();
-
     static bool checkIsShaderExecutionReorderingSupported(DxvkDevice& device);
-
-    const DxvkScInfo& getSpecConstantsInfo(VkPipelineBindPoint pipeline) const;
-    void setSpecConstantsInfo(VkPipelineBindPoint pipeline, const DxvkScInfo& newSpecConstantInfo);
 
     bool useRayReconstruction() const;
 
@@ -179,11 +189,52 @@ namespace dxvk {
 #endif
     }
 
+    // Labels must outlive the delayed query readback.
+    void recordGpuStageTiming(const char* label);
+
+    // This frame's feature mask, computed once right after updateRaytraceArgsConstantBuffer. The slim
+    // selectors of the G-buffer, direct and indirect passes read it (rtx_fork_frame_features.h).
+    const RtFrameFeatures& getFrameFeatures() const { return m_frameFeatures; }
+
+    // Whether binding `shader` (compute) would find its pipeline compiled for the current compute state,
+    // without waiting for a compile in progress. Defined in rtx_fork_variant_tables.cpp.
+    bool isComputeShaderPipelineReady(const Rc<DxvkShader>& shader);
+
+    // rtx.present.midFrameFlushes. Submits the command list recorded so far when
+    // `pointBit` is set in the option (a submission boundary between large ray tracing dispatches). Only call
+    // between passes (no render pass or external-SDK recording open). No-op in Tracy builds: TracyVkZone keeps
+    // the VkCommandBuffer it opened on and would write its end timestamp into an already submitted buffer.
+    void midFrameFlush(uint32_t pointBit);
+    // rtx.present.presentWaitPreGateFlush. Like midFrameFlush, but the submitted list is
+    // not marked as ray tracing work, so the present-wait gate lets it through and holds the next one.
+    void preGateFlush(uint32_t point);
+    // rtx.present.presentWaitPreGateMax*: this frame's BLAS / OMM work since `buildBase` exceeds a guard limit.
+    bool preGateHeavyFrame(const uint64_t (&buildBase)[8]);
+    // Shared by midFrameFlush / preGateFlush: endRecording, submit without Reflex markers, beginRecording.
+    void submitFrameSegment();
+
+    RTX_OPTION("rtx.profile", bool, gpuStages, false,
+               "Logs sampled GPU stage timings every 120 rendered frames. The timestamps can reduce overlap between "
+               "passes, so turn this off for performance comparisons.");
+
   protected:
     virtual void updateComputeShaderResources() override;
     virtual void updateRaytracingShaderResources() override;
 
   private:
+    // SceneCommandQueue::issued() when the next injectRTX was emitted (setInjectionSceneCommandBound).
+    uint64_t m_injectionSceneCommandBound = 0;
+    // The highest drain bound applied so far; a drain never goes below it.
+    uint64_t m_sceneCommandsApplied = 0;
+    // Device frame of the last retained frame marker applied, and how many it applied: one per device frame, two when
+    // the first was held over from the frame before (so a backlog shrinks).
+    uint32_t m_sceneFrameMarkerFrame = UINT32_MAX;
+    uint32_t m_sceneFrameMarkers = 0;
+    uint32_t m_sceneFrameMarkerLimit = 1;
+    bool m_sceneFrameMarkerHeld = false;
+    // Drained device frames by how many frame markers they applied (0, 1, 2+), for the [SceneQueue] line.
+    uint32_t m_sceneFrameMarkerCounts[3] = {};
+
     // This enum is for internal use only.
     // There is a mode called UpscalerType in RtxOptions, but it doesn't contain DLSS-RR because RR is considered as a special mode of DLSS.
     enum class InternalUpscaler {
@@ -202,7 +253,7 @@ namespace dxvk {
 
     void checkOpacityMicromapSupport();
     void checkShaderExecutionReorderingSupport();
-    void checkNeuralRadianceCacheSupport();
+    void checkIndirectModeSupport();
 
     VkExtent3D setDownscaleExtent(const VkExtent3D& upscaleExtent);
 
@@ -211,6 +262,63 @@ namespace dxvk {
 
     void dispatchVolumetrics(const Resources::RaytracingOutput& rtOutput);
     void dispatchIntegrate(const Resources::RaytracingOutput& rtOutput);
+
+    void beginGpuStageTiming();
+    void endGpuStageTiming();
+    struct GpuStageFrame {
+      std::array<Rc<DxvkGpuQuery>, 80> queries;
+      std::array<const char*, 80> labels = {};
+      uint32_t count = 0;
+      uint32_t frameId = 0;
+      bool pending = false;
+    };
+    // 16 slots: samples are read back 8+ frames late, and rtx.profile.detailedLogging samples every 1-2 frames.
+    std::array<GpuStageFrame, 16> m_gpuStageFrames;
+    uint32_t m_gpuStageSampleCounter = 0;
+    uint32_t m_gpuStageNextSlot = 0;
+    int m_gpuStageSlot = -1;
+
+    // The always-on [Perf] window: about 30 s of ray traced frames (rtx_context.cpp, recordPerfWindow).
+    struct PerfWindow {
+      bool started = false;
+      std::chrono::steady_clock::time_point windowStart;
+      std::chrono::steady_clock::time_point lastFrame;
+      std::vector<float> frameMs;
+      double injectMs = 0.0;
+      double scenePrepMs = 0.0;
+      double retainedMs = 0.0;
+      double apiDrawMs = 0.0;
+      uint64_t apiDraws = 0;
+      uint64_t csThreadCpuStart = 0; // 100 ns units
+      uint64_t gpuIdleStart = 0;
+      uint64_t gpuSyncStart = 0;
+      uint64_t csSyncStart = 0;
+      uint64_t csExecStart = 0;
+      uint64_t textureCountStart = 0;
+      uint64_t buildStart[8] = {};
+      struct Stage { const char* label; double ms; };
+      std::vector<Stage> stages;
+      uint32_t stageSamples = 0;
+      uint32_t stageSamplesDropped = 0; // non-monotonic (stale) timestamp samples
+      double stageMeasuredMs = 0.0;
+    } m_perfWindow;
+
+    // The [Perf] windows of the whole session, for [PerfSummary].
+    struct PerfSession {
+      struct Window {
+        float fps;
+        uint8_t verdict;
+        char time[16];
+      };
+      std::vector<Window> windows;
+      std::chrono::steady_clock::time_point lastSummary;
+      std::chrono::steady_clock::time_point lastSlowLog;
+      uint32_t slowLogged = 0;
+      uint32_t windowsAtLastSummary = 0;
+    } m_perfSession;
+    void recordPerfWindow(double injectMs, double scenePrepMs);
+    void logPerfSummary(const char* when);
+
     void dispatchPathTracing(const Resources::RaytracingOutput& rtOutput);
     void dispatchDemodulate(const Resources::RaytracingOutput& rtOutput);
     void dispatchNeeCache(const Resources::RaytracingOutput& rtOutput);
@@ -222,27 +330,27 @@ namespace dxvk {
     void dispatchNIS(const Resources::RaytracingOutput& rtOutput);
     void dispatchXeSS(const Resources::RaytracingOutput& rtOutput);
     void dispatchTemporalAA(const Resources::RaytracingOutput& rtOutput);
-    void dispatchToneMapping(const Resources::RaytracingOutput& rtOutput);
+    bool dispatchDlssNR(const Resources::RaytracingOutput& rtOutput);
+    void dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool updateAutoExposure = true);
     void dispatchBloom(const Resources::RaytracingOutput& rtOutput);
     void dispatchPostFxMotionBlur(Resources::RaytracingOutput& rtOutput);
+    void dispatchPostFxDof(Resources::RaytracingOutput& rtOutput);
+    void dispatchPostFxNtsc(Resources::RaytracingOutput& rtOutput);
     void dispatchPostFxLensEffects(Resources::RaytracingOutput& rtOutput);
     void dispatchSRGBDither(const Resources::RaytracingOutput& rtOutput, bool performSRGBConversion);
     void dispatchDebugView(Rc<DxvkImage>& srcImage, const Resources::RaytracingOutput& rtOutput, bool captureScreenImage);
     void dispatchObjectPicking(Resources::RaytracingOutput& rtOutput, const VkExtent3D& srcExtent, const VkExtent3D& targetExtent);
-    void dispatchDLFG();
+    void dispatchFrameInterpolation(const Rc<DxvkImage>& finalOutput);
     void dispatchScreenOverlay(Resources::RaytracingOutput& rtOutput);
     void updateMetrics(const float gpuIdleTimeMilliseconds) const;
-    void rasterizeToSkyMatte(const DrawParameters& params, const DrawCallState& drawCallState);
+    void rasterizeToSkyMatte(const frontend::RasterDrawInfo& info, const std::function<void(const frontend::RasterPass&)>& draw,
+                             frontend::RasterPass& pass);
     void initSkyProbe();
-    void rasterizeToSkyProbe(const DrawParameters& params, const DrawCallState& drawCallState);
-    void rasterizeSky(const DrawParameters& params, const DrawCallState& drawCallState);
-    enum class TryHandleSkyResult {
-      Default,
-      SkipSubmit,
-    };
-    TryHandleSkyResult tryHandleSky(const DrawParameters* originalParams, DrawCallState* originalDrawCallState /* can be std::move-d */);
+    void rasterizeToSkyProbe(const frontend::RasterDrawInfo& info, const std::function<void(const frontend::RasterPass&)>& draw,
+                             frontend::RasterPass& pass);
+    // The sky matte and probe formats from the bound render target, and the probe's views.
+    void initSkyTargets();
 
-    void bakeTerrain(const DrawParameters& params, DrawCallState& drawCallState, const MaterialData** outOverrideMaterialData);
 
     InternalUpscaler getCurrentFrameUpscaler();
 
@@ -267,13 +375,21 @@ namespace dxvk {
     bool shouldUseXeSS() const;
     bool shouldUseUpscaler() const { return shouldUseDLSS() || shouldUseNIS() || shouldUseTAA() || shouldUseXeSS() || RtxOptions::isFSREnabled(); }
 
-    inline static bool s_triggerScreenshot = false;
     inline static bool s_triggerUsdCapture = false;
     inline static const bool s_capturePrePresentTestScreenshot = env::getEnvVar("RTX_TAKE_PRE_PRESENT_SCREENSHOT_FRAME") != "";
 
     bool m_rayTracingSupported;
     bool m_dlssSupported;
     bool m_submitContainsInjectRtx = false;
+    // rtx.present.presentWaitPreGateFlush point resolved for the frame being recorded (0 = no split).
+    uint32_t m_preGatePoint = 0;
+    // See getFrameFeatures().
+    RtFrameFeatures m_frameFeatures;
+    // rtx.profile.detailedLogging
+    RtxPerfLog m_perfLog;
+    RtxPerfLog::CpuFrame m_perfCpu;
+    bool m_perfCpuActive = false;
+    bool m_importedImageBarrierPending = false;
     uint64_t m_cachedReflexFrameId = 0;
 
     bool m_resetHistory = true;    // Discards use of temporal data in passes
@@ -286,18 +402,14 @@ namespace dxvk {
     bool m_triggerDelayedTerminate = false;
     uint32_t m_screenshotFrameNum = -1;
     uint32_t m_terminateAppFrameNum = -1;
-    uint32_t m_framesWithoutValidScene = 0;
     IntegrateIndirectMode m_prevIntegrateIndirectMode = IntegrateIndirectMode::Count;
 
-    DxvkRaytracingInstanceState m_rtState;
 
     struct {
       std::atomic<uint64_t>           signalValue = 1;
       Rc<sync::Fence>                 signal = new sync::Fence{};
       std::vector<std::future<void>>  asyncTasks = {};
     } m_objectPickingReadback {};
-
-    std::vector<DrawCallState> m_delayedRayTracedSky;
 
     // Screen overlay state - populated by remixapi_DrawScreenOverlay via setScreenOverlayData,
     // consumed and cleared by dispatchScreenOverlay once per frame.
@@ -314,6 +426,16 @@ namespace dxvk {
     uint32_t m_screenOverlayWidth = 0;
     uint32_t m_screenOverlayHeight = 0;
     VkFormat m_screenOverlayFormat = VK_FORMAT_UNDEFINED;
+    struct GpuScreenOverlaySlot {
+      Rc<DxvkImage> image;
+      Rc<DxvkImageView> view;
+      uint32_t flags = 0;
+      float opacity = 1.0f;
+      float rect[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+      float alphaCutoff = 0.0f;
+    };
+    std::array<GpuScreenOverlaySlot, kMaxGpuScreenOverlayLayers> m_gpuScreenOverlay;
+    uint32_t m_gpuScreenOverlayCount = 0;
 
 #ifdef REMIX_DEVELOPMENT
     void queryAvailableResourceAliasing();
@@ -334,15 +456,12 @@ namespace dxvk {
     RtxFramePassStage m_currentPassStage = RtxFramePassStage::FrameBegin;
 #endif
 
-    // Grant fork_hooks functions access to private members they require.
-    // Each friend corresponds to a hook that was lifted out of this class's
-    // method bodies during the 2026-04-18 fork touchpoint-pattern refactor.
-    // See docs/fork-touchpoints.md and rtx_fork_hooks.h for the catalogue.
+    // Grant the hooks access to the private state above. See rtx_fork_hooks.h.
     friend void fork_hooks::dispatchScreenOverlay(RtxContext&, Resources::RaytracingOutput&);
     friend bool fork_hooks::isFsrUpscalerActive(RtxContext&);
     friend void fork_hooks::dispatchFsrUpscale(RtxContext&, const Resources::RaytracingOutput&);
     friend void fork_hooks::dispatchRcasSharpening(RtxContext&, const Resources::RaytracingOutput&);
-    friend void fork_hooks::dispatchFsrFrameGeneration(RtxContext&, const Rc<DxvkImage>&);
+    friend class RtxPostProcessingStack;
     friend void fork_hooks::setFsrDownscaleExtent(RtxContext&, const VkExtent3D&, VkExtent3D&);
   };
 } // namespace dxvk

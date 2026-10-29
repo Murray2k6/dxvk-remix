@@ -87,10 +87,12 @@ namespace dxvk
     class SharedResource : public RcObject {
     public:
       SharedResource(Resource&& _resource);
+      SharedResource(Rc<DxvkBuffer>&& _buffer);
 #ifdef REMIX_DEVELOPMENT  
       std::weak_ptr<const AliasedResource*> owner;
 #endif
       Resource resource;
+      Rc<DxvkBuffer> buffer;
     };
 
     enum class AccessType {
@@ -133,7 +135,7 @@ namespace dxvk
                       const VkImageType imageType = VK_IMAGE_TYPE_2D,
                       const VkImageViewType imageViewType = VK_IMAGE_VIEW_TYPE_2D);
 
-      AliasedResource(const AliasedResource& other, const char* name = nullptr);
+      AliasedResource(const AliasedResource& other, const char* name);
       AliasedResource(AliasedResource& other) = delete;   // Prevent shallow copy
       AliasedResource& operator=(AliasedResource&& other);
 
@@ -184,6 +186,13 @@ namespace dxvk
         return m_sharedResource == nullptr || m_view == nullptr;
       }
 
+    protected:
+      AliasedResource(DxvkDevice* device, Rc<DxvkBuffer>&& buffer, const char* name);
+
+      const Rc<DxvkBuffer>& sharedBuffer() const {
+        return m_sharedResource->buffer;
+      }
+
     private:
       void takeOwnership() const;
 
@@ -211,6 +220,17 @@ namespace dxvk
 #endif
     };
 
+    class AliasedBuffer : private AliasedResource {
+    public:
+      AliasedBuffer() = default;
+      AliasedBuffer(DxvkDevice* device, Rc<DxvkBuffer>&& buffer, const char* name);
+      AliasedBuffer(const AliasedBuffer& other, const char* name);
+      AliasedBuffer(AliasedBuffer& other) = delete;   // Prevent shallow copy
+      AliasedBuffer& operator=(AliasedBuffer&& other) = default;
+
+      DxvkBufferSlice slice(AccessType accessType, bool isAccessedByGPU = true) const;
+    };
+
     // a queue of N resources used over N frames
     struct ResourceQueue : public std::array<Resource, kDLFGMaxGPUFramesInFlight> {
       Resource& get() {
@@ -225,6 +245,10 @@ namespace dxvk
         idx = (idx + 1) % size();
       }
 
+      void rewind() {
+        idx = 0;
+      }
+
     private:
       int idx = 0;
     };
@@ -234,6 +258,7 @@ namespace dxvk
       Resource m_sharedFlags;
       Resource m_sharedRadianceRG;
       Resource m_sharedRadianceB;
+      Resource m_atmosphereForeground;
       AliasedResource m_sharedIntegrationSurfacePdf;
       Resource m_sharedMaterialData0;
       Resource m_sharedMaterialData1;
@@ -267,10 +292,6 @@ namespace dxvk
       Resource m_primaryPositionError;
       AliasedResource m_primaryRtxdiIlluminance[2];
       AliasedResource m_primaryRtxdiTemporalPosition;
-      // m_primaryCloudShadowFactor (fork — 2026-05-18) removed 2026-06-19. The
-      // screen-space cumulus-shadow texture was deleted when the cloud shadow was
-      // re-architected onto the sun term in the NEE (sampleAtmosphereSunLight),
-      // so the high-frequency pattern is no longer routed around the denoiser.
       Resource m_primarySurfaceFlags;
       Resource m_primaryDisocclusionThresholdMix;
       AliasedResource m_primaryDisocclusionMaskForRR;
@@ -297,15 +318,9 @@ namespace dxvk
       // Resource containing 1spp radiance from indirect pass - with each pixel containing {diffuse | specular} for a {primary | secondary} surface
       AliasedResource m_indirectRadianceHitDistance;
       AliasedResource m_rayReconstructionHitDistance;
-      Resource m_rayReconstructionParticleBuffer;
-      Resource m_sparseRenderingDirectActivePixelMask;
-      Resource m_sparseRenderingIndirectActivePixelMask;
-      Resource m_sparseRenderingUnionActivePixelMask;
-      Resource m_sparseRenderingDirectPixelSamplingRate;
-      Resource m_sparseRenderingIndirectPixelSamplingRate;
-      Resource m_sparseRenderingDirectActiveLocalPixelCoords;
-      Resource m_sparseRenderingIndirectActiveLocalPixelCoords;
-      Resource m_sparseRenderingUnionActiveLocalPixelCoords;
+      Resource m_sparseRenderingActivePixelMask;
+      Resource m_sparseRenderingPixelSamplingRate;
+      Resource m_sparseRenderingActiveLocalPixelCoords;
 
       AliasedResource m_primaryDirectDiffuseRadiance;
       AliasedResource m_primaryDirectSpecularRadiance;
@@ -319,12 +334,17 @@ namespace dxvk
       AliasedResource m_indirectFirstSampledLobeData;
       AliasedResource m_indirectFirstHitPerceptualRoughness;
 
-      AliasedResource m_gbufferPSRData[7];
+      AliasedResource m_gbufferPSRData[3];
 
       // DLSSRR data
       AliasedResource m_primaryDepthDLSSRR;
       AliasedResource m_primaryWorldShadingNormalDLSSRR;
       Resource m_primaryScreenSpaceMotionVectorDLSSRR;
+
+      // DLSSNR Data
+      AliasedResource m_neuralRenderingOutput;
+      Resource m_controlMask;
+      AliasedResource m_neuralRenderingInput;
 
       Resource m_bsdfFactor;
 
@@ -334,7 +354,7 @@ namespace dxvk
       VkExtent3D m_finalOutputExtent;
       AliasedResource m_finalOutput;
 
-      Resource m_postFxIntermediateTexture;
+      AliasedResource m_postFxIntermediateTexture;
 
       Resource m_gbufferLast;
       Resource m_reprojectionConfidence;
@@ -345,7 +365,8 @@ namespace dxvk
       AliasedResource m_primarySurfaceFlagsIntermediateTexture1;
       AliasedResource m_primarySurfaceFlagsIntermediateTexture2;
 
-      Rc<DxvkBuffer> m_rtxdiReservoirBuffer;
+      AliasedBuffer m_rtxdiReservoirBuffer;
+      AliasedBuffer m_transmissionPSRData;
 
       Rc<DxvkBuffer> m_neeCache;
       Rc<DxvkBuffer> m_neeCacheTask;
@@ -410,9 +431,6 @@ namespace dxvk
     Rc<DxvkImageView> getWhiteTexture(Rc<DxvkContext> ctx);
     Resources::Resource getSkyProbe(Rc<DxvkContext> ctx, VkFormat format = VK_FORMAT_UNDEFINED);
     Resources::Resource getSkyMatte(Rc<DxvkContext> ctx, VkFormat format = VK_FORMAT_UNDEFINED);
-    Resources::Resource getAtmosphereTransmittanceLut(Rc<DxvkContext> ctx);
-    Resources::Resource getAtmosphereMultiscatteringLut(Rc<DxvkContext> ctx);
-    Resources::Resource getAtmosphereSkyViewLut(Rc<DxvkContext> ctx);
     Rc<DxvkImageView> getCompatibleViewForView(const Rc<DxvkImageView>& view, VkFormat format);
 
     Rc<DxvkSampler> getSampler(const VkFilter filter, const VkSamplerMipmapMode mipFilter,
@@ -424,17 +442,6 @@ namespace dxvk
     Rc<DxvkSampler> getSampler(const VkFilter filter, const VkSamplerMipmapMode mipFilter, 
                                const VkSamplerAddressMode addrMode, 
                                const float mipBias = 0, const bool useAnisotropy = false);
-    
-    // XeSS: Get sampler with automatic XeSS-specific mip bias calculation
-    Rc<DxvkSampler> getSamplerWithXeSSMipBias(const VkFilter filter, const VkSamplerMipmapMode mipFilter,
-                                               const VkSamplerAddressMode addressModeU,
-                                               const VkSamplerAddressMode addressModeV,
-                                               const VkSamplerAddressMode addressModeW,
-                                               const VkClearColorValue borderColor = VkClearColorValue(),
-                                               const float additionalMipBias = 0, const bool useAnisotropy = false);
-    Rc<DxvkSampler> getSamplerWithXeSSMipBias(const VkFilter filter, const VkSamplerMipmapMode mipFilter, 
-                                               const VkSamplerAddressMode addrMode, 
-                                               const float additionalMipBias = 0, const bool useAnisotropy = false);
 
     Tlas& getTLAS(Tlas::Type type) { return m_tlas[type]; }
 
@@ -448,6 +455,15 @@ namespace dxvk
 
     const VkExtent3D& getTargetDimensions() const { return m_targetExtent; }
     const VkExtent3D& getDownscaleDimensions() const { return m_downscaledExtent; }
+    bool areRtxdiGradientResourcesAllocated() const { return m_rtxdiGradientResourcesAllocated; }
+    bool needsRtxdiGradientResources() const;
+    bool areRtxdiIlluminanceResourcesAllocated() const { return m_rtxdiIlluminanceResourcesAllocated; }
+    bool needsRtxdiIlluminanceResources() const;
+    bool areNrdDenoisingGuideResourcesAllocated() const { return m_nrdDenoisingGuideResourcesAllocated; }
+    bool needsNrdDenoisingGuideResources() const;
+    void createNrdDenoisingGuideResources(Rc<DxvkContext>& ctx);
+    bool needsPrimaryDenoisingNormal() const;
+    void createDlfgResourceQueues(Rc<DxvkContext>& ctx);
 
     static RtxTextureFormatCompatibilityCategory getFormatCompatibilityCategory(const VkFormat format);
     static bool areFormatsCompatible(const VkFormat format1, const VkFormat format2);
@@ -486,9 +502,6 @@ namespace dxvk
     Resources::Resource m_skyProbe;
     Resources::Resource m_skyMatte;
 
-    Resources::Resource m_atmosphereTransmittanceLut;
-    Resources::Resource m_atmosphereMultiscatteringLut;
-    Resources::Resource m_atmosphereSkyViewLut;
 
     fast_unordered_cache<Rc<DxvkSampler>> m_samplerCache;
     fast_unordered_cache<std::pair<Rc<DxvkImageView>, uint32_t>> m_viewCache;
@@ -496,6 +509,12 @@ namespace dxvk
     Tlas m_tlas[Tlas::Type::Count];
 
     VkExtent3D m_downscaledExtent = { 0, 0, 0 };
+    bool m_rtxdiGradientResourcesAllocated = true;
+    bool m_rtxdiIlluminanceResourcesAllocated = true;
+    bool m_nrdDenoisingGuideResourcesAllocated = false;
+    bool m_primaryDenoisingNormalAllocated = false;
+    bool m_dlfgResourceQueueAllocated = false;
+    bool m_dlssNeuralRenderingResourcesAllocated = false;
     VkExtent3D m_targetExtent = { 0, 0, 0 };
 
     using ResizeEventList = std::vector<std::weak_ptr<EventHandler::ResizeEvent>>;
@@ -511,7 +530,11 @@ namespace dxvk
 
     void createTargetResources(Rc<DxvkContext>& ctx);
 
+    void createNeuralRenderingOutput(Rc<DxvkContext>& ctx);
+    void updateDlssNeuralRenderingResources(Rc<DxvkContext>& ctx);
+
     void createDownscaledResources(Rc<DxvkContext>& ctx);
+    bool areDownscaledResourcesCurrent() const;
   };
 
   // State passed to RtxPass::onFrameBegin() callbacks

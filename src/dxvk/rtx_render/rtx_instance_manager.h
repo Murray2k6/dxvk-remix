@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -21,8 +21,10 @@
 */
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -42,6 +44,7 @@ namespace dxvk
 class DxvkContext;
 class DxvkDevice;
 class ResourceCache;
+struct LegacySurfaceDesc; // rtx_fork_material_derivation.h
 class CameraManager;
 
 // RtInstance defines a SceneObjects placement/parameterization within the current scene.
@@ -76,6 +79,11 @@ public:
   const Vector3& getPrevWorldPosition() const { return surface.prevObjectToWorld.data[3].xyz(); }
 
   bool isCreatedThisFrame(uint32_t frameIndex) const { return frameIndex == m_frameCreated; }
+  uint32_t getFrameCreated() const { return m_frameCreated; }
+  // Young cluster buckets (rtx.accel.clusterYoungFrames).
+  bool isCreatedWithinFrames(uint32_t frameIndex, uint32_t frames) const {
+    return m_frameCreated != kInvalidFrameIndex && m_frameCreated <= frameIndex && frameIndex - m_frameCreated < frames;
+  }
 
   // Particle-emitter spawn-discontinuity guard state (rtx.particles.enableDiscontinuityGuard).
   // velocityMovingAverage tracks the emitter's per-frame world translation. A one-frame motion that
@@ -100,14 +108,22 @@ public:
   // Leave it false before relative transforms, such as portal teleports.
   void updateFromReference(const RtInstance& src, bool preserveTransforms = true);
 
-  // Bind a BLAS object to this instance
+  // Bind a BLAS object to this instance and sync buffer indices/strides from its geometry data.
   void setBlas(BlasEntry& blas);
+
+  // Syncs surface buffer indices and strides from the currently bound BLAS.
+  // Called by setBlas() on initial bind or re-link, and by updateBufferCache()
+  // when geometry buffer slots change mid-scene.
+  void syncBufferIndicesFromBlas();
 
   // Sets current and previous transforms explicitly
   bool teleport(const Matrix4& objectToWorld);
   bool teleport(const Matrix4& objectToWorld, const Matrix4& prevObjectToWorld);
   // Changes all transform data from an old context to a new context (i.e. when an instance moves through a portal).
   void teleportWithHistory(const Matrix4& oldToNew);
+  // rtx.accel.originTranslation: the whole scene was translated (origin shift). Same as teleport(objectToWorld,
+  // prevObjectToWorld) but the BLAS is not marked dirty: AccelManager translates the merged BLAS holding it.
+  void shiftOrigin(const Matrix4& objectToWorld, const Matrix4& prevObjectToWorld);
   
   // Move to the new transform and retain previous transforms as history (call the first time a transform changes per frame)
   bool move(const Matrix4& objectToWorld);
@@ -121,6 +137,10 @@ public:
   uint32_t getFrameAge() const { return m_frameLastUpdated - m_frameCreated; }
   // Signal this object should be collected on the next GC pass
   void markForGarbageCollection() const;
+  // Number of markForGarbageCollection calls so far (InstanceManager::garbageCollection uses it to
+  // see whether removing instances marked others).
+  static uint64_t gcMarkCount() { return s_gcMarkCount.load(std::memory_order_relaxed); }
+  static std::atomic<uint64_t> s_gcMarkCount;
   // Returns true if a new camera type was registered
   bool registerCamera(CameraType::Enum cameraType, uint32_t frameIndex);
   bool isCameraRegistered(CameraType::Enum cameraType) const;
@@ -128,6 +148,9 @@ public:
   bool getCustomIndexBit(uint32_t oneBitMask) const;
   bool isHidden() const { return m_isHidden; }
   void setHidden(bool value) { m_isHidden = value; }
+  // Returns true when the instance is alpha tested or blended and rtx.enableAlphaTest or rtx.enableAlphaBlend is off.
+  // The external show paths of the retained scene and retained v2 must not show such an instance.
+  bool hiddenByAlphaToggles() const;
 
   bool usesUnorderedApproximations() const { return m_isUnordered; }
   MaterialDataType getMaterialType() const {
@@ -173,6 +196,7 @@ uint32_t getFirstBillboardIndex() const { return m_firstBillboard; }
   bool isViewModelVirtual() const;
   bool isSubsurface() const { return m_isSubsurface; }
   bool isCreatedByRenderer() const { return m_isCreatedByRenderer; }
+  bool isPlayerModelInstance() const { return m_isPlayerModel; }
 
   // Returns true if this instance has been modified since the last BLAS build
   // (transform, material, or geometry change).  New instances default to dirty.
@@ -187,7 +211,32 @@ uint32_t getFirstBillboardIndex() const { return m_firstBillboard; }
   
   void printDebugInfo() const;
 
+  // rtx.incrementalBucketBookkeeping: uid of the AccelManager merged-bucket cache entry this
+  // instance was last placed in (0 = none). Only AccelManager reads or writes it; it is not
+  // copied by copyInstanceDataFrom, so a clone starts outside every bucket.
+  uint64_t getAccelBucketUid() const { return m_accelBucketUid; }
+  void setAccelBucketUid(uint64_t uid) { m_accelBucketUid = uid; }
+
+  // rtx.retainedPinSteadyEntries: the retained handle whose replay pinned this instance, and the
+  // SceneManager pin generation it was pinned in (stale generations mean "not pinned"). Only
+  // SceneManager reads or writes these; not copied by copyInstanceDataFrom.
+  uint64_t getRetainedPinHandle() const { return m_retainedPinHandle; }
+  uint64_t getRetainedPinGeneration() const { return m_retainedPinGeneration; }
+  void setRetainedPin(uint64_t handle, uint64_t generation) {
+    m_retainedPinHandle = handle;
+    m_retainedPinGeneration = generation;
+  }
+
+  // The retained handle of the scene entry that owns this instance (0 = none). Only
+  // RetainedScene reads or writes it; not copied by copyInstanceDataFrom.
+  uint64_t getSceneOwnedHandle() const { return m_sceneOwnedHandle; }
+  void setSceneOwnedHandle(uint64_t handle) { m_sceneOwnedHandle = handle; }
+
 private:
+  uint64_t m_accelBucketUid = 0;
+  uint64_t m_retainedPinHandle = 0;
+  uint64_t m_retainedPinGeneration = 0;
+  uint64_t m_sceneOwnedHandle = 0;
 
   Matrix4 calcFirstInstanceObjectToWorld() {
     if (surface.instancesToObject) {
@@ -279,7 +328,7 @@ struct InstanceEventHandler {
   // The MaterialData pointer is non-null on the dynamic update path and null on the
   // preserve path (RtInstance::surface.isPreservePath is set iff the pointer is null).
   // Handlers must null-check or short-circuit on isPreservePath before reading material.
-  std::function<void(RtInstance&, const DrawCallState& drawCall, const MaterialData*, bool, bool, bool)> onInstanceUpdatedCallback;
+  std::function<void(RtInstance&, const SceneDraw& drawCall, const MaterialData*, bool, bool, bool)> onInstanceUpdatedCallback;
   // Callback triggered whenever an instance has been removed from the database
   std::function<void(RtInstance&)> onInstanceDestroyedCallback;
 
@@ -309,6 +358,9 @@ struct IntersectionBillboard {
 // InstanceManager is responsible for maintaining the active set of scene instances
 //  and the GPU buffers which are required by VK for instancing.
 class InstanceManager : public CommonDeviceObject {
+  // RetainedScene predicts the alpha state (unordered / decal) before it creates an instance.
+  friend class RetainedScene;
+  friend class TransientLane;
 public:
   InstanceManager(InstanceManager const&) = delete;
   InstanceManager& operator=(InstanceManager const&) = delete;
@@ -316,11 +368,22 @@ public:
   InstanceManager(DxvkDevice* device, ResourceCache* pResourceCache);
   ~InstanceManager();
 
+  // For frontends: the alpha state an instance of this draw would get (unordered / decal),
+  // before handing the draw to the scene.
+  static RtSurface::AlphaState predictAlphaState(const SceneDraw& drawCall, const MaterialData& materialData) {
+    return calculateAlphaState(drawCall, materialData);
+  }
+
   // Return a list of instances currently active in the scene
   const std::vector<RtInstance*>& getInstanceTable() const { return m_instances; }
 
   // Returns the active number of instances in scene
   const uint32_t getActiveCount() const { return m_instances.size(); }
+
+  // True when a view-model or player-model instance updated this frame uses a translucent
+  // material. Those carry dynamic mask bits instead of OBJECT_MASK_TRANSLUCENT, so a primary NEE ray can still reach
+  // them with rtx.enableDirectTranslucentShadows off. Scans only the (short) view-model and player-model lists.
+  bool hasTranslucentDynamicInstance(uint32_t frameId) const;
 
   // Returns a monotonically increasing token used only for equality checks by
   // acceleration-structure caches.  It is bumped for changes that affect BLAS
@@ -334,11 +397,45 @@ public:
   // prefix sums) do not need this notification when BLAS/TLAS inputs are stable.
   void notifySceneChanged() { ++m_sceneGeneration; }
 
+  // rtx.incrementalBucketBookkeeping: called for every RtInstance right before its memory is
+  // freed, renderer-created clones included (those never fire onInstanceDestroyed). The accel
+  // manager uses it to invalidate the merged bucket holding the instance, which replaces a
+  // per-frame hash set of all live instances.
+  void setInstanceFreedHook(std::function<void(RtInstance*)> hook) { m_instanceFreedHook = std::move(hook); }
+
+  // Hides or shows an instance from outside the draw path (a Remix API host hiding a
+  // retained instance) and makes the acceleration-structure caches notice: a cached
+  // merged bucket holding it is dirtied and the unchanged-scene fast path is skipped.
+  // The next full update of the instance recomputes the hidden state from its
+  // categories, so a caller that wants it to stay hidden must re-apply it.
+  void setInstanceHiddenExternally(RtInstance& instance, bool hidden);
+
+  // A transform-only change of an instance whose draw state is otherwise unchanged.
+  // Does for the instance what updateInstance does when only objectToWorld differs -- history (the
+  // previous transform becomes the old current one), the static flag, the BLAS-dirty flag, the
+  // moved-geometry frame and the scene generation (only if the transform really changed) -- without
+  // re-deriving material, flags, mask or billboards. The instance is left off the preserve path for
+  // this frame, as updateInstance leaves it, so the next preserve re-syncs its history.
+  // Refuses (returns false, changes nothing) when the result would differ from updateInstance in
+  // anything else: a world-space UI background offset, a mirroring change, or an instance already
+  // updated this frame. A host-instanced (point instancer) instance is accepted: its per-instance
+  // transforms are relative to objectToWorld and read per frame by the point-instancer batches.
+  // worldSpaceUiOffset is RtxOptions::worldSpaceUiBackgroundOffset(), read once by the caller.
+  // notifyScene=false leaves the scene-generation bump to the caller (one bump for a batch; *outMoved
+  // says whether one is due). Touches only the instance and its BlasEntry's frameLastInstanceMoved
+  // (same value from every caller), so distinct instances may be relocated on different threads with
+  // notifyScene=false.
+  bool relocateExternally(RtInstance& instance, const Matrix4& objectToWorld, CameraType::Enum cameraType,
+                          float worldSpaceUiOffset, bool notifyScene, bool* outMoved);
+
   void onFrameEnd();
 
   // Optional notification callbacks that can be implemented to "opt-in" to InstanceManager events
   void addEventHandler(const InstanceEventHandler& events) {
     m_eventHandlers.push_back(events);
+  }
+  size_t getEventHandlerCount() const {
+    return m_eventHandlers.size();
   }
   
   void removeEventHandler(void* eventHandlerOwnerAddress);
@@ -347,18 +444,19 @@ public:
   void clear();
 
   // Clean up instances which are deemed as no longer required
-  void garbageCollection();
+  // parallelScan: rtx.parallelScenePrepScans.
+  void garbageCollection(bool parallelScan = false);
   
   // Takes a scene object entry (blas + drawcall) and generates/finds the instance data internally
+  // alphaOverride / legacyOverride, when set (a frontend's MaterialTranslator through
+  // ExternalDrawState), replace the alpha state and legacy surface state derived from drawCall.
   RtInstance* processSceneObject(
     const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
-    BlasEntry& blas, const DrawCallState& drawCall, const MaterialData& materialData, RtInstance* existingInstance);
+    BlasEntry& blas, const SceneDraw& drawCall, const MaterialData& materialData, RtInstance* existingInstance,
+    const RtSurface::AlphaState* alphaOverride = nullptr, const LegacySurfaceDesc* legacyOverride = nullptr);
 
   // Binds a raytracing material to the specified instance.
   void bindMaterial(RtInstance& instance, const RtSurfaceMaterial& material);
-
-  // Copies buffer indices from the BlasEntry's geometry data to the instance's surface.
-  void processInstanceBuffers(const BlasEntry& blas, RtInstance& currentInstance) const;
 
   // Per-frame finalization shared by the dynamic and preserve paths:
   // re-registers the player-model / view-model candidate lists (cleared every onFrameEnd) and
@@ -370,7 +468,7 @@ public:
   // onInstanceUpdatedCallback's contract above for the null-handling requirement.
   void preserveInstance(
       RtInstance& instance,
-      const DrawCallState& drawCall,
+      const SceneDraw& drawCall,
       const MaterialData* materialData,
       bool hasTransformChanged = false,
       bool hasPreviousPositions = false,
@@ -419,6 +517,7 @@ private:
 
   std::vector<RtInstance*> m_instances; 
   uint64_t m_sceneGeneration = 0;
+  std::function<void(RtInstance*)> m_instanceFreedHook;
   std::vector<RtInstance*> m_viewModelCandidates;
   uint32_t m_viewModelCandidatesFrameId = kInvalidFrameIndex;
   std::vector<RtInstance*> m_playerModelInstances;
@@ -458,9 +557,10 @@ private:
   void destroyInstanceAllocation(RtInstance* instance);
 
   std::vector<InstanceEventHandler> m_eventHandlers;
+  std::vector<uint8_t> m_gcMarkedScratch; // rtx.parallelScenePrepScans
 
   // Handles the case of when two (or more) identical geometries+textures draw calls have been submitted in a single frame (typically used for two-pass rendering in FF)
-  void mergeInstanceHeuristics(RtInstance& instanceToModify, const DrawCallState& drawCall, const RtSurface::AlphaState& alphaState) const;
+  void mergeInstanceHeuristics(RtInstance& instanceToModify, const SceneDraw& drawCall, const RtSurface::AlphaState& alphaState) const;
 
   void registerViewModelCandidate(RtInstance& instance);
 
@@ -473,14 +573,15 @@ private:
 
   void updateInstance(
       RtInstance& currentInstance, const CameraManager& cameraManager,
-      const BlasEntry& blas, const DrawCallState& drawCall, const MaterialData* materialData);
+      const BlasEntry& blas, const SceneDraw& drawCall, const MaterialData* materialData,
+      const RtSurface::AlphaState* alphaOverride = nullptr, const LegacySurfaceDesc* legacyOverride = nullptr);
 
   void removeInstance(RtInstance* instance);
 
-  static RtSurface::AlphaState calculateAlphaState(const DrawCallState& drawCall, const MaterialData& materialData);
+  static RtSurface::AlphaState calculateAlphaState(const SceneDraw& drawCall, const MaterialData& materialData);
 
   // Modifies an instance given active developer options. Returns true if the instance was modified
-  bool applyDeveloperOptions(RtInstance& currentInstance, const DrawCallState& drawCall);
+  bool applyDeveloperOptions(RtInstance& currentInstance, const SceneDraw& drawCall);
 
   void createBillboards(RtInstance& instance, const Vector3& cameraViewDirection);
 

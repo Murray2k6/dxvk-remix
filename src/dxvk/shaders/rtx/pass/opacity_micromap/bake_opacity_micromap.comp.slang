@@ -165,6 +165,13 @@ float16_t sampleOpacity(float2 texcoords, Surface surface, float3 bary, float16_
   return float16_t(opacity);
 }
 
+// The mean opacity of the taps taken for the current micro-triangle, which splits mixed (4-state "unknown")
+// micro-triangles into UnknownOpaque (coverage >= 0.5) and UnknownTransparent. Rays that trace FORCE_OPAQUE see no
+// difference between the two, because both hit and are alpha-tested. Rays that force 2-state OMM
+// (rtx.foliageRays.fastRayMode = Omm2State) keep the ones at least 50% covered.
+// It stays at 0.5 (UnknownOpaque) when no footprint could be sampled.
+static float g_microTriangleCoverage = 0.5f;
+
 // Samples opacity for a micro triangle with conservative estimation
 // Samples a lod 0 texture quad that fully covers the uTriangle finding min and max opacities
 void sampleOpacityConservative(Surface surface,
@@ -187,37 +194,63 @@ void sampleOpacityConservative(Surface surface,
     return;
   }
   
-  // Align bbox to actual texel centers that fully cover the bbox 
-  // Align with a top left pixel relative to the bbox min
-  const float2 texcoordsIndexMin = floor(texcoordsMin * cb.textureResolution - 0.5);  
-  // Align with a bottom right pixel relative to the bbox max
-  const float2 texcoordsIndexMax = floor(texcoordsMax * cb.textureResolution + 0.5);
-  
-  // Calculate number of texels in the given texcoord bbox
-  // +1: include the end point of the bbox
-  const float2 texelSampleDimsFloat = texcoordsIndexMax - texcoordsIndexMin + 1;
-  const uint2 texelSampleDims = texelSampleDimsFloat;
-  texcoordsMin = (texcoordsIndexMin + 0.5) * cb.rcpTextureResolution;
-
-  // Check for sampling count overflow
-  if (// Check float variant to be within valid range first to handle integer overflow case
-      texelSampleDimsFloat.x > cb.conservativeEstimationMaxTexelTapsPerMicroTriangle ||
-      texelSampleDimsFloat.y > cb.conservativeEstimationMaxTexelTapsPerMicroTriangle ||
-      texelSampleDims.x * texelSampleDims.y > cb.conservativeEstimationMaxTexelTapsPerMicroTriangle)
+  // NV-DXVK start: [OmmBake] a texture extent outside [1, MAX] (zero, NaN, stale) cannot produce a
+  // meaningful footprint; report unknown rather than derive a loop bound from it.
+  if (!(cb.textureResolution.x >= 1.0f && cb.textureResolution.x <= float(BAKE_OPACITY_MICROMAP_MAX_TEXTURE_DIMENSION) &&
+        cb.textureResolution.y >= 1.0f && cb.textureResolution.y <= float(BAKE_OPACITY_MICROMAP_MAX_TEXTURE_DIMENSION)))
   {
-    // Sampling budget overflowed, mark the microtriangle state as unknown/anyHit
     minOpacity = 0;
     maxOpacity = 1;
     return;
   }
+  // NV-DXVK end
+
+  // Align bbox to actual texel centers that fully cover the bbox
+  // Align with a top left pixel relative to the bbox min
+  const float2 texcoordsIndexMin = floor(texcoordsMin * cb.textureResolution - 0.5);
+  // Align with a bottom right pixel relative to the bbox max
+  const float2 texcoordsIndexMax = floor(texcoordsMax * cb.textureResolution + 0.5);
+
+  // Calculate number of texels in the given texcoord bbox
+  // +1: include the end point of the bbox
+  const float2 texelSampleDimsFloat = texcoordsIndexMax - texcoordsIndexMin + 1;
+  texcoordsMin = (texcoordsIndexMin + 0.5) * cb.rcpTextureResolution;
+
+  // NV-DXVK start: [OmmBake] NaN-safe budget check. The original test rejected with `dims > max`,
+  // which is FALSE for NaN: finite texcoords around 1e35 overflow to +inf once scaled by the texture
+  // extent, inf - inf = NaN, the NaN passed every `>` test, and uint(NaN) is undefined in SPIR-V (the
+  // product check could then wrap, e.g. 0xFFFFFFFF^2 == 1). Every comparison below is written so NaN
+  // fails it, and the tap budget itself is capped by a compile-time constant.
+  const float maxTaps = float(min(cb.conservativeEstimationMaxTexelTapsPerMicroTriangle, uint(BAKE_OPACITY_MICROMAP_MAX_TEXEL_TAPS_HARD_CAP)));
+  if (!(texelSampleDimsFloat.x >= 1.0f && texelSampleDimsFloat.x <= maxTaps &&
+        texelSampleDimsFloat.y >= 1.0f && texelSampleDimsFloat.y <= maxTaps &&
+        texelSampleDimsFloat.x * texelSampleDimsFloat.y <= maxTaps) ||
+      !isValidValue(texcoordsMin))
+  {
+    // Sampling budget overflowed or the footprint is garbage, mark the microtriangle state as unknown/anyHit
+    minOpacity = 0;
+    maxOpacity = 1;
+    return;
+  }
+  const uint2 texelSampleDims = min(uint2(texelSampleDimsFloat), uint2(BAKE_OPACITY_MICROMAP_MAX_TEXEL_TAPS_HARD_CAP, BAKE_OPACITY_MICROMAP_MAX_TEXEL_TAPS_HARD_CAP));
+  // NV-DXVK end
 
   // Go through all texels within the texcoord bbox, sampling at their centers and calculating the min max opacity
   minOpacity = 1;
   maxOpacity = 0;
+  uint numTaps = 0;
+  float opacitySum = 0.0f; // coverage for the unknown-state split
   for (uint v = 0; v < texelSampleDims.y; v++)
   {
     for (uint u = 0; u < texelSampleDims.x; u++)
     {
+      // NV-DXVK: [OmmBake] belt and braces - a hard stop independent of the bounds computed above
+      if (++numTaps > BAKE_OPACITY_MICROMAP_MAX_TEXEL_TAPS_HARD_CAP)
+      {
+        minOpacity = 0;
+        maxOpacity = 1;
+        return;
+      }
       const float2 texcoords = texcoordsMin + uint2(u, v) * cb.rcpTextureResolution;
       
       float3 bary;
@@ -226,11 +259,13 @@ void sampleOpacityConservative(Surface surface,
       // to a triangle edge. This is better than not having barys and thus skipping vertex opacity blending 
       texcoordToBary(texcoords, vertexTexcoords, bary);
 
-      const float16_t opacity = sampleOpacity(texcoords, surface, bary, vertexOpacities);  
+      const float16_t opacity = sampleOpacity(texcoords, surface, bary, vertexOpacities);
       minOpacity = min(opacity, minOpacity);
       maxOpacity = max(opacity, maxOpacity);
+      opacitySum += float(opacity);
     }
   }
+  g_microTriangleCoverage = opacitySum / float(max(numTaps, 1u));
 }
 
 enum OpacityState 
@@ -272,7 +307,15 @@ OpacityState calculateOpacityMicromapValue(float16_t minOpacity, float16_t maxOp
 
   OpacityState mixedOpacityState = cb.is2StateOMMFormat ? OMM_2_STATE_UNKNOWN_STATE : OMM_4_STATE_UNKNOWN_STATE;
 
-  return minOpacityState == maxOpacityState ? minOpacityState : mixedOpacityState;
+  const OpacityState state = minOpacityState == maxOpacityState ? minOpacityState : mixedOpacityState;
+
+  // See g_microTriangleCoverage.
+  if (state == OpacityState::UnknownTransparent && g_microTriangleCoverage >= 0.5f)
+  {
+    return OpacityState::UnknownOpaque;
+  }
+
+  return state;
 }
 
 OpacityState calculateOpacityMicromapValue(uint uIdx, float rcpNumSubdivisions, Surface surface, float2 vertexTexcoords[3], float16_t vertexOpacities[3])
@@ -288,6 +331,7 @@ OpacityState calculateOpacityMicromapValue(uint uIdx, float rcpNumSubdivisions, 
                           
   float16_t maxOpacity;
   float16_t minOpacity;
+  g_microTriangleCoverage = 0.5f;
 
   if (cb.useConservativeEstimation)
   {
@@ -303,15 +347,18 @@ OpacityState calculateOpacityMicromapValue(uint uIdx, float rcpNumSubdivisions, 
   
     maxOpacity = opacity;
     minOpacity = opacity;
-  
+    float opacitySum = float(opacity);
+
     // Taps at corners of the microtriangle at lod 0
-    for (uint i = 0; i < 3; i++) 
-    { 
+    for (uint i = 0; i < 3; i++)
+    {
       opacity = sampleOpacity(microTriangleVertexTexcoords[i], surface, microTriangleVertexBarys[i], vertexOpacities);
 
       minOpacity = min(opacity, minOpacity);
       maxOpacity = max(opacity, maxOpacity);
+      opacitySum += float(opacity);
     }
+    g_microTriangleCoverage = opacitySum * 0.25f;
   }
 
   return calculateOpacityMicromapValue(minOpacity, maxOpacity);
@@ -326,12 +373,21 @@ void main(uint globalId: SV_DispatchThreadID, uint groupId : SV_GroupID, uint th
     return;
   }
 
+  // NV-DXVK start: [OmmBake] reject constants that would make the index math below meaningless
+  // (division by zero, shifts past 31). The CPU validates the same before dispatching.
+  if (cb.numMicroTrianglesPerTriangle == 0 || cb.subdivisionLevel > 12)
+  {
+    return;
+  }
+  // NV-DXVK end
+
   const uint numBitsPerMicroTriangle = cb.is2StateOMMFormat ? 1 : 2;
   const uint numSubdivisionsPerEdge = 1 << cb.subdivisionLevel;
   const float rcpNumSubdivisions = 1.f / numSubdivisionsPerEdge;
-  
+
   // log2(number of uTri per 32-bit output word), so 5 (32 tris) when each uTri output 1 bit, or 4 (16 tris) when each uTri outputs 2 bits
-  const uint numTrisPerThread = cb.numMicroTrianglesPerThread;
+  // NV-DXVK: [OmmBake] capped by a compile-time constant (one output byte holds at most 8 uTris)
+  const uint numTrisPerThread = min(cb.numMicroTrianglesPerThread, uint(BAKE_OPACITY_MICROMAP_MAX_MICRO_TRIANGLES_PER_THREAD));
   
   const uint globalThreadlIdx = cb.threadIndexOffset + globalId;
   const uint triIdx = globalThreadlIdx * numTrisPerThread / cb.numMicroTrianglesPerTriangle;

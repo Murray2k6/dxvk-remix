@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2022, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -125,6 +125,24 @@ namespace dxvk {
      * \returns Synchronization status
      */
     VkResult synchronize();
+
+    // NV-DXVK start: [GpuStall] watchdog context (coarse content of this command list)
+    struct PerfInfo {
+      uint32_t    frameId        = 0;       // device frame id when recording began
+      uint32_t    accelBuilds    = 0;       // BLAS/TLAS build infos recorded
+      uint32_t    micromapBuilds = 0;       // OMM build infos recorded
+      bool        injectRtx      = false;   // holds Remix ray tracing (injectRTX) work
+      bool        preGate        = false;   // rtx.present.presentWaitPreGateFlush: RT frame start, not held by the present wait
+      const char* lastStage      = nullptr; // last Remix GPU stage marker recorded (string literal)
+      uint64_t    submitNs       = 0;       // steady clock at vkQueueSubmit
+      uint32_t    ommBakeItems   = 0;       // [OmmBake] OMM bake items dispatched in this command list
+      uint64_t    ommBakeMicroTriangles = 0;
+      const char* lastOmmBake    = nullptr; // [OmmBake] description of the last one (persistent storage)
+    };
+    PerfInfo& perfInfo() { return m_perfInfo; }
+    // One-line description of this command list for [GpuStall] lines.
+    std::string describeForStallLog() const;
+    // NV-DXVK end
     
     /**
      * \brief Stat counters
@@ -828,7 +846,18 @@ namespace dxvk {
         uint32_t                               depth) {
         m_vkd->vkCmdTraceRaysKHR(m_execBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable, pHitShaderBindingTable, pCallableShaderBindingTable, width, height, depth);
     }
-    
+
+    // NV-DXVK start: Indirect ray dispatch support
+    void cmdTraceRaysIndirectKHR(
+        const VkStridedDeviceAddressRegionKHR* pRaygenShaderBindingTable,
+        const VkStridedDeviceAddressRegionKHR* pMissShaderBindingTable,
+        const VkStridedDeviceAddressRegionKHR* pHitShaderBindingTable,
+        const VkStridedDeviceAddressRegionKHR* pCallableShaderBindingTable,
+        VkDeviceAddress                        indirectDeviceAddress) {
+        m_vkd->vkCmdTraceRaysIndirectKHR(m_execBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable, pHitShaderBindingTable, pCallableShaderBindingTable, indirectDeviceAddress);
+    }
+    // NV-DXVK end
+
     void cmdWriteTimestamp(
             VkPipelineStageFlagBits pipelineStage,
             VkQueryPool             queryPool,
@@ -845,6 +874,7 @@ namespace dxvk {
     void vkCmdBuildMicromapsEXT(
         uint32_t                      infoCount,
         const VkMicromapBuildInfoEXT* pInfos) {
+        m_perfInfo.micromapBuilds += infoCount;
         m_vkd->vkCmdBuildMicromapsEXT(m_execBuffer, infoCount, pInfos);
     }
 
@@ -853,6 +883,7 @@ namespace dxvk {
         const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
         const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos)
     {
+        m_perfInfo.accelBuilds += infoCount;
         m_vkd->vkCmdBuildAccelerationStructuresKHR(m_execBuffer, infoCount, pInfos, ppBuildRangeInfos);
     }
 
@@ -938,6 +969,7 @@ namespace dxvk {
     DxvkGpuQueryTracker m_gpuQueryTracker;
     DxvkBufferTracker   m_bufferTracker;
     DxvkStatCounters    m_statCounters;
+    PerfInfo            m_perfInfo;
 
     VkResult submitToQueue(
             VkQueue               queue,

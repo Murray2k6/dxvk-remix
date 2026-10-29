@@ -21,12 +21,72 @@
  */
 #include "d3d9_device_base.h"
 
+#include "client_options.h"
 #include "d3d9_lss.h"
 #include "window.h"
 
+#include "util_devicecommand.h"
 #include "util_modulecommand.h"
 
 #include <d3d9.h>
+
+#include <algorithm>
+#include <mutex>
+#include <vector>
+
+namespace {
+  // The live client devices, which are the only pointers setOuterObjects accepts as the inner device.
+  std::mutex gLiveDevicesMutex;
+  std::vector<BaseDirect3DDevice9Ex_LSS*> gLiveDevices;
+}
+
+bool BaseDirect3DDevice9Ex_LSS::setOuterObjects(IDirect3DDevice9* pInner, IDirect3DDevice9* pOuterDevice,
+                                                IDirect3D9* pOuterDirect3D) {
+  if (pInner == nullptr) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(gLiveDevicesMutex);
+  for (BaseDirect3DDevice9Ex_LSS* pDevice : gLiveDevices) {
+    if (static_cast<IDirect3DDevice9*>(pDevice) == pInner) {
+      pDevice->m_pOuterDevice.store(pOuterDevice);
+      pDevice->m_pOuterDirect3D.store(pOuterDirect3D);
+      return true;
+    }
+  }
+  return false;
+}
+
+void BaseDirect3DDevice9Ex_LSS::unregisterLiveDevice() {
+  std::lock_guard<std::mutex> lock(gLiveDevicesMutex);
+  gLiveDevices.erase(std::remove(gLiveDevices.begin(), gLiveDevices.end(), this), gLiveDevices.end());
+  m_pOuterDevice.store(nullptr);
+  m_pOuterDirect3D.store(nullptr);
+}
+
+void BaseDirect3DDevice9Ex_LSS::reportDevice(IDirect3DDevice9** ppDevice) {
+  IDirect3DDevice9* const pOuterDevice = m_pOuterDevice.load();
+  if (pOuterDevice != nullptr) {
+    pOuterDevice->AddRef();
+    (*ppDevice) = pOuterDevice;
+    return;
+  }
+  AddRef();
+  (*ppDevice) = this;
+}
+
+bool BaseDirect3DDevice9Ex_LSS::reportOuterDirect3D(IDirect3D9** ppDirect3D) {
+  IDirect3D9* const pOuterDirect3D = m_pOuterDirect3D.load();
+  if (pOuterDirect3D == nullptr) {
+    return false;
+  }
+  pOuterDirect3D->AddRef();
+  (*ppDirect3D) = pOuterDirect3D;
+  return true;
+}
+
+BaseDirect3DDevice9Ex_LSS::~BaseDirect3DDevice9Ex_LSS() {
+  unregisterLiveDevice();
+}
 
 BaseDirect3DDevice9Ex_LSS::BaseDirect3DDevice9Ex_LSS(const bool bExtended,
                                                      Direct3D9Ex_LSS* const pDirect3D,
@@ -40,12 +100,24 @@ BaseDirect3DDevice9Ex_LSS::BaseDirect3DDevice9Ex_LSS(const bool bExtended,
   , m_createParams(createParams)
   , m_presParams(presParams) {
   Logger::debug("Creating Device...");
-  
+
+  {
+    std::lock_guard<std::mutex> lock(gLiveDevicesMutex);
+    gLiveDevices.push_back(this);
+  }
+
   // Initialize WndProc logic
   WndProc::set(getWinProcHwnd());
 
   //Setting default value
   m_maxFrameLatency = 3;
+
+  // Drop setters whose value the server already has (the shadow starts empty: nothing is known yet)
+  m_dropRedundantState = ClientOptions::getDropRedundantState();
+
+  // State setters travel as records of one packet per run (flushed before any other command). With
+  // sendAllServerResponses every setter waits for its answer, so each record goes out on its own.
+  DeviceBridge::setStateBatching(ClientOptions::getBatchState() && !GlobalOptions::getSendAllServerResponses());
 
   // D3D9 seems to inialize its state to this
   memset(&m_state.renderStates[0], 0xBAADCAFE, sizeof(m_state.renderStates));
@@ -79,6 +151,8 @@ BaseDirect3DDevice9Ex_LSS::BaseDirect3DDevice9Ex_LSS(const bool bExtended,
   DWORD customBehaviorFlags = createParams.BehaviorFlags | D3DCREATE_NOWINDOWCHANGES;
   InitRamp();
   
+  DeviceBridge::ResponseTransaction responseTransaction;
+
   UID currentUID = 0;
   {
     ClientMessage c(m_ex ? Commands::IDirect3D9Ex_CreateDeviceEx : Commands::IDirect3D9Ex_CreateDevice, getId());

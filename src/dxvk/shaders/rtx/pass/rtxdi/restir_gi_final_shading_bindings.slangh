@@ -36,8 +36,8 @@ Texture2D<uint> SharedMaterialData0;
 layout(r32ui, binding = RESTIR_GI_FINAL_SHADING_BINDING_SHARED_MATERIAL_DATA1_INPUT)
 Texture2D<uint> SharedMaterialData1;
 
-layout(rg32f, binding = RESTIR_GI_FINAL_SHADING_BINDING_SHARED_TEXTURE_COORD_INPUT)
-Texture2D<float2> SharedTextureCoord;
+layout(rgba32f, binding = RESTIR_GI_FINAL_SHADING_BINDING_SHARED_TEXTURE_COORD_INPUT)
+Texture2D<float4> SharedTextureCoord;
 
 layout(r32ui, binding = RESTIR_GI_FINAL_SHADING_BINDING_SHARED_SURFACE_INDEX_INPUT)
 Texture2D<uint> SharedSurfaceIndex;
@@ -59,7 +59,7 @@ Texture2D<float> PrimaryHitDistance;
 layout(r8, binding = RESTIR_GI_FINAL_SHADING_BINDING_PRIMARY_PERCEPTUAL_ROUGHNESS_INPUT)
 Texture2D<float> PrimaryPerceptualRoughness;
 
-layout(rgb10_a2, binding = RESTIR_GI_FINAL_SHADING_BINDING_PRIMARY_ALBEDO_INPUT)
+layout(binding = RESTIR_GI_FINAL_SHADING_BINDING_PRIMARY_ALBEDO_INPUT)
 Texture2D<float4> PrimaryAlbedo;
 
 layout(rg16_snorm, binding = RESTIR_GI_FINAL_SHADING_BINDING_PRIMARY_VIEW_DIRECTION_INPUT)
@@ -76,7 +76,7 @@ Texture2D<float> PrimaryPositionError;
 
 // Primary Inputs/Outputs
 
-layout(rgb10_a2, binding = RESTIR_GI_FINAL_SHADING_BINDING_PRIMARY_BASE_REFLECTIVITY_INPUT_OUTPUT)
+layout(rgba16f, binding = RESTIR_GI_FINAL_SHADING_BINDING_PRIMARY_BASE_REFLECTIVITY_INPUT_OUTPUT)
 RWTexture2D<float4> PrimaryBaseReflectivity;
 
 layout(rgba16f, binding = RESTIR_GI_FINAL_SHADING_BINDING_PRIMARY_INDIRECT_DIFFUSE_RADIANCE_HIT_DISTANCE_INPUT_OUTPUT)

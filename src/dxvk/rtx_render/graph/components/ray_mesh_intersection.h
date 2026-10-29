@@ -112,10 +112,10 @@ void RayMeshIntersection::updateRange(const Rc<DxvkContext>& context, const size
   for (size_t i = start; i < end; i++) {
     bool intersects = false;
     
-    const PrimInstance* meshPrim = m_batch.resolvePrimTarget(context, i, m_target[i]);
+    const PrimInstance meshPrim = m_batch.resolvePrimTarget(context, i, m_target[i]);
     
-    if (meshPrim != nullptr && meshPrim->getType() == PrimInstance::Type::Instance) {
-      RtInstance* rtInstance = meshPrim->getInstance();
+    if (meshPrim.getType() == PrimInstance::Type::Instance) {
+      RtInstance* rtInstance = meshPrim.getInstance();
       
       if (rtInstance != nullptr) {
         BlasEntry* blasEntry = rtInstance->getBlas();

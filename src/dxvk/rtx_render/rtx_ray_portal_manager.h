@@ -110,6 +110,8 @@ public:
   const RayPortalInfosType& getRayPortalInfos() const { return m_rayPortalInfos; }
   const RayPortalPairInfosType& getRayPortalPairInfos() const { return m_rayPortalPairInfos; }
   bool areAnyRayPortalPairsActive() const;
+  // Instances hidden because their portal index was already set in the same frame, since the manager was created.
+  uint64_t getDuplicatesHidden() const { return m_duplicatesHidden; }
   static uint32_t getRayPortalPairPortalBaseIndex(uint32_t pairIndex) { return pairIndex * 2; }
 
   const SingleRayPortalDirectionInfo* getCameraTeleportationRayPortalDirectionInfo() const { return m_cameraTeleportationRayPortalDirectionInfo; }
@@ -133,6 +135,9 @@ private:
 
   // Active portal state during frame recording
   RayPortalInfosType m_rayPortalInfos{};
+  // The id of the instance that set each entry of m_rayPortalInfos this frame.
+  std::array<uint64_t, maxRayPortalCount> m_rayPortalInstanceIds{};
+  uint64_t m_duplicatesHidden = 0;
 
   // Portal pair infos persist until to their point of recreation every frame
   // so that the previous frame versions can be used during frame recording

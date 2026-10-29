@@ -83,6 +83,8 @@
 #define DEBUG_VIEW_VOLUME_RESERVOIR_DEPTH_LAYERS 50
 #define DEBUG_VIEW_VOLUME_PREINTEGRATION 51
 
+#define DEBUG_VIEW_EYE_REGIONS 52
+
 #define DEBUG_VIEW_TEXCOORDS_GRADIENT_X 55
 #define DEBUG_VIEW_TEXCOORDS_GRADIENT_Y 56
 
@@ -148,8 +150,6 @@
 #define DEBUG_VIEW_RESTIR_GI_FINAL_SHADING 133
 #define DEBUG_VIEW_RESTIR_GI_VIRTUAL_HIT_T 134
 #define DEBUG_VIEW_RESTIR_GI_VISIBILITY_INVALID_SAMPLES 135
-
-#define DEBUG_VIEW_EXPOSURE_HISTOGRAM 139
 
 #define DEBUG_VIEW_NOISY_SECONDARY_DIRECT_DIFFUSE_RADIANCE 140
 #define DEBUG_VIEW_NOISY_SECONDARY_DIRECT_SPECULAR_RADIANCE 141
@@ -220,15 +220,14 @@
 #define DEBUG_VIEW_SHADOW_TERMINATOR_OFFSET 279
 
 #define DEBUG_VIEW_GEOMETRY_FLAGS_FIRST_SAMPLED_LOBE_IS_SPECULAR 300
-#define DEBUG_VIEW_RAY_RECONSTRUCTION_PARTICLE_LAYER 301
-#define DEBUG_VIEW_RAY_RECONSTRUCTION_DIFFUSE_ALBEDO 302
-#define DEBUG_VIEW_RAY_RECONSTRUCTION_SPECULAR_ALBEDO 303
-#define DEBUG_VIEW_RAY_RECONSTRUCTION_HIT_DISTANCE    304
-#define DEBUG_VIEW_RAY_RECONSTRUCTION_PARTICLE_LAYER_ALPHA 305
-#define DEBUG_VIEW_RAY_RECONSTRUCTION_PRIMARY_DEPTH 306
-#define DEBUG_VIEW_RAY_RECONSTRUCTION_PRIMARY_WORLD_SHADING_NORMAL 307
-#define DEBUG_VIEW_RAY_RECONSTRUCTION_PRIMARY_SCREEN_SPACE_MOTION_VECTOR 308
-#define DEBUG_VIEW_RAY_RECONSTRUCTION_PRIMARY_DISOCCLUSION_MASK 309
+#define DEBUG_VIEW_RAY_RECONSTRUCTION_DIFFUSE_ALBEDO 301
+#define DEBUG_VIEW_RAY_RECONSTRUCTION_SPECULAR_ALBEDO 302
+#define DEBUG_VIEW_RAY_RECONSTRUCTION_HIT_DISTANCE    303
+#define DEBUG_VIEW_RAY_RECONSTRUCTION_PRIMARY_DEPTH 304
+#define DEBUG_VIEW_RAY_RECONSTRUCTION_PRIMARY_WORLD_SHADING_NORMAL 305
+#define DEBUG_VIEW_RAY_RECONSTRUCTION_PRIMARY_SCREEN_SPACE_MOTION_VECTOR 306
+#define DEBUG_VIEW_RAY_RECONSTRUCTION_PRIMARY_DISOCCLUSION_MASK 307
+#define DEBUG_VIEW_RAY_RECONSTRUCTION_INPUT_COLOR 310
 
 #define DEBUG_VIEW_SHARED_BIAS_CURRENT_COLOR_MASK 320
 
@@ -250,6 +249,14 @@
 #define DEBUG_VIEW_NRC_QUERY_NUMBER_OF_BOUNCES 575
 #define DEBUG_VIEW_NRC_QUERY_NUMBER_OF_PATH_SEGMENTS 576
 #define DEBUG_VIEW_NRC_QUERY_NUMBER_OF_INDIRECT_PATH_SEGMENTS 577
+
+#define DEBUG_VIEW_SHARC_QUERY_OUTCOME 580       // green hit, red miss, blue too close, yellow footprint too narrow, grey rejected
+#define DEBUG_VIEW_SHARC_REJECT_REASON 581       // first failing eligibility term, colour-coded
+#define DEBUG_VIEW_SHARC_CACHED_RADIANCE 582     // radiance read from the cache where the path ended on it
+#define DEBUG_VIEW_SHARC_TERMINATION_BOUNCE 583  // bounce at which the cache ended the path, 0 never
+#define DEBUG_VIEW_SHARC_GRID_CELLS 584          // hash-coloured cell at the vertex
+#define DEBUG_VIEW_SHARC_CELL_AGE 585            // R accumulated frames, G stale frames, B sample count
+
 #define DEBUG_VIEW_NRC_IS_OUTSIDE_SCENE_AABB 590
 
 #define DEBUG_VIEW_IS_BAKED_TERRAIN 600
@@ -267,10 +274,18 @@
 #define DEBUG_VIEW_POM_ITERATIONS 810
 #define DEBUG_VIEW_POM_DIRECT_HIT_POS 811
 #define DEBUG_VIEW_HEIGHT_MAP 812
+#define DEBUG_VIEW_POM_CONE_RATIO 813
+#define DEBUG_VIEW_POM_CONE_ERROR 814
+#define DEBUG_VIEW_POM_DEPTH_SCALE 815
+#define DEBUG_VIEW_SCCR_SHELL_EDGES 816
+#define DEBUG_VIEW_SCCR_SHELL_STEPS 817
+#define DEBUG_VIEW_SCCR_SHELL_CROSSINGS 818
+#define DEBUG_VIEW_SCCR_SHELL_RESULT 819
 
 #define DEBUG_VIEW_RAYTRACED_RENDER_TARGET_GEOMETRY 820
 #define DEBUG_VIEW_RAYTRACED_RENDER_TARGET_DIRECT 821
 #define DEBUG_VIEW_RAYTRACED_RENDER_TARGET_INDIRECT 822
+#define DEBUG_VIEW_SCCR_SHELL_SHADOW 823
 
 #define DEBUG_VIEW_NRD_INSTANCE_0_VALIDATION_LAYER 850
 #define DEBUG_VIEW_NRD_INSTANCE_1_VALIDATION_LAYER 851
@@ -279,59 +294,19 @@
 #define DEBUG_VIEW_PREV_WORLD_POSITION_AND_TBN 860
 
 #define DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_PIXELS_MASK 901
-#define DEBUG_VIEW_SPARSE_RENDERING_DIRECT_ACTIVE_PIXELS_PERCENTAGE 903
-#define DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_ACTIVE_PIXELS_PERCENTAGE 904
-#define DEBUG_VIEW_SPARSE_RENDERING_DIRECT_ACTIVE_PIXELS_OUTPUT_SCALE 905
-#define DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_ACTIVE_PIXELS_OUTPUT_SCALE 906
-#define DEBUG_VIEW_SPARSE_RENDERING_DIRECT_PIXEL_SAMPLING_RATE 907
-#define DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_PIXEL_SAMPLING_RATE 908
-#define DEBUG_VIEW_SPARSE_RENDERING_UNION_ACTIVE_THREADS 909
-#define DEBUG_VIEW_SPARSE_RENDERING_DIRECT_ACTIVE_THREADS 910
-#define DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_ACTIVE_THREADS 911
+#define DEBUG_VIEW_SPARSE_RENDERING_PIXEL_SAMPLING_RATE 903
+#define DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_PIXELS_OUTPUT_SCALE 905
+#define DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_THREADS 910
 
-// Fork: atmosphere / cloud diagnostics
-#define DEBUG_VIEW_CLOUD_SKY_TRANSMITTANCE_LUT 870
-#define DEBUG_VIEW_CLOUD_D_SUN              873
-#define DEBUG_VIEW_CLOUD_D_AMBIENT          874
-// Production-call-shape diagnostic for sampleCloudGroundShadow_OptionB.
-// Paints the helper's output at each G-buffer pixel using the EXACT
-// per-pixel call shape (worldPos, sunDir, args, isZUp) that the upcoming
-// NEE wiring will use. CRITICAL GATE: spatially compare against
-// DEBUG_VIEW_CLOUD_D_SUN (873). If they disagree on cumulus position,
-// isZUp handling is mismatched between debug and production paths.
-#define DEBUG_VIEW_CLOUD_GROUND_SHADOW_PRODSHAPE 875
-// Nubis Cubed 2023 cloud render RT (fork — 2026-05-12, C4). Visualizes the
-// screen-space cloud RT produced by cloud_render.comp.slang. RGB = per-pixel
-// cloud radiance (premultiplied) accumulated through the Nubis Cubed lighting
-// equations. Alpha (view-ray transmittance) is ignored by this debug case.
-#define DEBUG_VIEW_CLOUD_RENDER_RT 876
-// Raw D_sun optical-depth diagnostic at the production NEE call shape
-// (fork — 2026-05-17). Sibling of 875: same per-pixel inputs (G-buffer
-// worldPos + atmosphereArgs.sunDirection + cb.isZUp), but stops at the
-// dSunTex.SampleLevel call — NO exp(), NO mix(cloudShadowStrength). Three
-// signals encoded in RGB so one screenshot discriminates all hypotheses:
-//   R = saturate(OD * 0.2)  — matches 873's vis scale (direct A/B vs bake)
-//   G = saturate(OD)        — raw magnitude (distinguishes amplified-tiny
-//                              from actually-visible-sized)
-//   B = uvw.x from cloudVoxelWorldToUVW — consumer's lookup position
-//                              (uniform B across screen = scene-scale bug)
-// Sentinels: magenta = surface above slab top; blue = sun below horizon
-// or otherwise unreachable. Black would be ambiguous, so we paint instead.
-#define DEBUG_VIEW_CLOUD_GROUND_SHADOW_RAW_OD 877
-// Enum 878 (DEBUG_VIEW_CLOUD_SHADOW_FACTOR_RAW) RETIRED 2026-06-19 with the
-// screen-space cloud-shadow system (it visualized the removed
-// PrimaryCloudShadowFactor texture). The cloud shadow now folds onto the sun
-// radiance in the NEE; use 875/877 (D_sun grid reads) for diagnostics. The
-// number is left burned (not reused) so saved configs referencing 878 fall
-// through to the default view rather than aliasing a new one.
-// Cloud NVDF SDF slice (fork — Nubis3 conversion Phase A). Horizontal slice
-// of the 256x64x256 body signed-distance field at a fixed height fraction:
-// warm gradient inside (negative km), cool gradient outside (positive km),
-// green band at the zero crossing. Primary validation surface for the JFA
-// bake — cloud bodies should read as smooth blobby cells, the green
-// iso-line should trace their outlines, and panning the tile must show no
-// seam at the wrap boundary.
-#define DEBUG_VIEW_CLOUD_NVDF_SDF 879
+// 870-884 and 912 stay unused, so saved configs that select them fall through to the default view.
+
+// Primary surface cutout diagnosis (geometry_resolver.slangh).
+// R = texel alpha < 0.5, G = surface fully opaque, B = alpha test set.
+#define DEBUG_VIEW_CUTOUT_DIAGNOSIS 913
+
+// Sky provider cloud motion vectors (composite.comp.slang applyCloudMotionVectors).
+// R = the cloud's weight in the motion vector, G = cloud opacity, B = the depth is the cloud's.
+#define DEBUG_VIEW_CLOUD_MOTION_VECTOR_MASK 914
 
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,

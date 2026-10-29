@@ -282,6 +282,16 @@ namespace dxvk {
     }
     // NV-DXVK end
 
+    // Set when the shader is registered as a Remix shader. Its compute pipelines are then created without
+    // specialization constants on every path, so a pipeline the context creates matches the prewarmed one.
+    void markRemixShader() {
+      m_remixShader = true;
+    }
+
+    bool isRemixShader() const {
+      return m_remixShader;
+    }
+
     /**
      * \brief Get lookup hash for a shader
      *
@@ -320,6 +330,8 @@ namespace dxvk {
     // NV-DXVK start
     const char* m_debugName = nullptr;
     // NV-DXVK end
+
+    bool m_remixShader = false;
 
     static void eliminateInput(SpirvCodeBuffer& code, uint32_t location);
 

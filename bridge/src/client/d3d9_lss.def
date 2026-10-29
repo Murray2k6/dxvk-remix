@@ -20,3 +20,10 @@ EXPORTS
 
   remixapi_InitializeLibrary @ 39
   remixapi_RegisterCallbacks @ 40
+
+  remixapi_SetColorGradePreset @ 41
+  remixapi_SetColorGrade @ 42
+  remixapi_MixColorGradePresets @ 43
+  remixapi_GetColorGrade @ 44
+  remixapi_SaveColorGradePreset @ 45
+  BridgeClient_SetOuterDevice @ 46

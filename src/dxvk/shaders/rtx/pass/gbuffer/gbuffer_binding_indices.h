@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -78,10 +78,7 @@
 #define GBUFFER_BINDING_SHARED_BIAS_CURRENT_COLOR_MASK_OUTPUT                  102
 
 #define GBUFFER_BINDING_REFLECTION_PSR_DATA_STORAGE_2                          103
-#define GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_0                        104
-#define GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_1                        105
-#define GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_2                        106
-#define GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_3                        107
+#define GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE                          104
 
 #define GBUFFER_BINDING_ALPHA_BLEND_GBUFFER_OUTPUT                             108
 #define GBUFFER_BINDING_SHARED_TEXTURE_COORD_OUTPUT                            109
@@ -101,7 +98,7 @@
 #define GBUFFER_BINDING_PRIMARY_DEPTH_DLSSRR_OUTPUT                             120
 #define GBUFFER_BINDING_PRIMARY_NORMAL_DLSSRR_OUTPUT                            121
 #define GBUFFER_BINDING_PRIMARY_SCREEN_SPACE_MOTION_DLSSRR_OUTPUT               122
-#define GBUFFER_BINDING_PARTICLE_BUFFER_OUTPUT                                  123
+#define GBUFFER_BINDING_DLSS_NR_CONTROL_MASK_OUTPUT                             124
 
 #define GBUFFER_BINDING_NRC_QUERY_PATH_INFO_OUTPUT                              130
 #define GBUFFER_BINDING_NRC_TRAINING_PATH_INFO_OUTPUT                           131
@@ -116,6 +113,12 @@
 #define GBUFFER_BINDING_NRC_TRAINING_GBUFFER_SURFACE_RADIANCE_B_OUTPUT          141
 
 #define GBUFFER_BINDING_PRIMARY_OBJECT_PICKING_OUTPUT                           150
+#define GBUFFER_BINDING_ATMOSPHERE_FOREGROUND_OUTPUT                            151
+
+// rtx.gbuffer.compactPsr. PSR Prepare appends the pixels that run Reflection and Transmission PSR to two lists,
+// and the PSR passes dispatch indirectly over them (gbuffer_rayquery_compact.comp.slang).
+#define GBUFFER_BINDING_COMPACT_PSR_LIST                                        152
+#define GBUFFER_BINDING_COMPACT_PSR_ARGS                                        153
 
 
 #define GBUFFER_MIN_BINDING                         GBUFFER_BINDING_LINEAR_WRAP_SAMPLER
@@ -126,8 +129,23 @@
 
 #define GBUFFER_SBT_OFFSET_STANDARD 0
 
+// The rtx.gbuffer.compactPsr CompactPsrArgs layout (uints): one VkDispatchIndirectCommand per list
+// (x = thread groups of the compact PSR kernel, y = z = 1), then the two appended pixel counts. List i holds
+// compactPsrCapacity entries starting at i * compactPsrCapacity, each a pixel packed as x | (y << 16).
+// List 0 = Reflection PSR, list 1 = Transmission PSR (the push isTransmissionPSR value).
+#define GBUFFER_COMPACT_PSR_GROUP_SIZE            128
+#define GBUFFER_COMPACT_PSR_ARGS_DWORDS_PER_LIST  3
+#define GBUFFER_COMPACT_PSR_ARGS_COUNT_OFFSET     6
+#define GBUFFER_COMPACT_PSR_ARGS_DWORDS           8
+#define GBUFFER_COMPACT_PSR_FLAG_APPEND           (1 << 0) // PSR Prepare appends to the lists this frame
+
 struct GbufferPushConstants
 {
   uint isTransmissionPSR;
   uint usePSRPrepare;
+  uint compactPsrFlags; // GBUFFER_COMPACT_PSR_FLAG_* bits
+  uint compactPsrCapacity; // entries per list in CompactPsrList
+  // When nonzero, the primary loop skips its unordered particle walk,
+  // and the deferred decal kernel (gbuffer_decal_prepare_particles_* variants) resolves the particles once per pixel instead.
+  uint deferUnorderedParticles;
 };

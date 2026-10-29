@@ -39,6 +39,17 @@ namespace dxvk {
   class DxvkDevice;
   class DxvkContext;
 
+  // rtx.hostImport.deviceLocalStaticMeshes: usage bits that mark a Remix API mesh buffer
+  // uploaded device-local in the layout a BlasEntry uses, so the entry may use it in place.
+  // Nothing binds these buffers as vertex/index/indirect buffers; the bits are only the marker
+  // (a combination no D3D frontend buffer that reaches a BlasEntry is created with).
+  constexpr VkBufferUsageFlags kAliasableGeometryUsage =
+    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+  inline bool isAliasableGeometryBuffer(const DxvkBuffer& buffer) {
+    return (buffer.info().usage & kAliasableGeometryUsage) == kAliasableGeometryUsage &&
+           !(buffer.memFlags() & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+  }
+
   /**
   * \brief Geometry utility shaders and related objects
   *
@@ -50,7 +61,12 @@ namespace dxvk {
     std::unique_ptr<RtxStagingDataAlloc> m_pCbData;
     std::unique_ptr<RtxStagingDataAlloc> m_pSmoothNormalsHashData;
     Rc<DxvkContext> m_skinningContext;
+    // Commands recorded into the skinning context since its last flush.
     uint32_t m_skinningCommands = 0;
+    // The skinning context's current batch: what it records until its next flush submits it.
+    uint64_t m_skinningBatch = 1;
+    // The skinning constants of the last dispatch. Only the bones it used are current.
+    std::unique_ptr<SkinningArgs> m_skinningArgs;
 
   public:
     explicit RtxGeometryUtils(DxvkDevice* pDevice);
@@ -71,7 +87,12 @@ namespace dxvk {
     /**
      * \brief Execute a compute shader to perform skinning
      */
-    void dispatchSkinning(const DrawCallState& drawCallState, const RaytraceGeometry& geo);
+    void dispatchSkinning(const SceneDraw& drawCallState, const RaytraceGeometry& geo);
+
+    /**
+     * \brief The skinning batch recorded but not submitted yet, or 0 when none is pending.
+     */
+    uint64_t pendingSkinningBatch() const { return m_skinningCommands > 0 ? m_skinningBatch : 0; }
 
     /**
      * \brief Execute a compute shader to perform view model perspective correction
@@ -112,8 +133,10 @@ namespace dxvk {
 
     /**
      * \brief Execute a compute shader to bake opacity micromap for the input geometry
+     * \returns false when the inputs failed validation ([OmmBake] warning logged) and nothing
+     *   was dispatched; the caller should drop the item.
      */
-    void dispatchBakeOpacityMicromap(
+    bool dispatchBakeOpacityMicromap(
       Rc<DxvkContext> ctx,
       const RtInstance& instance,
       const RaytraceGeometry& geo,
@@ -173,6 +196,43 @@ namespace dxvk {
      * \brief Execute a compute shader to generate a triangle list from arbitrary topologies
      */
     void dispatchGenTriList(const Rc<DxvkContext>& ctx, const GenTriListArgs& args, const DxvkBufferSlice& dst, const RasterBuffer* srcBuffer) const;
+
+    /**
+     * \brief rtx.alphaBake.census: counts the triangles of a baked opacity micromap array that are
+     * uniformly transparent / opaque / mixed into a counter buffer.
+     * numTriangles, wordsPerTriangle, opaqueWord and slotOffset are as in OmmCensusArgs.
+     */
+    void dispatchOmmClassCensus(const Rc<DxvkContext>& ctx, const Rc<DxvkBuffer>& ommArray, const Rc<DxvkBuffer>& counters,
+                                uint32_t numTriangles, uint32_t wordsPerTriangle, uint32_t opaqueWord, uint32_t slotOffset) const;
+
+    /**
+     * \brief rtx.alphaBake.censusMicroStates: counts the micro-triangle states of a baked opacity micromap array
+     * per triangle class / format / level into a counter buffer (OmmMicroCensusArgs).
+     */
+    void dispatchOmmMicroCensus(const Rc<DxvkContext>& ctx, const Rc<DxvkBuffer>& ommArray, const Rc<DxvkBuffer>& counters,
+                                uint32_t numTriangles, uint32_t wordsPerTriangle, bool twoState, uint32_t level) const;
+
+    /**
+     * \brief rtx.alphaBake.softwareOmm: packs a baked, compacted opacity micromap array into a software store
+     * (index words, then the mixed triangles' data, see omm_sw_pack_args.h).
+     */
+    void dispatchOmmSwPack(const Rc<DxvkContext>& ctx, const Rc<DxvkBuffer>& ommArray, const Rc<DxvkBuffer>& indexIn,
+                           const Rc<DxvkBuffer>& triangleIn, const Rc<DxvkBuffer>& storeOut, uint32_t numTriangles,
+                           uint32_t wordsPerTriangle, uint32_t numMixed) const;
+
+    /**
+     * \brief rtx.alphaBake.softwareOmmSelfTest: checks the software micromap barycentrics -> micro-triangle index
+     * mapping for levels 0-12 (2 uint32 results per level, see software_omm_shared.h).
+     */
+    void dispatchSoftOmmSelfTest(const Rc<DxvkContext>& ctx, const Rc<DxvkBuffer>& results) const;
+
+    /**
+     * \brief Opacity micromap compaction: writes the special / compact OMM index of
+     * every triangle of a baked array, the compact triangle records of its mixed triangles and their count.
+     */
+    void dispatchOmmCompact(const Rc<DxvkContext>& ctx, const Rc<DxvkBuffer>& ommArray, const Rc<DxvkBuffer>& indexOut,
+                            const Rc<DxvkBuffer>& triangleOut, const Rc<DxvkBuffer>& counter, uint32_t numTriangles,
+                            uint32_t wordsPerTriangle, uint32_t opaqueWord, uint32_t triangleWord1) const;
     
     /**
       * \brief Execute a compute shader to interleave vertex data into a single buffer
@@ -201,6 +261,8 @@ namespace dxvk {
     inline void flushCommandList() {
       if (m_skinningContext->getCommandList() != nullptr && m_skinningCommands > 0) {
         m_skinningContext->flushCommandList();
+        m_skinningCommands = 0;
+        ++m_skinningBatch;
       }
     }
 

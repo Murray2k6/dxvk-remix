@@ -1,8 +1,11 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstdio>
+#include <deque>
 #include <mutex>
 #include <queue>
+#include <vector>
 
 #include "../util/thread.h"
 
@@ -60,6 +63,11 @@ namespace dxvk {
     bool                insertReflexPresentMarkers;
     // Represents the acquired presenter image index at the time of image presentation for usage in presentation submission.
     uint32_t            cachedAcquiredImageIndex;
+    // NV-DXVK start: Keep raster presents out of Remix frame interpolation
+    bool                isRemixPresent = true;
+    // Reflex sleep preceding this frame's simulation, for rtx.present.traceCsv (ms; -1 = none)
+    float               reflexSleepMs = -1.0f;
+    // NV-DXVK end
   };
 
 
@@ -80,6 +88,10 @@ namespace dxvk {
     bool              resetHistory;
     // number of requested interpolated frames; must be at least 1, actual count may be lower depending on hardware support for MFG
     uint32_t          interpolatedFrameCount = 0;
+    // The Remix output in the back buffer format, for backends that compose the HUD over the generated frame. DLSS-G does not use it.
+    Rc<DxvkImage>     hudLessColor;
+    // The real frame time in milliseconds. DLSS-G does not use it.
+    float             frameTimeMs = 0.0f;
     
     bool valid() const {
       return motionVectors.ptr() &&
@@ -92,6 +104,8 @@ namespace dxvk {
       depth = nullptr;
       resetHistory = false;
       interpolatedFrameCount = 0;
+      hudLessColor = nullptr;
+      frameTimeMs = 0.0f;
     }
   };
   // NV-DXVK end
@@ -152,6 +166,17 @@ namespace dxvk {
     VkResult getLastError() const {
       return m_lastError.load();
     }
+
+    // The Remix presents since the last take, for the always-on [Perf] line.
+    // Filled on the submit thread, taken on the CS thread.
+    struct PresentWindow {
+      std::vector<float> intervalMs;   // between vkQueuePresentKHR calls
+      std::vector<float> acquireMs;    // the swapchain image acquire after each present (V-Sync and queue back-pressure)
+      std::vector<float> gateWaitMs;   // rtx.present.gpuQueueLimit waits
+      uint64_t framesInFlightSum = 0;
+      uint32_t presents = 0;
+    };
+    PresentWindow takePresentWindow();
     
     /**
      * \brief Submits a command list asynchronously
@@ -163,6 +188,12 @@ namespace dxvk {
      */
     void submit(
             DxvkSubmitInfo      submitInfo);
+
+    // Queues a command list like submit. The submission thread sets the status once it has submitted the command list
+    // to the Vulkan queue, so synchronizeSubmission can wait for that.
+    void submit(
+            DxvkSubmitInfo      submitInfo,
+            DxvkSubmitStatus*   status);
     
     /**
      * \brief Presents an image synchronously
@@ -272,6 +303,104 @@ namespace dxvk {
 
     std::queue<DxvkSubmitEntry> m_submitQueue;
     std::queue<DxvkSubmitEntry> m_finishQueue;
+
+    // NV-DXVK start: present pacing
+    // Declared before the threads, which start in the constructor.
+    // Detects "one late interval, then 3 fast ones" in a stream of intervals.
+    struct BurstDetector {
+      float    ring[16] = {};
+      uint32_t count    = 0;
+      // Returns true when the interval just pushed completes a burst.
+      bool push(float ms, float* outLateMs);
+    };
+
+    // Command lists handed to / completed by the finish thread, in submission order. Under m_mutex.
+    uint64_t                    m_submittedSeq = 0;
+    uint64_t                    m_completedSeq = 0;
+    // Per Remix present, the seq of the last command list submitted before it. Under m_mutex;
+    // the finish thread pops entries as those command lists complete.
+    std::deque<uint64_t>        m_presentFrameSeqs;
+    // Finish thread (samples moved out under m_mutex): intervals between presented frames' GPU completion.
+    uint64_t                    m_lastFrameDoneNs = 0;
+    std::vector<float>          m_frameDoneIntervalsMs;
+    BurstDetector               m_frameDoneBursts;
+    uint32_t                    m_frameDoneBurstCount = 0;
+    // rtx.present.traceCsv. Finish thread appends (frame seq, GPU-done QPC ms) as presented
+    // frames complete; the submit thread drains it under m_mutex when it writes rows.
+    std::vector<std::pair<uint64_t, double>> m_traceDone;
+
+    // Submit thread only.
+    struct PresentPacingDiag {
+      uint64_t           lastCallNs = 0;
+      uint32_t           presents = 0;
+      uint64_t           prevFrameSeqs[4] = {};   // [0] = previous Remix present's frame seq
+      std::vector<float> callIntervalMs, queuePresentMs, acquireMs, gateWaitMs;
+      std::vector<float> presentWaitMs;   // Frames that waited only
+      std::vector<float> framesInFlight, cmdListsInFlight, submitQueueLen;
+      BurstDetector      callBursts;
+      uint32_t           callBurstCount = 0, burstLinesLogged = 0, gateTimeouts = 0;
+      bool               loggedRuntimeModules = false;
+      // rtx.present.traceCsv
+      struct TraceCall {
+        uint64_t frameSeq;
+        double   callQpcMs;           // vkQueuePresentKHR call, QueryPerformanceCounter in ms (PresentMon --qpc_time_ms clock)
+        float    queuePresentMs, gateWaitMs;
+        uint32_t framesInFlight, cmdListsInFlight;
+        bool     gpuDoneAtPresent;    // the frame had already finished on the GPU when the present reached the submit thread
+        uint64_t reflexFrameId;
+        float    reflexSleepMs;       // Reflex sleep before this frame's simulation, -1 = none
+        uint64_t presentId;           // VkPresentIdKHR attached to this present, 0 = none
+        uint64_t presentWaitId;       // id this frame waited for before its RT work, 0 = no wait
+        float    presentWaitMs;       // time in vkWaitForPresentKHR before this frame's RT work, -1 = no wait
+        double   presentDoneQpcMs;    // QPC ms when that wait returned complete, -1 = no wait / timeout / error
+      };
+      std::deque<TraceCall> traceCalls;   // presents whose GPU-done time is not written yet
+      uint64_t           tracePresents = 0; // rows written so far (the present index column)
+      FILE*              traceFile = nullptr;
+      bool               traceOpenFailed = false;
+    } m_pacing;
+
+    dxvk::mutex   m_presentWindowMutex;
+    PresentWindow m_presentWindow;
+    uint64_t      m_presentWindowLastNs = 0;
+
+    // rtx.present.presentWaitPacing, submit thread only.
+    struct PresentWaitState {
+      Rc<vk::Presenter> presenter;          // the last Remix present's presenter
+      bool     armed = false;               // a Remix present went out and its next frame's RT work has not been submitted
+      // Result of this frame's wait, consumed by the next Remix present's trace row.
+      uint64_t frameWaitId = 0;
+      float    frameWaitMs = -1.0f;
+      double   frameDoneQpcMs = -1.0;
+      // Timeout guard: consecutive timeouts switch the wait off until the swapchain is recreated or the option toggles.
+      uint32_t consecutiveTimeouts = 0;
+      bool     suspended = false;
+      uint32_t suspendedGeneration = 0;
+      uint32_t timeoutsInInterval = 0;
+      // rtx.present.presentWaitPreGateFlush lists submitted ahead of an armed gate this interval.
+      uint32_t preGateListsInInterval = 0;
+      bool     loggedUnsupported = false, loggedError = false, loggedFirstWait = false;
+    } m_presentWait;
+
+    // Submit thread, before the first ray tracing command list after a Remix present.
+    void waitForPresentBeforeRtWork();
+
+    // Submit thread. Registers a Remix present's frame boundary, reports the GPU backlog at that
+    // moment and waits for the rtx.present.gpuQueueLimit gate. Returns the gate wait in ns.
+    // frameSeq / gpuDoneAtPresent: the frame's closing command list seq and whether it had already completed.
+    uint64_t waitRemixPresentGate(uint32_t& framesInFlight, uint32_t& cmdListsInFlight, uint32_t& submitQueueLen,
+                                  uint64_t& frameSeq, bool& gpuDoneAtPresent);
+    // Submit thread. Records one Remix present and logs [PresentPacing] / [PresentBurst].
+    void recordRemixPresent(const vk::Presenter& presenter, uint64_t callNs, double callQpcMs, uint64_t gateWaitNs,
+                            uint32_t framesInFlight, uint32_t cmdListsInFlight, uint32_t submitQueueLen,
+                            uint64_t frameSeq, bool gpuDoneAtPresent, uint64_t reflexFrameId, float reflexSleepMs);
+    // rtx.present.traceCsv, submit thread. tracePresent queues a row and opens/closes the file
+    // as the option changes; flushPresentTrace writes the rows whose GPU-done time has arrived.
+    void tracePresent(const PresentPacingDiag::TraceCall& call);
+    void flushPresentTrace(bool closeFile);
+    // Once, at the first Remix present: which presentation/overlay runtimes are loaded in this process.
+    void logPresentRuntimeModules();
+    // NV-DXVK end
 
     dxvk::thread                m_submitThread;
     dxvk::thread                m_finishThread;

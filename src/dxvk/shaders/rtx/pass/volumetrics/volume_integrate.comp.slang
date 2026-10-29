@@ -22,7 +22,6 @@
 
 //!variant volume_integrate_rayquery.comp
 
-// Atmosphere variant
 
 
 //!end-variants
@@ -33,6 +32,9 @@
 // with respect to volumetrics solely (if mixing of volumetric and non-volumetric lighting is
 // done, a new approach will be needed).
 #define ENABLE_VOLUMETRIC_RADIANCE_SCALE 1
+
+// Applies the sky provider's cloud shadow to the light samples that light the froxel cache (rtxdi_application_bridge_ext.slangh).
+#define VOLUME_LIGHT_SAMPLE_CLOUD_SHADOW 1
 
 #include "rtx/pass/common_bindings.slangh"
 #include "rtx/pass/volumetrics/volume_integrate_bindings.slangh"

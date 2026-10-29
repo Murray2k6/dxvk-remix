@@ -20,14 +20,8 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
-// rtx_fork_upscaler_ui.cpp — fork-owned UI for the FSR upscaler, the shared
-// post-upscale sharpening slider, and the frame-generation backend selector.
-//
-// This lives here rather than in dxvk_imgui.cpp / rtx_user_menu.cpp so that
-// those upstream files keep a one-line fork footprint. In particular
-// ImGUI::showDLFGOptions is left byte-identical to upstream: the selector below
-// decides *whether* it gets drawn, instead of the DLSS-G panel being rewritten
-// to host a second backend.
+// UI for the FSR upscaler, the shared post-upscale sharpening slider and the frame-generation backend selector.
+// The menus draw showFrameGenerationOptions in place of ImGUI::showDLFGOptions.
 
 #include "rtx_fork_hooks.h"
 #include "rtx_fork_fsr.h"
@@ -45,7 +39,7 @@
 
 namespace dxvk {
 
-  // Owned by dxvk_imgui.cpp; reused rather than duplicated.
+  // Defined in dxvk_imgui.cpp.
   extern RemixGui::ComboWithKey<int> dlfgMfgModeCombo;
 
   namespace {
@@ -80,6 +74,14 @@ namespace dxvk {
       } }
     };
 
+    RemixGui::ComboWithKey<bool> g_dlfgPresetCombo {
+      "DLSS Frame Generation Preset",
+      RemixGui::ComboWithKey<bool>::ComboEntries { {
+          { false, "A", "Standard model." },
+          { true,  "C", "Lightweight model with a lower GPU cost per generated frame." },
+      } }
+    };
+
     DxvkFSRFrameGen& fsrFrameGen(const Rc<DxvkContext>& ctx) {
       return ctx->getCommonObjects()->metaFSRFrameGen();
     }
@@ -97,10 +99,8 @@ namespace dxvk {
     }
 
     void applyFrameGenerationType(DxvkDevice* device) {
-      // The dropdown is the enable control: selecting a backend turns it on and
-      // turns the other one off. Living in the option's onChange rather than in
-      // the menu means the invariant also holds for rtx.conf, DXVK_FRAMEGEN_TYPE
-      // and SetConfigVariable, not just while the settings window is open.
+      // The dropdown is the enable control. Selecting a backend enables it and disables the other.
+      // This runs as the option's onChange, so it also holds for rtx.conf, DXVK_FRAMEGEN_TYPE and SetConfigVariable.
       const FrameGenerationType type = RtxOptions::frameGenerationType();
       const bool wantDlfg = (type == FrameGenerationType::DLSS);
       const bool wantFsrFg = (type == FrameGenerationType::FSR);
@@ -108,8 +108,7 @@ namespace dxvk {
       DxvkDLFG::enable.setDeferred(wantDlfg);
       DxvkFSRFrameGen::enable.setDeferred(wantFsrFg);
 
-      // Matches what upstream's DLFG checkbox did: turning DLSS-G on forces
-      // Reflex to Low Latency.
+      // Enabling DLSS-G sets Reflex to Low Latency, like upstream's DLFG checkbox.
       if (wantDlfg) {
         RtxOptions::reflexMode.setDeferred(ReflexMode::LowLatency);
       }
@@ -117,10 +116,23 @@ namespace dxvk {
 
     namespace {
 
-      // Colours reused from the dev menu's existing status text.
+      // These match the dev menu's other status text colours.
       constexpr ImVec4 kStatusActive { 0.45f, 0.85f, 0.45f, 1.0f };
       constexpr ImVec4 kStatusOff    { 0.70f, 0.70f, 0.70f, 1.0f };
       constexpr ImVec4 kStatusFault  { 250 / 255.f, 176 / 255.f, 50 / 255.f, 1.0f };
+
+      // Totals since the frame generation context was created. The log prints the same counters per interval.
+      void showFsrFrameGenerationReadout(const Rc<DxvkContext>& ctx) {
+        const DxvkFSRFrameGen::Stats s = fsrFrameGen(ctx).getStats();
+        ImGui::TextWrapped("%s", str::format("Presents: ", s.presents, ", interpolated: ", s.interpolated,
+          ", repeated: ", s.held, ", without a prepared frame: ", s.skipped, ", generation off: ", s.disabled).c_str());
+        ImGui::TextWrapped("%s", str::format("Resets: ", s.resetsHistory, " requested, ", s.resetsGap, " after a gap.").c_str());
+        ImGui::TextWrapped("%s", str::format("Render ", s.renderWidth, "x", s.renderHeight, " to ", s.displayWidth, "x", s.displayHeight,
+          ", frame time ", s.frameTimeMs, " ms, jitter ", s.jitter[0], ", ", s.jitter[1]).c_str());
+        ImGui::TextWrapped("%s", str::format("Depth: ", s.depthInverted ? "inverted" : "standard", s.depthInfinite ? ", infinite far" : "",
+          ". HUD-less image: ", s.hudLess ? "on" : "off", ". Async: ", s.asyncWorkloads ? "on" : "off",
+          ". HDR: ", s.hdr ? "on" : "off", ". Format: ", static_cast<int>(s.backBufferFormat), ".").c_str());
+      }
 
       void showFrameGenerationStatus(const Rc<DxvkContext>& ctx, bool isDlfgSupported) {
         switch (RtxOptions::frameGenerationType()) {
@@ -140,7 +152,7 @@ namespace dxvk {
             } else {
               const uint32_t frames = std::max(DxvkDLFG::maxInterpolatedFrames(), 1u);
               ImGui::TextColored(kStatusActive,
-                str::format("Status: active - DLSS Frame Generation, ", frames + 1, "x.").c_str());
+                str::format("Status: active - DLSS Frame Generation, ", frames + 1, "x, preset ", DxvkDLFG::getPresetName(), ".").c_str());
             }
             break;
 
@@ -154,6 +166,7 @@ namespace dxvk {
               ImGui::TextColored(kStatusFault, "Status: selected but inactive.");
             } else {
               ImGui::TextColored(kStatusActive, "Status: active - FSR Frame Generation, 2x.");
+              showFsrFrameGenerationReadout(ctx);
             }
             break;
         }
@@ -162,9 +175,8 @@ namespace dxvk {
     } // namespace
 
     void showFrameGenerationOptions(const Rc<DxvkContext>& ctx, bool isDlfgSupported) {
-      // Migration: a config written before the selector existed may have a
-      // backend enabled without a type set. Adopt it so the dropdown reflects
-      // what is actually running rather than silently reading "Off".
+      // A config can enable a backend without setting a type.
+      // The enabled backend is adopted so the dropdown shows what is running.
       if (RtxOptions::frameGenerationType() == FrameGenerationType::None) {
         if (DxvkDLFG::enable()) {
           RtxOptions::frameGenerationType.setDeferred(FrameGenerationType::DLSS);
@@ -176,8 +188,7 @@ namespace dxvk {
       if (isDlfgSupported) {
         g_frameGenTypeCombo.getKey(&RtxOptions::frameGenerationTypeObject());
       } else {
-        // Without DLSS-G support DLSS must not be selectable, but a config file
-        // or an earlier session on other hardware can still have left it set.
+        // DLSS is not selectable here, but a config file or a session on other hardware can have set it.
         if (RtxOptions::frameGenerationType() == FrameGenerationType::DLSS) {
           RtxOptions::frameGenerationType.setDeferred(FrameGenerationType::None);
         }
@@ -189,12 +200,28 @@ namespace dxvk {
 
       showFrameGenerationStatus(ctx, isDlfgSupported);
 
-      // Per-backend extras. Neither draws an enable toggle - the dropdown above
-      // is the enable control.
+      // Per-backend extras draw no enable toggle because the dropdown above is the enable control.
       if (RtxOptions::frameGenerationType() == FrameGenerationType::DLSS && isDlfgSupported) {
         if (ctx->getCommonObjects()->metaNGXContext().dlfgMaxInterpolatedFrames() > 1) {
           dlfgMfgModeCombo.getKey(&DxvkDLFG::maxInterpolatedFramesObject());
         }
+      }
+
+      // The preset stays selectable after a feature failure because selecting one makes DLSS Frame Generation available again.
+      const bool dlfgFailed = ctx->getCommonObjects()->metaDLFG().hasDLFGFailed();
+      if (ctx->getCommonObjects()->metaNGXContext().supportsDLFG()
+          && (RtxOptions::frameGenerationType() == FrameGenerationType::DLSS || dlfgFailed)) {
+        g_dlfgPresetCombo.getKey(&DxvkDLFG::litePresetObject());
+      }
+
+      if (RtxOptions::frameGenerationType() == FrameGenerationType::FSR) {
+        RemixGui::Checkbox("Interpolate HUD", &DxvkFSRFrameGen::interpolateHudObject());
+        RemixGui::SetTooltipToLastWidgetOnHover(
+          "Interpolates the HUD with the scene instead of drawing the current HUD over the generated frame. "
+          "Turn this on when generated frames look like repeats of the real frame.");
+        RemixGui::Checkbox("Frame Generation Debug Overlay", &DxvkFSRFrameGen::debugOverlayObject());
+        RemixGui::SetTooltipToLastWidgetOnHover(
+          "Draws tear lines, pacing lines and a red bar on frames generated after a reset.");
       }
     }
 
@@ -212,9 +239,7 @@ namespace dxvk {
     }
 
     void showSharedSharpnessSlider() {
-      // NIS has its own sharpening stage with its own control, and native
-      // rendering has nothing to sharpen after; showing the slider for either
-      // would be a dead widget.
+      // The slider would have no effect for NIS, which has its own sharpening control, or for native rendering.
       const UpscalerType upscaler = RtxOptions::upscalerType();
       if (upscaler == UpscalerType::None || upscaler == UpscalerType::NIS) {
         return;

@@ -72,7 +72,8 @@ GBufferMemoryPolymorphicSurfaceMaterialInteraction gBufferMemoryPolymorphicSurfa
   gBufferMemoryPolymorphicSurfaceMaterialInteraction.data1 =
     (uint32_t(f32ToUnorm8(gammaEmissiveColor.g)) << 0) |
     (uint32_t(f32ToUnorm8(gammaEmissiveColor.b)) << 8) |
-    (uint32_t(float16BitsToUint16(float16_t(emissiveIntensity))) << 16);
+    // Clamped: a pre-exposed (rtx_pre_exposure.h) emissive beyond fp16 range must not become an Inf.
+    (uint32_t(float16BitsToUint16(float16_t(min(emissiveIntensity, float16Max)))) << 16);
 
   return gBufferMemoryPolymorphicSurfaceMaterialInteraction;
 }

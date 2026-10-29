@@ -28,8 +28,16 @@
 
 #define RAY_TRACING_PRIMARY_RAY
 #define RESOLVE_OPACITY_LIGHTING_APPROXIMATION 1
+// rtx.gbuffer.slimVariants (gbuffer_decal_prepare_slim.comp.slang includes this file).
+#ifndef GBUFFER_SLIM_NO_THIN_FILM
 #define OPAQUE_MATERIAL_USE_THIN_FILM 1
+#endif
+#ifndef GBUFFER_SLIM_NO_POM
 #define OPAQUE_MATERIAL_USE_POM 1
+#endif
+#ifdef GBUFFER_SLIM_NO_PORTALS
+#define SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+#endif
 
 #ifndef GBUFFER_FEATURE_DEBUG_VIEW
 #define GBUFFER_FEATURE_DEBUG_VIEW 0
@@ -41,10 +49,6 @@
 
 #ifndef GBUFFER_FEATURE_DLSSRR
 #define GBUFFER_FEATURE_DLSSRR 1
-#endif
-
-#ifndef GBUFFER_FEATURE_PARTICLE_LAYER
-#define GBUFFER_FEATURE_PARTICLE_LAYER 0
 #endif
 
 #ifndef GBUFFER_FEATURE_STOCHASTIC_ALPHA
@@ -62,12 +66,12 @@
 
 [shader("compute")]
 [numthreads(16, 8, 1)]
-void main(uint2 ipos : SV_DispatchThreadID)
+void main(uint2 dispatchThreadId : SV_DispatchThreadID)
 {
-  if (any(ipos >= cb.camera.resolution))
+  if (any(dispatchThreadId >= cb.camera.resolution))
   {
     return;
   }
 
-  geometryResolverApplyUnorderedDecalsPass(ipos);
+  geometryResolverApplyUnorderedDecalsPass(dispatchThreadId);
 }

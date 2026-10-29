@@ -21,7 +21,9 @@
 */
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 #include "../util/log/log.h"
@@ -53,7 +55,8 @@ namespace dxvk::vk {
     VkExtent2D          imageExtent;
     uint32_t            imageCount;
     uint32_t            numFormats;
-    VkSurfaceFormatKHR  formats[4];
+    // Up to 2 HDR10 entries (d3d9 rtx.tonemap.hdrEnabled) ahead of up to 5 SDR ones (16-bit back buffers).
+    VkSurfaceFormatKHR  formats[8];
     uint32_t            numPresentModes;
     VkPresentModeKHR    presentModes[4];
     VkFullScreenExclusiveEXT fullScreenExclusive;
@@ -80,6 +83,8 @@ namespace dxvk::vk {
    */
   struct PresenterFeatures {
     bool                fullScreenExclusive : 1;
+    // VK_KHR_present_id + VK_KHR_present_wait enabled on the device
+    bool                presentWait : 1;
   };
   
   /**
@@ -139,7 +144,7 @@ namespace dxvk::vk {
     // NV-DXVK start: FSR FG support - surface handover across presenter switches
     /**
      * \brief Releases ownership of the surface
-     * 
+     *
      * Returns the surface handle and sets internal handle to
      * VK_NULL_HANDLE so the destructor won't destroy it.
      * Caller is responsible for the surface lifetime.
@@ -279,6 +284,29 @@ namespace dxvk::vk {
       return m_swapchain;
     }
 
+    // NV-DXVK start: present pacing diagnostics
+    // Duration of the last vkQueuePresentKHR call and of the image acquire that
+    // presentImage() issues right after it, in nanoseconds (non-DLFG path).
+    uint64_t lastQueuePresentNs() const { return m_lastQueuePresentNs; }
+    uint64_t lastPostPresentAcquireNs() const { return m_lastPostPresentAcquireNs; }
+    // NV-DXVK end
+
+    // Used by rtx.present.presentWaitPacing.
+    // True when presents on this swapchain can carry a VkPresentIdKHR and be waited on.
+    bool presentWaitSupported() const {
+      return m_device.features.presentWait && m_vkd->vkWaitForPresentKHR != nullptr;
+    }
+    // Id of the last present that was accepted (VK_SUCCESS / VK_SUBOPTIMAL_KHR) with an id attached; 0 = none
+    // on the current swapchain. Ids restart at 1 on every swapchain (re)creation.
+    uint64_t lastPresentId() const { return m_lastPresentId.load(std::memory_order_acquire); }
+    // Id attached to the most recent presentImage call (0 = none attached). Submission thread only.
+    uint64_t lastAttachedPresentId() const { return m_lastAttachedPresentId; }
+    // Bumped on every swapchain (re)creation.
+    uint32_t swapchainGeneration() const { return m_swapchainGeneration.load(std::memory_order_acquire); }
+    // vkWaitForPresentKHR on the current swapchain. Returns VK_NOT_READY without waiting when the id is 0, is not
+    // (or no longer) a present of the current swapchain, or waiting is unsupported.
+    VkResult waitForPresent(uint64_t presentId, uint64_t timeoutNs);
+
     /**
      * \brief Acquires FSE
      *
@@ -304,13 +332,22 @@ namespace dxvk::vk {
   // NV-DXVK start: DLFG integration
     virtual void synchronize() { }
 
+    /**
+     * rief Layout of an image when it is presented
+     *
+     * Rendering to a presenter image leaves the image in this layout.
+     */
+    virtual VkImageLayout presentLayout() const {
+      return VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    }
+
   protected:
   // NV-DXVK end
 
     // NV-DXVK start: FSR FG support - Protected constructor for derived classes
     /**
      * \brief Protected constructor for derived classes
-     * 
+     *
      * Creates a presenter using an existing surface, allowing
      * derived classes to take ownership of another presenter's
      * surface without recreating it. This avoids VK_ERROR_NATIVE_WINDOW_IN_USE_KHR
@@ -335,12 +372,28 @@ namespace dxvk::vk {
     VkSwapchainKHR    m_swapchain   = VK_NULL_HANDLE;
 
     std::vector<PresenterImage> m_images;
-    std::vector<PresenterSync>  m_semaphores;
+
+    // Acquire semaphores rotate per acquire. Present semaphores belong to one swap image each, since a present
+    // semaphore is only free again once its image has been re-acquired.
+    std::vector<VkSemaphore>    m_acquireSemaphores;
+    std::vector<VkSemaphore>    m_presentSemaphores;
 
     uint32_t m_imageIndex = 0;
-    uint32_t m_frameIndex = 0;
+    uint32_t m_acquireIndex = 0;
 
     VkResult m_acquireStatus = VK_NOT_READY;
+
+    // NV-DXVK start: present pacing diagnostics
+    uint64_t m_lastQueuePresentNs = 0;
+    uint64_t m_lastPostPresentAcquireNs = 0;
+    // NV-DXVK end
+
+    // m_presentWaitMutex orders waitForPresent against swapchain (re)creation.
+    uint64_t              m_nextPresentId = 0;
+    uint64_t              m_lastAttachedPresentId = 0;
+    std::atomic<uint64_t> m_lastPresentId = { 0 };
+    std::atomic<uint32_t> m_swapchainGeneration = { 0 };
+    dxvk::mutex           m_presentWaitMutex;
 
     FpsLimiter m_fpsLimiter;
 
@@ -380,6 +433,32 @@ namespace dxvk::vk {
             uint32_t                  desired);
 
     VkResult createSurface();
+
+    /**
+     * \brief Creates the acquire and present semaphores
+     *
+     * Creates one present semaphore per swap image in
+     * m_info.imageCount and enough acquire semaphores
+     * that one is never reused while a wait on it is
+     * still pending.
+     */
+    VkResult createSemaphores();
+
+    void destroySemaphores();
+
+    /**
+     * \brief Advances to the next acquire semaphore
+     * \returns The semaphore to pass to the next image acquire
+     */
+    VkSemaphore nextAcquireSemaphore();
+
+    /**
+     * \brief Semaphores for an acquired image
+     *
+     * \param [in] imageIndex Index of the acquired swap image
+     * \returns The semaphore of the latest acquire and the image's present semaphore
+     */
+    PresenterSync getSync(uint32_t imageIndex) const;
 
     void destroySwapchain();
 

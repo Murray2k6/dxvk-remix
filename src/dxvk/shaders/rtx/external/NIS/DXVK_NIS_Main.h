@@ -71,7 +71,7 @@ layout(push_constant) uniform const_buffer
 
 layout(binding=NIS_BINDING_SAMPLER_LINEAR_CLAMP) uniform sampler samplerLinearClamp;
 layout(binding=NIS_BINDING_INPUT) uniform texture2D in_texture;
-layout(binding=NIS_BINDING_OUTPUT,rgba8_snorm) uniform image2D out_texture;
+layout(binding=NIS_BINDING_OUTPUT,rgba16f) uniform image2D out_texture;
 
 #if NIS_SCALER
 layout(binding=NIS_BINDING_COEF_SCALER) uniform texture2D coef_scaler;

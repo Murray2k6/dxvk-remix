@@ -36,10 +36,10 @@ Texture2D<float> PrimaryPerceptualRoughness;
 layout(r32f, binding = RESTIR_GI_REUSE_BINDING_HIT_DISTANCE_INPUT)
 Texture2D<float> PrimaryHitDistance;
 
-layout(rgb10_a2, binding = RESTIR_GI_REUSE_BINDING_ALBEDO_INPUT)
+layout(binding = RESTIR_GI_REUSE_BINDING_ALBEDO_INPUT)
 Texture2D<float4> PrimaryAlbedo;
 
-layout(rgb10_a2, binding = RESTIR_GI_REUSE_BINDING_BASE_REFLECTIVITY_INPUT)
+layout(binding = RESTIR_GI_REUSE_BINDING_BASE_REFLECTIVITY_INPUT)
 Texture2D<float4> PrimaryBaseReflectivity;
 
 layout(rgba32f, binding = RESTIR_GI_REUSE_BINDING_WORLD_POSITION_INPUT)

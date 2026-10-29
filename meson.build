@@ -43,16 +43,14 @@ current_build_dir_norm = meson.current_build_dir().replace('\\', '/')
 #     early outs if everything's already fetched, so the waste is negligible + forgiveable.
 get_dependencies_script_path = join_paths(global_src_root_norm, 'scripts-common/update-deps.cmd')
 message('Downloading dependencies...')
-# Note: arm64 deps placed in a separate xml to keep x64 builds functional
-dependencies_file = target_machine.cpu() != 'armv8' ? 'packman-external.xml' : 'packman-external-arm64.xml'
-packman_out = run_command(get_dependencies_script_path, dependencies_file, 'update-deps.log', check: true)
+packman_out = run_command(get_dependencies_script_path, 'packman-external.xml', 'update-deps.log', check: true)
 message(packman_out.stdout().strip())
 if packman_out.returncode() != 0
   message(packman_out.stderr().strip())
   error('Failed to get dependencies.')
 endif
 fetch_packman_target = custom_target('fetch_packman',
-  input            : [dependencies_file, get_dependencies_script_path],
+  input            : ['packman-external.xml', get_dependencies_script_path],
   output           : 'update-deps.log',
   command          : [get_dependencies_script_path, '@INPUT0@', '@OUTPUT0@' ] )
 
@@ -109,6 +107,17 @@ endif
 if enable_rtxio == true
   add_global_arguments('/DWITH_RTXIO', language : 'cpp')
   vs_project_defines += 'WITH_RTXIO;'
+endif
+
+release_build = get_option('release_build')
+if release_build
+  if dxvk_is_msvc
+    # Trims the source root from __FILE__, which absolute include paths such as USD's would otherwise embed.
+    # The prefix has no trailing backslash, so a quoted argument cannot end in an escaped quote.
+    add_global_arguments('/d1trimfile:' + meson.global_source_root().replace('/', '\\'), language : ['c', 'cpp'])
+    # Records only the PDB file name in the debug directory.
+    add_global_link_arguments('/PDBALTPATH:%_PDB%', language : ['c', 'cpp'])
+  endif
 endif
 
 if get_option('buildtype') == 'release'
@@ -201,11 +210,20 @@ else
   nrc_include_path = 'submodules/nrc/include'
 endif
 
+nsight_graphics_capture_supported = target_machine.cpu_family() == 'x86_64'
+if nsight_graphics_capture_supported
+  add_project_arguments('-DDXVK_ENABLE_NSIGHT_GRAPHICS_CAPTURE=1', language : 'cpp')
+endif
+
 dxvk_include_dirs = [
   './include',
   './include/vulkan/include',
   nrc_include_path
 ]
+
+if nsight_graphics_capture_supported
+  dxvk_include_dirs += './external/nsight_graphics/include'
+endif
 
 dxvk_include_path = include_directories(dxvk_include_dirs)
 dxvk_shader_include_path = include_directories('./src/dxvk/shaders')
@@ -308,6 +326,13 @@ spirv_val = find_program('external/spirv_tools/spirv-val')
 python_interpreter = find_program('python3', 'python')
 shader_compile_script = join_paths(global_src_root_norm, 'scripts-common/compile_shaders.py')
 
+# NV-DXVK start: NUMOS sky provider (submodules/numos). Its passes build with this slangc into
+# numos_spirv_dir; install copies them and the night sky data to <output>/numos.
+numos_root = join_paths(global_src_root_norm, 'submodules/numos')
+numos_shader_script = join_paths(global_src_root_norm, 'scripts-common/numos_shaders.py')
+numos_spirv_dir = join_paths(current_build_dir_norm, 'src/dxvk/numos_spirv')
+# NV-DXVK end
+
 # GLSL Compiler
 
 glsl_args = [ '-V', '--vn', '@BASENAME@', '@INPUT@', '-o', '@OUTPUT@', '--target-env', 'vulkan1.2', '@EXTRA_ARGS@' ]
@@ -369,6 +394,11 @@ rtx_shaders_command_arguments = [
   '-include', rtxcr_include_path_string,
   '-include', submodules_include_path_string,
   '-include', volumetrics_include_path_string,
+  # NV-DXVK start: NUMOS host shader API (submodules/numos). numos_shim first: it maps NUMOS's vendored
+  # numos/util/* copies onto the Remix headers they came from.
+  '-include', join_paths(shader_directory, 'numos_shim'),
+  '-include', join_paths(numos_root, 'shaders'),
+  # NV-DXVK end
   '-output', rtx_shader_output_directory,
   '-parallel',
 ]
@@ -382,6 +412,12 @@ endif
 # different set of arguments.
 # Note: Append -binary to the runtime shader command arguments to output SPIR-V in binary form rather than as C headers.
 rtx_shaders_runtime_command_arguments = rtx_shaders_command_arguments + [ '-binary' ]
+
+# A release build runs spirv-opt over the embedded shaders. The runtime recompilation arguments above do not include it.
+if release_build
+  spirv_opt = find_program('external/spirv_tools/spirv-opt')
+  rtx_shaders_command_arguments += [ '-spirvopt', fs.as_posix(spirv_opt.full_path()) ]
+endif
 
 # Runtime Shader Recompilation Definitions
 # Note: Runtime shader recompilation requires various paths and script arguments as constant strings, so this information is generated
@@ -421,63 +457,16 @@ message('##############')
 message('# Versioning #')
 message('##############')
 
-full_version = meson.project_version()
-
-git_rev_parse_out = run_command('git', ['rev-parse','--verify','--short=8', 'HEAD'], check: false)
-git_hash = ''
-if git_rev_parse_out.returncode() != 0
-  error('Failed to get current git hash')
-else
-  git_hash = git_rev_parse_out.stdout().replace('\n','')
-  message('Current git hash: ' + git_hash)
+# vcs_tag reruns this command at every build, so the version follows the commit being built.
+vcs_version_command = [python_interpreter.full_path(), join_paths(global_src_root_norm, 'scripts-common/vcs_version.py'), meson.project_version(), global_src_root_norm]
+vcs_version_out = run_command(vcs_version_command, check: false)
+if vcs_version_out.returncode() != 0
+  error('vcs_version.py failed: ' + vcs_version_out.stderr().strip())
 endif
-
-found_tag = ''
-ci_commit_tag = ''
-get_env_out = run_command(python_interpreter.full_path(), [join_paths(global_src_root_norm, 'scripts-common/get_env.py'), 'CI_COMMIT_TAG'], check: false)
-if get_env_out.returncode() != 0
-  warning('get_env.py failed, ' + get_env_out.stderr().strip())
-else
-  ci_commit_tag = get_env_out.stdout().replace('\n','')
-endif
-b_found_ci_commit_tag = (ci_commit_tag != '')
-
-if b_found_ci_commit_tag
-  message('Found tag in CI_COMMIT_TAG envvar: ' + ci_commit_tag)
-  found_tag = ci_commit_tag
-else
-  git_describe_tag = ''
-  git_describe_out = run_command('git', ['describe','--always','--exact-match', git_hash], check: false)
-  if git_describe_out.returncode() == 0
-    git_describe_tag = git_describe_out.stdout().replace('\n','')
-    message('Found tag via git describe: ' + git_describe_tag)
-  endif
-  found_tag = git_describe_tag
-endif
-
-b_found_tag = found_tag != ''
-b_found_tag_matches = false
-if b_found_tag
-  b_found_tag_matches = found_tag == meson.project_version()
-endif
-
-if b_found_tag
-  if not b_found_tag_matches
-    warning('Tag does not match current version: ' + meson.project_version() + '. Please reconcile tag with version in meson.build.')
-  else
-    message('Found tag matches current version: ' + meson.project_version())
-    message('This is a release version.')
-  endif
-else
-  message('No tag found at current commit.')
-  message('This is NOT a release version')
-  full_version += '+' + git_hash
-endif
-
-message('Full version: ' + full_version)
+message('Full version at configure time: ' + vcs_version_out.stdout().strip())
 
 dxvk_version = vcs_tag(
-  command: [python_interpreter.full_path(), join_paths(global_src_root_norm, 'scripts-common/echo.py'), full_version],
+  command: vcs_version_command,
   input:  'version.h.in',
   output: 'version.h')
 
@@ -521,57 +510,16 @@ add_project_arguments('-DVK_ENABLE_BETA_EXTENSIONS', language : 'cpp')
 
 # External dependencies configuration
 # Configures Sentry, USD include/lib paths, MDL includes and the RTX IO dependency.
-# (NVAPI, Reflex, Aftermath, DLSS, DLFG, NRD, NRC and XeSS are configured below,
-#  as they carry Windows-on-Arm specific handling.)
+# (Reflex, NRD, NRC and XeSS are configured below)
 subdir('external-build')
-
-lssusd_include_paths = [nv_usd_include_path, vk_include_path]
 
 # This will be populated by the usd plugin builder
 usd_plugins = []
 usd_plugin_deps = []
 usd_plugin_delay_load_args = []
 
-nvapi_include_paths = include_directories('submodules/nvapi')
-if dxvk_is_woa
-  nvapi_lib_path = join_paths(global_src_root_norm, 'external/nvapi_arm64/arm64')
-  nvapi_lib = dxvk_compiler.find_library('nvapia64', dirs : nvapi_lib_path)
-else
-  nvapi_lib_path = join_paths(global_src_root_norm, 'submodules/nvapi/amd64')
-  nvapi_lib = dxvk_compiler.find_library('nvapi64', dirs : nvapi_lib_path)
-endif
-
 # Cache lib locations
 external_dll_paths += usd_lib_path
-
-nvusd_deplibs_22 = [
-  'ar',
-  'arch',
-  'js',
-  'gf',
-  'kind',
-  'sdf',
-  'sdr',
-  'ndr',
-  'pcp',
-  'tf',
-  'trace',
-  'usd',
-  'usdLux',
-  'usdGeom',
-  'usdRender',
-  'usdShade',
-  'usdSkel',
-  'work',
-  'vt',
-  'python310',
-  'plug',
-  'tbbmalloc',
-  get_option('buildtype') == 'debug' ? 'boost_python310-vc142-mt-gd-x64-1_76' :
-                                       'boost_python310-vc142-mt-x64-1_76',
-  get_option('buildtype') == 'debug' ? 'tbb_debug' :
-                                       'tbb',    # NOTE: remixsdk also depends on tbb.dll, assuming both USD / remixsdk use the same tbb version
-]
 
 nvusd_deplibs = [
   'usd_ar',
@@ -592,24 +540,16 @@ nvusd_deplibs = [
   'usd_usdSkel',
   'usd_work',
   'usd_vt',
-  'usd_python',
   'usd_plug',
   'usd_ts',
 ]
 
 usd_linklibs = []
-if dxvk_is_woa
-  foreach ulib : nvusd_deplibs
-    usd_linklibs += dxvk_compiler.find_library(ulib, dirs: join_paths(usd_lib_path, 'lib'))
-  endforeach
+foreach ulib : nvusd_deplibs
+  usd_linklibs += dxvk_compiler.find_library(ulib, dirs: join_paths(usd_lib_path, 'lib'))
+endforeach
 
-  usd_linklibs += dxvk_compiler.find_library(get_option('buildtype') == 'debug' ? 'tbb12_debug' : 'tbb12', dirs: join_paths(usd_lib_path, 'lib'))
-  usd_linklibs += dxvk_compiler.find_library('python311', dirs: join_paths(usd_lib_path, 'lib'))
-else
-  foreach ulib : nvusd_deplibs_22
-    usd_linklibs += dxvk_compiler.find_library(ulib, dirs: join_paths(usd_lib_path, 'lib'))
-  endforeach
-endif
+usd_linklibs += dxvk_compiler.find_library(get_option('buildtype') == 'debug' ? 'tbb12_debug' : 'tbb12', dirs: join_paths(usd_lib_path, 'lib'))
 
 if dxvk_is_woa
   reflex_lib_path = join_paths(global_src_root_norm, 'external/reflex_arm64/lib')
@@ -620,46 +560,6 @@ else
 endif
 external_dll_paths += reflex_lib_path
 reflex_lib = dxvk_compiler.find_library('NvLowLatencyVk', dirs : reflex_lib_path)
-
-if dxvk_is_woa
-  aftermath_lib_path = join_paths(global_src_root_norm, 'external/aftermath_arm64/lib/arm64/')
-  external_dll_paths += aftermath_lib_path
-  aftermath_lib = dxvk_compiler.find_library('GFSDK_Aftermath_Lib.arm64', dirs : aftermath_lib_path)
-  aftermath_include_path = include_directories( 'external/aftermath_arm64/include')
-else
-  aftermath_lib_path = join_paths(global_src_root_norm, 'external/aftermath/lib/x64/')
-  external_dll_paths += aftermath_lib_path
-  aftermath_lib = dxvk_compiler.find_library('GFSDK_Aftermath_Lib.x64', dirs : aftermath_lib_path)
-  aftermath_include_path = include_directories( 'external/aftermath/include')
-endif
-
-# this is repeated below, since we overwrite dlss_lib_path in src/dxvk/meson.build for some reason
-if dxvk_is_woa
-  dlss_root_path = 'external/ngx_sdk_dldn_arm64'
-  dlfg_root_path = 'external/ngx_sdk_dlfg_arm64'
-  dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_arm64/rel/')
-  dlfg_lib_path = join_paths(global_src_root_norm, dlfg_root_path, 'lib/Windows_arm64/rel/')
-else
-  dlss_root_path = 'external/ngx_sdk_dldn'
-  dlfg_root_path = 'external/ngx_sdk_dlfg'
-  dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_x86_64/rel/')
-  dlfg_lib_path = join_paths(global_src_root_norm, dlfg_root_path, 'lib/Windows_x86_64/rel/')
-endif
-
-external_dll_paths += dlss_lib_path
-external_dll_paths += dlfg_lib_path
-
-# Optional fork override: dlss_override/ at repo root, populated by
-# scripts/update-dlss-dlls.ps1 from the dxvk-remix-dlss-bundle releases.
-# Wins over the packman NGX SDK paths above so contributors can pin newer DLLs
-# without editing packman-external.xml or touching the packman cache junctions.
-dlss_override_path = join_paths(global_src_root_norm, 'dlss_override')
-if fs.is_file(join_paths(dlss_override_path, 'nvngx_dlss.dll'))
-  message('DLSS override active: using dlss_override/ for nvngx_dlss/dlssd/dlssg.dll')
-  dlss_lib_path = dlss_override_path
-  dlfg_lib_path = dlss_override_path
-  external_dll_paths += dlss_override_path
-endif
 
 nrc_dll_name = 'NRC_Vulkan.dll'
 if dxvk_is_woa
@@ -688,16 +588,6 @@ reflex_dep = declare_dependency(
   dependencies : [ reflex_lib ],
   include_directories : reflex_include_path
 )
-
-aftermath_dep = declare_dependency(
-    dependencies : [ aftermath_lib ],
-    include_directories : aftermath_include_path
-  )
-
-nvapi_dep = declare_dependency(
-    dependencies : [ nvapi_lib ],
-    include_directories : nvapi_include_paths
-  )
 
 embedded_includes = [ mdl_include_dir ]
 
@@ -741,25 +631,6 @@ if dxvk_is_ninja or dxvk_is_woa_ec
   fs.read('vsgen/testcase_project.vcxproj.user.template')
   fs.read('vsgen/testcase_project.args.json.template')
   fs.read('vsgen/vsutil.py')
-
-  # ... and now we do this again, because src/dxvk/meson.build overwrites this for some reason
-  if dxvk_is_woa
-    dlss_root_path = 'external/ngx_sdk_dldn_arm64'
-    dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_arm64/rel/')
-    dlfg_root_path = 'external/ngx_sdk_dlfg_arm64'
-    dlfg_lib_path = join_paths(global_src_root_norm, dlfg_root_path, 'lib/Windows_arm64/rel/')
-  else
-    dlss_root_path = 'external/ngx_sdk_dldn'
-    dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_x86_64/rel/')
-    dlfg_root_path = 'external/ngx_sdk_dlfg'
-    dlfg_lib_path = join_paths(global_src_root_norm, dlfg_root_path, 'lib/Windows_x86_64/rel/')
-  endif
-
-  # Re-apply the dlss_override/ swap clobbered by subdir('src') above.
-  if fs.is_file(join_paths(dlss_override_path, 'nvngx_dlss.dll'))
-    dlss_lib_path = dlss_override_path
-    dlfg_lib_path = dlss_override_path
-  endif
 
   # meson seems to force / as the path separator in custom_target
   # ... except in the case where the path separators are inconsistent, in which case it does nothing
@@ -856,21 +727,14 @@ if dxvk_is_ninja or dxvk_is_woa_ec
 
     install_subdir(join_paths(usd_lib_path, 'lib/usd/'), install_dir : output_path, install_tag: target_suffix)  
 
-    if dxvk_is_woa
-      foreach ulib : nvusd_deplibs
-        install_data(join_paths(usd_lib_path, 'lib', ulib + '.dll'), install_dir : output_path, install_tag: target_suffix) 
-      endforeach
 
-      install_data(join_paths(usd_lib_path, 'bin', get_option('buildtype') == 'debug' ? 'tbbmalloc_debug.dll' : 'tbbmalloc.dll'), install_dir : output_path, install_tag: target_suffix)
-      install_data(join_paths(usd_lib_path, 'bin', get_option('buildtype') == 'debug' ? 'tbb12_debug.dll' : 'tbb12.dll'), install_dir : output_path, install_tag: target_suffix)
-      install_data(join_paths(usd_lib_path, 'lib', 'python311.dll'), install_dir : output_path, install_tag: target_suffix)
-      install_subdir(join_paths(usd_lib_path, 'lib/python/'), install_dir : output_path, install_tag: target_suffix)
-    else
-      foreach ulib : nvusd_deplibs_22
-        install_data(join_paths(usd_lib_path, 'lib', ulib + '.dll'), install_dir : output_path, install_tag: target_suffix) 
-      endforeach
-    endif
+    foreach ulib : nvusd_deplibs
+      install_data(join_paths(usd_lib_path, 'lib', ulib + '.dll'), install_dir : output_path, install_tag: target_suffix) 
+    endforeach
 
+    install_data(join_paths(usd_lib_path, 'bin', get_option('buildtype') == 'debug' ? 'tbbmalloc_debug.dll' : 'tbbmalloc.dll'), install_dir : output_path, install_tag: target_suffix)
+    install_data(join_paths(usd_lib_path, 'bin', get_option('buildtype') == 'debug' ? 'tbb12_debug.dll' : 'tbb12.dll'), install_dir : output_path, install_tag: target_suffix)
+    # Python DLL not needed for nopy USD build
     install_data(join_paths(global_src_root_norm, 'src', 'usd-plugins', 'plugInfo.json'), install_dir : join_paths(output_path, 'usd', 'plugins'), install_tag: target_suffix) 
 
     # install USD plugins
@@ -880,15 +744,13 @@ if dxvk_is_ninja or dxvk_is_woa_ec
       install_tag: target_suffix 
     )
 
+    install_data(join_paths(nrc_dll_path, nrc_dll_name), install_dir : output_path, install_tag: target_suffix)
+    install_data(join_paths(nrc_dll_path, 'cudart64_13.dll'), install_dir : output_path, install_tag: target_suffix)
+    install_data(join_paths(nrc_dll_path, 'nvrtc64_130_0.dll'), install_dir : output_path, install_tag: target_suffix)
+
     if dxvk_is_woa
-      install_data(join_paths(nrc_dll_path, nrc_dll_name), install_dir : output_path, install_tag: target_suffix)
-      install_data(join_paths(nrc_dll_path, 'cudart64_13.dll'), install_dir : output_path, install_tag: target_suffix)
-      install_data(join_paths(nrc_dll_path, 'nvrtc64_130_0.dll'), install_dir : output_path, install_tag: target_suffix)
-      install_data(join_paths(nrc_dll_path, 'nvrtc-builtins64_131.dll'), install_dir : output_path, install_tag: target_suffix)
+      install_data(join_paths(nrc_dll_path, 'nvrtc-builtins64_134.dll'), install_dir : output_path, install_tag: target_suffix)
     else
-      install_data(join_paths(nrc_dll_path, nrc_dll_name), install_dir : output_path, install_tag: target_suffix)
-      install_data(join_paths(nrc_dll_path, 'cudart64_13.dll'), install_dir : output_path, install_tag: target_suffix)
-      install_data(join_paths(nrc_dll_path, 'nvrtc64_130_0.dll'), install_dir : output_path, install_tag: target_suffix)
       install_data(join_paths(nrc_dll_path, 'nvrtc-builtins64_133.dll'), install_dir : output_path, install_tag: target_suffix)
     endif
 
@@ -900,18 +762,17 @@ if dxvk_is_ninja or dxvk_is_woa_ec
 
     install_data(join_paths(fsr3_dll_path, 'amd_fidelityfx_vk.dll'), install_dir : output_path, install_tag: target_suffix)
 
-    install_data(join_paths(dlss_lib_path, 'nvngx_dlss.dll'), install_dir : output_path, install_tag: target_suffix) 
-    install_data(join_paths(dlss_lib_path, 'nvngx_dlssd.dll'), install_dir : output_path, install_tag: target_suffix) 
+    install_data(join_paths(dlss_bin_path, 'nvngx_dlss.dll'), install_dir : output_path, install_tag: target_suffix) 
+    install_data(join_paths(dlss_bin_path, 'nvngx_dlssd.dll'), install_dir : output_path, install_tag: target_suffix) 
+    install_data(join_paths(dlfg_bin_path, 'nvngx_dlssg.dll'), install_dir : output_path, install_tag: target_suffix)
 
-    install_data(join_paths(dlfg_lib_path, 'nvngx_dlssg.dll'), install_dir : output_path, install_tag: target_suffix) 
+    if not dxvk_is_woa
+      install_data(join_paths(dlnr_bin_path, 'nvngx_dlssnr.dll'), install_dir : output_path, install_tag: target_suffix)
+    endif
 
     install_data(join_paths(reflex_lib_path, 'NvLowLatencyVk.dll'), install_dir : output_path, install_tag: target_suffix) 
 
-    if dxvk_is_woa
-      install_data(join_paths(aftermath_lib_path, 'GFSDK_Aftermath_Lib.arm64.dll'), install_dir : output_path, install_tag: target_suffix) 
-    else
-      install_data(join_paths(aftermath_lib_path, 'GFSDK_Aftermath_Lib.x64.dll'), install_dir : output_path, install_tag: target_suffix)
-    endif
+    install_data(aftermath_binary, install_dir : output_path, install_tag: target_suffix)
 
     if enable_rtxio == true
       install_data(join_paths(rtxio_bin_path, 'rtxio.dll'), install_dir : output_path, install_tag: target_suffix)
@@ -947,11 +808,19 @@ if dxvk_is_ninja or dxvk_is_woa_ec
       )
     endif
 
+    # NV-DXVK start: NUMOS shaders and night sky data, loaded from <output>/numos at run time
+    meson.add_install_script(
+      python_interpreter, numos_shader_script, 'install', numos_root, numos_spirv_dir, output_path,
+      install_tag: target_suffix
+    )
+    # NV-DXVK end
+
     if requires_pdb
 	  # ensure we copy everything to these special targets, the PDB is important!
+      # A release build copies only the DLL, so the output folder holds nothing that records local paths.
       meson.add_install_script(
         join_paths(global_src_root_norm, 'scripts-common/install_file_in_dir.bat'),
-        join_paths(current_build_dir_norm, 'src/d3d9', 'd3d9.*'), output_path,
+        join_paths(current_build_dir_norm, 'src/d3d9', release_build ? 'd3d9.dll' : 'd3d9.*'), output_path,
         install_tag: target_suffix
       )
     endif
@@ -976,6 +845,6 @@ if dxvk_is_ninja or dxvk_is_woa_ec
   endif
 endif # dxvk_is_ninja
 
-if fs.is_dir('nv-private')
+if fs.is_file('nv-private/meson.build')
   subdir('nv-private')
 endif

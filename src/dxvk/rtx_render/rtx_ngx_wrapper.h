@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023-2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -21,15 +21,22 @@
 */
 #pragma once
 
-// this gets included from other modules, so use full path to external --- ugly!
+// Note: because this header might be included in another module which does not have access
+// to the DLSS SDK do not include any SDK headers unconditionally.
+#ifdef NVSDK_NGX_H
+// Now when we have main NGX header we can include the feature headers
+#include <nvsdk_ngx_defs.h>
+#include <nvsdk_ngx_defs_dlssd.h>
+#include <nvsdk_ngx_defs_dlssg.h>
 #ifdef _M_X64
-#include "../../../external/ngx_sdk_dldn/include/nvsdk_ngx.h"
-#include "../../../external/ngx_sdk_dldn/include/nvsdk_ngx_defs_dlssd.h"
-#else
-#include "../../../external/ngx_sdk_dldn_arm64/include/nvsdk_ngx.h"
-#include "../../../external/ngx_sdk_dldn_arm64/include/nvsdk_ngx_defs_dlssd.h"
+#include <nvsdk_ngx_defs_dlssnr.h>
 #endif
+#endif
+
+#include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 #include "../util/rc/util_rc_ptr.h"
 #include "rtx_semaphore.h"
 
@@ -71,6 +78,8 @@ namespace dxvk {
   class NGXDLSSContext;
   class NGXRayReconstructionContext;
   class NGXDLFGContext;
+  class NGXNeuralRenderingContext;
+
   class NGXContext final {
   public:
     explicit NGXContext(DxvkDevice* device);
@@ -102,13 +111,26 @@ namespace dxvk {
       return m_supportsRayReconstruction;
     }
 
+    bool supportsDlssNeuralRendering() const {
+      return m_supportsDlssNeuralRendering;
+    }
+
+    bool isDlssNeuralRenderingSupportChecked() const {
+      return m_dlssNeuralRenderingSupportChecked;
+    }
+
     const std::string& getDLFGNotSupportedReason() {
       return m_dlfgNotSupportedReason;
     }
+
+    // Returns the directories NGX searches for feature DLLs, in search order, joined for display.
+    // Returns an empty string before NGX has been initialized.
+    std::string getFeatureSearchPathText() const;
     
     std::unique_ptr<NGXDLSSContext> createDLSSContext();
     std::unique_ptr<NGXRayReconstructionContext> createRayReconstructionContext();
     std::unique_ptr<NGXDLFGContext> createDLFGContext();
+    std::unique_ptr<NGXNeuralRenderingContext> createDlssNeuralRenderingContext();
     
   private:
     bool initialize();
@@ -120,11 +142,18 @@ namespace dxvk {
     bool m_supportsDLFG = false;
     uint32_t m_dlfgMaxInterpolatedFrames = 0;
     bool m_supportsRayReconstruction = false;
+    bool m_supportsDlssNeuralRendering = false;
+    bool m_dlssNeuralRenderingSupportChecked = false;
 
     bool checkDLSSSupport(NVSDK_NGX_Parameter* params);
+    bool checkDlssNeuralRenderingSupport(NVSDK_NGX_Parameter* params);
+    void logDlssNeuralRenderingLibrary() const;
     void checkDLFGSupport(NVSDK_NGX_Parameter* params);
 
     std::string m_dlfgNotSupportedReason;
+
+    // Set up by initialize() and passed to NGX as NVSDK_NGX_FeatureCommonInfo::PathListInfo.
+    std::vector<std::wstring> m_featureSearchPaths;
   };
 
   class NGXFeatureContext {
@@ -143,7 +172,8 @@ namespace dxvk {
     DxvkDevice* m_device = nullptr;
     NVSDK_NGX_Parameter* m_parameters = nullptr;
   };
-
+// Note: enabling features only when we have relevant DLSS SDK headers available.
+#ifdef NVSDK_NGX_DEFS_H
   class NGXDLSSContext final : public NGXFeatureContext {
   public:
     struct OptimalSettings {
@@ -182,6 +212,7 @@ namespace dxvk {
       bool depthInverted,
       bool autoExposure,
       bool sharpening,
+      NVSDK_NGX_DLSS_Hint_Render_Preset dlssPreset,
       NVSDK_NGX_PerfQuality_Value perfQuality = NVSDK_NGX_PerfQuality_Value_MaxPerf);
 
     /** Release DLSS.
@@ -220,7 +251,8 @@ namespace dxvk {
     Matrix4 m_worldToViewMatrix;
     Matrix4 m_viewToProjectionMatrix;
   };
-
+#endif // NVSDK_NGX_DEFS_H
+#ifdef NVSDK_NGX_DEFS_DLSSD_H
   class NGXRayReconstructionContext final : public NGXFeatureContext {
   public:
     struct QuerySettings {
@@ -242,7 +274,6 @@ namespace dxvk {
       const Resources::Resource* pRoughness;
       const Resources::Resource* pBiasCurrentColorMask;
       const Resources::Resource* pHitDistance;
-      const Resources::Resource* pInTransparencyLayer;
       const Resources::Resource* pDisocclusionMask;
     };
 
@@ -309,7 +340,8 @@ namespace dxvk {
     Matrix4 m_worldToViewMatrix;
     Matrix4 m_viewToProjectionMatrix;
   };
-
+#endif // NVSDK_NGX_DEFS_DLSSD_H
+#ifdef NVSDK_NGX_DEFS_DLSSG_H
   class NGXDLFGContext final : public NGXFeatureContext {
   public:
     typedef enum {
@@ -317,11 +349,12 @@ namespace dxvk {
       Success,
     } EvaluateResult;
 
-    void initialize(
+    bool initialize(
       Rc<DxvkContext> renderContext,
       VkCommandBuffer commandList,
       uint32_t displayOutSize[2],
-      VkFormat outputFormat
+      VkFormat outputFormat,
+      bool litePreset
       );
 
     // interpolates one frame
@@ -355,4 +388,61 @@ namespace dxvk {
   private:
     NVSDK_NGX_Handle* m_feature = nullptr;
   };
+#endif // NVSDK_NGX_DEFS_DLSSG_H
+
+#ifdef NVSDK_NGX_DEFS_H
+  class NGXNeuralRenderingContext final : public NGXFeatureContext {
+  public:
+    struct NGXNeuralRenderingBuffers {
+      const Resources::Resource* pInColor;
+      const Resources::Resource* pOutColor;
+      const Resources::Resource* pMotionVectors;
+      const Resources::Resource* pDepth;
+      const Resources::Resource* pControlMask;
+    };
+
+    struct NGXNeuralRenderingSettings {
+      bool resetAccumulation;
+      float jitterOffset[2];
+      float motionVectorScale[2];
+      float intensity;
+      float toneStrength;
+      float structuralStrength;
+      uint32_t model;
+      bool useAutoMask;
+      // An NVSDK_NGX_DLSSNR_Mask_Blend_Mode value.
+      uint32_t maskBlendMode;
+      float skinStructureStrength;
+    };
+
+    // preset is an NVSDK_NGX_DLSSNR_Hint_Render_Preset value, taken as uint32_t so this
+    // declaration does not need the DLSS-NR SDK header (which has no arm64 package).
+    void initialize(Rc<DxvkContext> renderContext, const uint32_t displaySize[2], uint32_t preset);
+
+    bool evaluateNeuralRendering(Rc<DxvkContext> renderContext, const NGXNeuralRenderingBuffers& buffers, const NGXNeuralRenderingSettings& settings) const;
+
+    void releaseNGXFeature() override;
+
+    bool isNeuralRenderingInitialized() const {
+      return m_initialized && m_neuralRenderingFeature != nullptr;
+    }
+
+  public:
+    // note: ctor is public due to make_unique/unique_ptr, but not intended as public --- use NGXWrapper::createDlssNeuralRenderingContext instead
+    explicit NGXNeuralRenderingContext(DxvkDevice* device);
+    ~NGXNeuralRenderingContext() override;
+
+    NGXNeuralRenderingContext(const NGXNeuralRenderingContext&) = delete;
+    NGXNeuralRenderingContext(NGXNeuralRenderingContext&&) noexcept = delete;
+    NGXNeuralRenderingContext& operator=(const NGXNeuralRenderingContext&) = delete;
+    NGXNeuralRenderingContext& operator=(NGXNeuralRenderingContext&&) noexcept = delete;
+
+  private:
+    bool m_initialized = false;
+    NVSDK_NGX_Handle* m_neuralRenderingFeature = nullptr;
+  };
+#endif // NVSDK_NGX_DEFS_H
 }
+
+// -1 while NGX support is unknown, 0 when unavailable, and 1 when available.
+extern "C" __declspec(dllexport) int remixinternal_GetDlssNeuralRenderingStatus();

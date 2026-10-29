@@ -113,12 +113,12 @@ void MeshProximity::updateRange(const Rc<DxvkContext>& context, const size_t sta
     
     // Default to "very far outside" if no valid mesh found
     float signedDistance = FLT_MAX;
-    const PrimInstance* meshPrim = m_batch.resolvePrimTarget(context, i, m_target[i]);
+    const PrimInstance meshPrim = m_batch.resolvePrimTarget(context, i, m_target[i]);
 
-    if (meshPrim != nullptr && meshPrim->getType() == PrimInstance::Type::Instance) {
+    if (meshPrim.getType() == PrimInstance::Type::Instance) {
         
       // Get the RtInstance from the PrimInstance
-      RtInstance* rtInstance = meshPrim->getInstance();
+      RtInstance* rtInstance = meshPrim.getInstance();
       
       if (rtInstance != nullptr) {
         // Get the BlasEntry from the RtInstance - this represents the mesh asset

@@ -329,6 +329,16 @@ vec3 signedOctahedralToHemisphereDirection(vec2 p, float strength = 1.f)
   return normalize(vec3(v.xy * strength, v.z));
 }
 
+// Converts a tangent-space normal stored as unsigned X and Y (Z rebuilt, as in
+// two-channel normal maps) to a normalized hemispherical vector.
+vec3 unsignedTangentXYToHemisphereDirection(vec2 p, float strength = 1.f)
+{
+  const vec2 xy = p * 2.0f - 1.0f;
+  const float z = sqrt(saturate(1.0f - dot(xy, xy)));
+
+  return normalize(vec3(xy * strength, max(z, 1e-4f)));
+}
+
 // Converts a normalized spherical vector to an unsigned octahedral encoding (2 channels of [0, 1])
 vec2 sphereDirectionToUnsignedOctahedral(vec3 v)
 {

@@ -24,6 +24,7 @@
 #include <version.h>
 
 #include "imgui.h"
+#include "dxvk_imgui.h"
 #include "dxvk_device.h"
 #include "dxvk_context.h"
 #include "dxvk_objects.h"
@@ -35,6 +36,27 @@
 #include <vector>
 
 namespace dxvk {
+  namespace {
+    constexpr const char* kRemixPlusName = "Remix Plus";
+
+    constexpr const char* kRemixPlusSummary =
+      "Remix Plus is a heavily extended fork of NVIDIA RTX Remix, the runtime that brings path tracing to classic games. "
+      "It keeps the RTX Remix renderer and adds:";
+
+    constexpr const char* kRemixPlusAdditions[] = {
+      "A physically based sky with atmosphere, clouds, haze and weather (NUMOS), including the sun, moon and night sky, and weather that follows the game's own.",
+      "Faster scene handling: a retained scene that keeps unchanged objects from frame to frame, a faster D3D9 path (D3D9 v2) and lower CPU cost per frame.",
+      "SHaRC indirect lighting and light BVH sampling, which keep scenes with many lights fast.",
+      "Better decals and surface detail: parallax occlusion mapping, SCCR relief displacement, and decals and cut-out textures that no longer punch holes in the surfaces under them.",
+      "DLSS-NR neural rendering with multi-pass evaluation.",
+      "Crash reports that stay on your computer: a crash writes its report and logs to the rtx-remix\\logs folder, and nothing is uploaded."
+    };
+
+    constexpr const char* kRemixPlusDisclaimer =
+      "Remix Plus is a community project. It is not an official NVIDIA product, and NVIDIA does not support or endorse it. "
+      "The RTX Remix credits below belong to the NVIDIA RTX Remix project it is built on.";
+  }
+
   void ImGuiAbout::update(const Rc<DxvkContext>& ctx) {
     m_secrets.update(ctx);
   }
@@ -44,7 +66,11 @@ namespace dxvk {
 
     // Remix Version Information
 
-    ImGui::TextUnformatted("RTX Remix Version: " DXVK_VERSION);
+    const std::string productVersion = ImGUI::productVersion();
+    if (!productVersion.empty()) {
+      ImGui::Text("%s Version: %s", ImGUI::productName().c_str(), productVersion.c_str());
+    }
+    ImGui::TextUnformatted("Remix Plus Version: " DXVK_VERSION);
     ImGui::SameLine();
 
     const auto currentTime = std::chrono::steady_clock::now();
@@ -66,11 +92,38 @@ namespace dxvk {
       m_copiedNotificationTimeout = currentTime + std::chrono::seconds(2);
     }
 
+    // Remix Plus
+
+    if (RemixGui::CollapsingHeader("Remix Plus", ImGuiTreeNodeFlags_DefaultOpen)) {
+      const std::string& productName = ImGUI::productName();
+      if (productName != kRemixPlusName) {
+        ImGui::TextWrapped("%s is built on Remix Plus.", productName.c_str());
+        ImGui::Spacing();
+      }
+
+      ImGUI::showDonateButton();
+      ImGui::Spacing();
+
+      ImGui::TextWrapped("%s", kRemixPlusSummary);
+      ImGui::Spacing();
+
+      for (const char* addition : kRemixPlusAdditions) {
+        ImGui::Bullet();
+        ImGui::SameLine();
+        ImGui::TextWrapped("%s", addition);
+      }
+
+      ImGui::Spacing();
+      ImGui::TextWrapped("%s", kRemixPlusDisclaimer);
+    }
+
     // Remix Credits
 
     if (RemixGui::CollapsingHeader("Credits", ImGuiTreeNodeFlags_DefaultOpen)) {
-      ImGui::TextUnformatted("Produced by NVIDIA Lightspeed Studios");
-      ImGui::TextUnformatted("Based on the DXVK project");
+      ImGui::TextUnformatted("Remix Plus is a community fork of NVIDIA RTX Remix.");
+      ImGui::TextUnformatted("It is not affiliated with or endorsed by NVIDIA.");
+      ImGui::TextUnformatted("RTX Remix is based on the DXVK project.");
+      ImGui::TextUnformatted("The people below are credited for their work on RTX Remix.");
 
       RemixGui::Separator();
 
@@ -115,6 +168,7 @@ namespace dxvk {
           "Sam Bourne",
           "David Driver-Gomm",
           "Alex Dunn",
+          "Scott Fitzpatrick",
           "Nicholas Freybler",
           "Shona Gillard",
           "Mark Henderson",

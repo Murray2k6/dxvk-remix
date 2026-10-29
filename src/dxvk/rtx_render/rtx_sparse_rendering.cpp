@@ -23,13 +23,17 @@
 
 #include "dxvk_device.h"
 #include "rtx_context.h"
+#include "rtx_scene_manager.h"
+#include "rtx_light_manager.h"
 #include "rtx_neural_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
 #include "rtx_options.h"
 #include "rtx_shader_manager.h"
+#include "rtx_pathtracer_integrate_direct.h"
 #include "rtx_imgui.h"
 
 #include <algorithm>
+#include <cstring>
 
 #include "rtx/pass/sparse_rendering/active_pixel_mask_binding_indices.h"
 #include "rtx/pass/sparse_rendering/compact_active_pixels_binding_indices.h"
@@ -41,6 +45,7 @@
 #include <rtx_shaders/active_pixel_mask.h>
 #include <rtx_shaders/active_pixel_sampling_rate.h>
 #include <rtx_shaders/compact_active_pixels.h>
+#include <rtx_shaders/compact_active_pixels_args.h>
 
 namespace dxvk {
 
@@ -60,13 +65,10 @@ namespace dxvk {
         COMMON_RAYTRACING_BINDINGS
 
         // Inputs
-        TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_DIRECT_PIXEL_SAMPLING_RATE_INPUT)
-        TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_INDIRECT_PIXEL_SAMPLING_RATE_INPUT)
+        TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_PIXEL_SAMPLING_RATE_INPUT)
 
         // Outputs
-        RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_DIRECT_ACTIVE_PIXEL_MASK_OUTPUT)
-        RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_INDIRECT_ACTIVE_PIXEL_MASK_OUTPUT)
-        RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_UNION_ACTIVE_PIXEL_MASK_OUTPUT)
+        RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_ACTIVE_PIXEL_MASK_OUTPUT)
       END_PARAMETER()
     };
 
@@ -78,10 +80,14 @@ namespace dxvk {
 
         // Inputs
         TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_SHARED_FLAGS_INPUT)
+        TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_PRIMARY_CONE_RADIUS_INPUT)
+        TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_SECONDARY_CONE_RADIUS_INPUT)
+
+        // Input-Outputs
+        RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_NRC_TRAINING_QUERY_RESERVOIR_INPUT_OUTPUT)
 
         // Outputs
-        RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_DIRECT_PIXEL_SAMPLING_RATE_OUTPUT)
-        RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_INDIRECT_PIXEL_SAMPLING_RATE_OUTPUT)
+        RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_PIXEL_SAMPLING_RATE_OUTPUT)
       END_PARAMETER()
     };
 
@@ -92,13 +98,24 @@ namespace dxvk {
         COMMON_RAYTRACING_BINDINGS
 
         // Inputs
-        TEXTURE2D(COMPACT_ACTIVE_PIXELS_BINDING_DIRECT_ACTIVE_PIXEL_MASK_INPUT)
-        TEXTURE2D(COMPACT_ACTIVE_PIXELS_BINDING_INDIRECT_ACTIVE_PIXEL_MASK_INPUT)
+        TEXTURE2D(COMPACT_ACTIVE_PIXELS_BINDING_ACTIVE_PIXEL_MASK_INPUT)
+
+        // Inputs/Outputs
+        RW_STRUCTURED_BUFFER(COMPACT_ACTIVE_PIXELS_BINDING_ACTIVE_PIXEL_LIST_INPUT_OUTPUT)
 
         // Outputs
-        RW_TEXTURE2D(COMPACT_ACTIVE_PIXELS_BINDING_DIRECT_ACTIVE_LOCAL_PIXEL_COORDS_OUTPUT)
-        RW_TEXTURE2D(COMPACT_ACTIVE_PIXELS_BINDING_INDIRECT_ACTIVE_LOCAL_PIXEL_COORDS_OUTPUT)
-        RW_TEXTURE2D(COMPACT_ACTIVE_PIXELS_BINDING_UNION_ACTIVE_LOCAL_PIXEL_COORDS_OUTPUT)
+        RW_TEXTURE2D(COMPACT_ACTIVE_PIXELS_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_OUTPUT)
+      END_PARAMETER()
+    };
+
+    class CompactActivePixelsArgsShader : public ManagedShader {
+      SHADER_SOURCE(CompactActivePixelsArgsShader, VK_SHADER_STAGE_COMPUTE_BIT, compact_active_pixels_args)
+
+      BEGIN_PARAMETER()
+        COMMON_RAYTRACING_BINDINGS
+
+        // Inputs/Outputs
+        RW_STRUCTURED_BUFFER(COMPACT_ACTIVE_PIXELS_BINDING_ACTIVE_PIXEL_LIST_INPUT_OUTPUT)
       END_PARAMETER()
     };
   }
@@ -106,6 +123,37 @@ namespace dxvk {
   SparseRendering::SparseRendering(dxvk::DxvkDevice* device)
     : CommonDeviceObject(device)
     , RtxPass(device) {
+  }
+
+  namespace {
+    // Declining when the destination already holds a value on this layer keeps a rate the user set
+    // explicitly intact, and keeps the migration idempotent - a transform that combined the two
+    // values would fold its own previous result back in every time a deprecated rate is set again.
+    bool migrateSamplingRate(const GenericValue& src, GenericValue& dest, bool destHasExistingValue) {
+      if (destHasExistingValue) {
+        return false;
+      }
+
+      dest.f = src.f;
+      return true;
+    }
+  }
+
+  // Both deprecated rates route here so the order they are attempted in is fixed: with a value on
+  // the same layer for each, the direct rate is the one that migrates.
+  void SparseRendering::Options::deprecatedSamplingRateOnChange(DxvkDevice* device) {
+    bool migrated = directLightingSamplingRate.migrateValuesTo(&samplingRateObject(), migrateSamplingRate);
+    migrated |= indirectLightingSamplingRate.migrateValuesTo(&samplingRateObject(), migrateSamplingRate);
+
+    if (migrated) {
+      directLightingSamplingRate.clearFromStrongerLayers(RtxOptionLayer::getDefaultLayer());
+      indirectLightingSamplingRate.clearFromStrongerLayers(RtxOptionLayer::getDefaultLayer());
+
+      Logger::info("[Deprecated Config] rtx.sparseRendering.directLightingSamplingRate and "
+                   "rtx.sparseRendering.indirectLightingSamplingRate have been deprecated, we have migrated them to "
+                   "rtx.sparseRendering.samplingRate, no further action is required from you. "
+                   "Please re-save your rtx config to get rid of this message.");
+    }
   }
 
   bool SparseRendering::isEnabled() const {
@@ -121,13 +169,10 @@ namespace dxvk {
       return false;
     }
 
-    // Return false if NRC is not active
-    if (!device()->getCommon()->metaNeuralRadianceCache().isActive()) {
-      // Reason:
-      //  ReSTIR GI cannot be active at the same time since bsdfFactor2.x would have to be applied to inactive pixels as well.
-      //  Importance Sampled mode has not been tested.
-      ONCE(Logger::warn("[RTX Sparse Rendering] Neural Radiance Cache is disabled; sparse rendering will not run. "
-                        "It will resume automatically when Neural Radiance Cache is re-enabled."));
+    // ReSTIR GI would have to apply bsdfFactor2.x to inactive pixels as well, which the sparse path does not do.
+    if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
+      ONCE(Logger::warn("[RTX Sparse Rendering] ReSTIR GI indirect illumination is not supported with sparse rendering; sparse rendering will not run. "
+                        "It will resume automatically when another indirect illumination mode is selected."));
       return false;
     }
 
@@ -151,8 +196,9 @@ namespace dxvk {
       RtxOptions::enableFirstBounceLobeProbabilityDithering.setImmediately(false);
     }
 
-    // Sparse secondary surface lighting needs per-signal radiance scaling for the combined direct+indirect
-    // PSR buffer; not implemented yet. Force off.
+    // The secondary (PSR) path runs dense: demodulate scales only the primary signals by the sampling
+    // rate, and composite reads secondary radiance regardless of the active-pixel mask, so letting
+    // secondary pixels go sparse would leave that radiance uncompensated. Force off.
     Options::enableSparseSecondaryLighting.setImmediately(false);
   }
 
@@ -175,39 +221,89 @@ namespace dxvk {
   void SparseRendering::createDownscaledResource(Rc<DxvkContext>& ctx, const VkExtent3D& downscaledExtent) {
     Resources::RaytracingOutput& rtOutput = device()->getCommon()->getResources().getRaytracingOutput();
 
-    rtOutput.m_sparseRenderingDirectActiveLocalPixelCoords =
-      Resources::createImageResource(ctx, "Sparse Rendering Direct Active Local Coords", downscaledExtent, VK_FORMAT_R16_UINT);
-    rtOutput.m_sparseRenderingIndirectActiveLocalPixelCoords =
-      Resources::createImageResource(ctx, "Sparse Rendering Indirect Active Local Coords", downscaledExtent, VK_FORMAT_R16_UINT);
-    rtOutput.m_sparseRenderingUnionActiveLocalPixelCoords =
-      Resources::createImageResource(ctx, "Sparse Rendering Union Active Local Coords", downscaledExtent, VK_FORMAT_R16_UINT);
-    rtOutput.m_sparseRenderingDirectPixelSamplingRate =
-      Resources::createImageResource(ctx, "Sparse Rendering Direct Pixel Sampling Rate", downscaledExtent, VK_FORMAT_R8_UNORM);
-    rtOutput.m_sparseRenderingIndirectPixelSamplingRate =
-      Resources::createImageResource(ctx, "Sparse Rendering Indirect Pixel Sampling Rate", downscaledExtent, VK_FORMAT_R8_UNORM);
+    rtOutput.m_sparseRenderingActiveLocalPixelCoords =
+      Resources::createImageResource(ctx, "Sparse Rendering Active Local Coords", downscaledExtent, VK_FORMAT_R16_UINT);
+    rtOutput.m_sparseRenderingPixelSamplingRate =
+      Resources::createImageResource(ctx, "Sparse Rendering Pixel Sampling Rate", downscaledExtent, VK_FORMAT_R8_UNORM);
 
     const VkExtent3D blockSize = { ACTIVE_PIXEL_MASK_BLOCK_WIDTH, ACTIVE_PIXEL_MASK_BLOCK_HEIGHT, 1u };
     const VkExtent3D maskExtent = util::computeBlockCount(downscaledExtent, blockSize);
     m_activePixelMaskExtent = maskExtent;
-    rtOutput.m_sparseRenderingDirectActivePixelMask =
-      Resources::createImageResource(ctx, "Sparse Rendering Direct Active Pixel Mask", maskExtent, VK_FORMAT_R8_UINT);
-    rtOutput.m_sparseRenderingIndirectActivePixelMask =
-      Resources::createImageResource(ctx, "Sparse Rendering Indirect Active Pixel Mask", maskExtent, VK_FORMAT_R8_UINT);
-    rtOutput.m_sparseRenderingUnionActivePixelMask =
-      Resources::createImageResource(ctx, "Sparse Rendering Union Active Pixel Mask", maskExtent, VK_FORMAT_R8_UINT);
+    rtOutput.m_sparseRenderingActivePixelMask =
+      Resources::createImageResource(ctx, "Sparse Rendering Active Pixel Mask", maskExtent, VK_FORMAT_R8_UINT);
+
+    createActivePixelList(downscaledExtent);
+  }
+
+  void SparseRendering::createActivePixelList(const VkExtent3D& downscaledExtent) {
+    // The list holds one entry per pixel, so it never drops an active pixel.
+    m_activePixelListCapacity = downscaledExtent.width * downscaledExtent.height;
+
+    // A full list launches this many consumer groups along x, which the device has to allow.
+    const VkPhysicalDeviceLimits& limits = device()->properties().core.properties.limits;
+    const uint64_t maxGroups =
+      (uint64_t(m_activePixelListCapacity) + COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE - 1) / COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE;
+    m_activePixelListLaunchesFit = maxGroups <= limits.maxComputeWorkGroupCount[0];
+    if (!m_activePixelListLaunchesFit) {
+      ONCE(Logger::warn(str::format("[RTX Sparse Rendering] The active-pixel list needs up to ", maxGroups,
+                                    " compute workgroups but the device allows ", limits.maxComputeWorkGroupCount[0],
+                                    ". The direct lighting passes keep their full-screen launches.")));
+    }
+
+    DxvkBufferCreateInfo listInfo = {};
+    listInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    listInfo.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    listInfo.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT |
+                      VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    listInfo.size = (VkDeviceSize(COMPACT_ACTIVE_PIXELS_LIST_HEADER_SIZE) + m_activePixelListCapacity) * sizeof(uint32_t);
+    m_activePixelList = device()->createBuffer(listInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                               DxvkMemoryStats::Category::RTXBuffer, "Sparse Rendering Active Pixel List");
+
+    if (m_activePixelCountReadback == nullptr) {
+      DxvkBufferCreateInfo readbackInfo = {};
+      readbackInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      readbackInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+      readbackInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+      readbackInfo.size = kActivePixelCountReadbackSlots * sizeof(uint32_t);
+      m_activePixelCountReadback = device()->createBuffer(readbackInfo,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        DxvkMemoryStats::Category::RTXBuffer, "Sparse Rendering Active Pixel Count Readback");
+      std::memset(m_activePixelCountReadback->mapPtr(0), 0, readbackInfo.size);
+    }
   }
 
   void SparseRendering::releaseDownscaledResource() {
     Resources::RaytracingOutput& rtOutput = device()->getCommon()->getResources().getRaytracingOutput();
-    rtOutput.m_sparseRenderingDirectActiveLocalPixelCoords.reset();
-    rtOutput.m_sparseRenderingIndirectActiveLocalPixelCoords.reset();
-    rtOutput.m_sparseRenderingUnionActiveLocalPixelCoords.reset();
-    rtOutput.m_sparseRenderingDirectPixelSamplingRate.reset();
-    rtOutput.m_sparseRenderingIndirectPixelSamplingRate.reset();
-    rtOutput.m_sparseRenderingDirectActivePixelMask.reset();
-    rtOutput.m_sparseRenderingIndirectActivePixelMask.reset();
-    rtOutput.m_sparseRenderingUnionActivePixelMask.reset();
+    rtOutput.m_sparseRenderingActiveLocalPixelCoords.reset();
+    rtOutput.m_sparseRenderingPixelSamplingRate.reset();
+    rtOutput.m_sparseRenderingActivePixelMask.reset();
     m_activePixelMaskExtent = { 0u, 0u, 0u };
+    m_activePixelList = nullptr;
+    m_activePixelListCapacity = 0u;
+    m_activePixelListLaunchesFit = false;
+    m_activePixelCount = 0u;
+  }
+
+  bool SparseRendering::buildsActivePixelList() const {
+    return isActive() && Options::compactActivePixels() && m_activePixelList != nullptr && m_activePixelListLaunchesFit;
+  }
+
+  DxvkBufferSlice SparseRendering::getActivePixelListSlice() const {
+    return buildsActivePixelList() ? DxvkBufferSlice(m_activePixelList) : DxvkBufferSlice();
+  }
+
+  void SparseRendering::dispatchLaunch(RtxContext& ctx, const SparseRenderingArgs& args, const uint32_t launchBit, const VkExtent3D& workgroups) const {
+    // A set bit always has the list behind it, because both come from the same frame state.
+    // The null check only guards against that breaking: the full-screen threads then find an empty list.
+    if ((args.compactedLaunchMask & launchBit) != 0 && m_activePixelList != nullptr) {
+      ctx.bindDrawBuffers(DxvkBufferSlice(m_activePixelList, 0, sizeof(VkDispatchIndirectCommand)), DxvkBufferSlice());
+      ctx.dispatchIndirect(0);
+      ctx.bindDrawBuffers(DxvkBufferSlice(), DxvkBufferSlice());
+      return;
+    }
+
+    ctx.dispatch(workgroups.width, workgroups.height, workgroups.depth);
   }
 
   bool SparseRendering::isEnabledByOptions() {
@@ -215,13 +311,24 @@ namespace dxvk {
       return false;
     }
     // See SparseRendering::isEnabled() for explanation on why these checks are necessary.
-    if (!RtxOptions::enableRayReconstruction()) {
+    if (!RtxOptions::isRayReconstructionEnabled()) {
       return false;
     }
-    if (RtxOptions::integrateIndirectMode() != IntegrateIndirectMode::NeuralRadianceCache) {
+    if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
       return false;
     }
     return true;
+  }
+
+  bool SparseRendering::resamplesNrcTrainingPaths(const bool nrcIsActive) const {
+    // Deliberately not gated on NrcOptions::trainCache(): update rows are dispatched regardless of it, and they
+    // rely on this staying true to resolve their GBuffer pixel through the query-pixel map.
+    return nrcIsActive && isActive();
+  }
+
+  // Resampling needs the per-pixel sampling rate, which only exists after the GBuffer pass has run.
+  bool SparseRendering::shouldDeferNrcTrainingSetup(const SparseRenderingArgs& args) {
+    return args.resampledNrcTrainingPaths;
   }
 
   void SparseRendering::prewarmShaders(DxvkPipelineManager& pipelineManager) const {
@@ -232,6 +339,7 @@ namespace dxvk {
     ActivePixelSamplingRateShader::getShader();
     ActivePixelMaskShader::getShader();
     CompactActivePixelsShader::getShader();
+    CompactActivePixelsArgsShader::getShader();
   }
 
   void SparseRendering::dispatch(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput) {
@@ -246,6 +354,37 @@ namespace dxvk {
     dispatchActivePixelSamplingRate(ctx, rtOutput);
     dispatchActivePixelMask(ctx, rtOutput);
     dispatchCompactActivePixels(ctx, rtOutput);
+
+    if (rtOutput.m_raytraceArgs.sparseRenderingArgs.compactActivePixels) {
+      dispatchActivePixelListArgs(ctx);
+      readBackActivePixelCount(ctx);
+    }
+  }
+
+  void SparseRendering::dispatchActivePixelListArgs(RtxContext& ctx) {
+    ScopedGpuProfileZone(&ctx, "Active Pixel List Args");
+
+    ctx.bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CompactActivePixelsArgsShader::getShader());
+    ctx.bindResourceBuffer(COMPACT_ACTIVE_PIXELS_BINDING_ACTIVE_PIXEL_LIST_INPUT_OUTPUT, DxvkBufferSlice(m_activePixelList));
+    ctx.dispatch(1, 1, 1);
+  }
+
+  void SparseRendering::readBackActivePixelCount(RtxContext& ctx) {
+    if (m_activePixelCountReadback == nullptr) {
+      return;
+    }
+
+    // Each frame writes its own slot and reads the slot written kActivePixelCountReadbackSlots - 1 frames earlier.
+    // The GPU has finished that copy, because fewer frames than that are in flight.
+    const uint32_t frameId = device()->getCurrentFrameId();
+    const uint32_t writeSlot = frameId % kActivePixelCountReadbackSlots;
+    const uint32_t readSlot = (frameId + 1u) % kActivePixelCountReadbackSlots;
+
+    m_activePixelCount = *reinterpret_cast<const uint32_t*>(m_activePixelCountReadback->mapPtr(readSlot * sizeof(uint32_t)));
+    m_activePixelCountPixels = m_activePixelListCapacity;
+
+    ctx.copyBuffer(m_activePixelCountReadback, writeSlot * sizeof(uint32_t),
+                   m_activePixelList, COMPACT_ACTIVE_PIXELS_LIST_COUNT_SLOT * sizeof(uint32_t), sizeof(uint32_t));
   }
 
   void SparseRendering::dispatchActivePixelSamplingRate(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput) {
@@ -255,10 +394,20 @@ namespace dxvk {
 
     // Inputs
     ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
+    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_PRIMARY_CONE_RADIUS_INPUT, rtOutput.m_primaryConeRadius.view, nullptr);
+    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_SECONDARY_CONE_RADIUS_INPUT, rtOutput.m_secondaryConeRadius.view(Resources::AccessType::Read), nullptr);
+
+    // Input-Outputs
+    // NRC training query-pixel reservoir, accumulated over active pixels. Only allocated while training-path
+    // resampling is on, which is also the only case the shader touches it.
+    Rc<DxvkImageView> trainingQueryReservoirView = nullptr;
+    if (rtOutput.m_raytraceArgs.sparseRenderingArgs.resampledNrcTrainingPaths) {
+      trainingQueryReservoirView = ctx.getCommonObjects()->metaNeuralRadianceCache().getTrainingQueryReservoir().view;
+    }
+    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_NRC_TRAINING_QUERY_RESERVOIR_INPUT_OUTPUT, trainingQueryReservoirView, nullptr);
 
     // Outputs
-    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_DIRECT_PIXEL_SAMPLING_RATE_OUTPUT, rtOutput.m_sparseRenderingDirectPixelSamplingRate.view, nullptr);
-    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_INDIRECT_PIXEL_SAMPLING_RATE_OUTPUT, rtOutput.m_sparseRenderingIndirectPixelSamplingRate.view, nullptr);
+    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_PIXEL_SAMPLING_RATE_OUTPUT, rtOutput.m_sparseRenderingPixelSamplingRate.view, nullptr);
 
     const VkExtent3D& extent = rtOutput.m_compositeOutputExtent;
     const VkExtent3D groupSize = { ACTIVE_PIXEL_MASK_THREADGROUP_SIZE_WIDTH, ACTIVE_PIXEL_MASK_THREADGROUP_SIZE_HEIGHT, 1u };
@@ -269,17 +418,14 @@ namespace dxvk {
   void SparseRendering::dispatchActivePixelMask(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput) {
     ScopedGpuProfileZone(&ctx, "Active Pixel Mask");
 
-    // Build per-tile bit masks (direct, indirect, union) recording active pixels for each signal.
+    // Build per-tile bit masks recording the active pixels.
     ctx.bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ActivePixelMaskShader::getShader());
 
     // Inputs
-    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_DIRECT_PIXEL_SAMPLING_RATE_INPUT, rtOutput.m_sparseRenderingDirectPixelSamplingRate.view, nullptr);
-    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_INDIRECT_PIXEL_SAMPLING_RATE_INPUT, rtOutput.m_sparseRenderingIndirectPixelSamplingRate.view, nullptr);
+    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_PIXEL_SAMPLING_RATE_INPUT, rtOutput.m_sparseRenderingPixelSamplingRate.view, nullptr);
 
     // Outputs
-    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_DIRECT_ACTIVE_PIXEL_MASK_OUTPUT, rtOutput.m_sparseRenderingDirectActivePixelMask.view, nullptr);
-    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_INDIRECT_ACTIVE_PIXEL_MASK_OUTPUT, rtOutput.m_sparseRenderingIndirectActivePixelMask.view, nullptr);
-    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_UNION_ACTIVE_PIXEL_MASK_OUTPUT, rtOutput.m_sparseRenderingUnionActivePixelMask.view, nullptr);
+    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_ACTIVE_PIXEL_MASK_OUTPUT, rtOutput.m_sparseRenderingActivePixelMask.view, nullptr);
 
     const VkExtent3D& maskExtent = m_activePixelMaskExtent;
     const VkExtent3D maskGroupSize = { ACTIVE_PIXEL_MASK_THREADGROUP_SIZE_WIDTH, ACTIVE_PIXEL_MASK_THREADGROUP_SIZE_HEIGHT, 1u };
@@ -293,16 +439,20 @@ namespace dxvk {
     ctx.bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CompactActivePixelsShader::getShader());
 
     // Inputs
-    ctx.bindResourceView(COMPACT_ACTIVE_PIXELS_BINDING_DIRECT_ACTIVE_PIXEL_MASK_INPUT, rtOutput.m_sparseRenderingDirectActivePixelMask.view, nullptr);
-    ctx.bindResourceView(COMPACT_ACTIVE_PIXELS_BINDING_INDIRECT_ACTIVE_PIXEL_MASK_INPUT, rtOutput.m_sparseRenderingIndirectActivePixelMask.view, nullptr);
+    ctx.bindResourceView(COMPACT_ACTIVE_PIXELS_BINDING_ACTIVE_PIXEL_MASK_INPUT, rtOutput.m_sparseRenderingActivePixelMask.view, nullptr);
+
+    // Inputs/Outputs
+    // The header is cleared first, so the tiles' appends start from a count of zero.
+    if (rtOutput.m_raytraceArgs.sparseRenderingArgs.compactActivePixels) {
+      ctx.clearBuffer(m_activePixelList, 0, COMPACT_ACTIVE_PIXELS_LIST_HEADER_SIZE * sizeof(uint32_t), 0u);
+      ctx.bindResourceBuffer(COMPACT_ACTIVE_PIXELS_BINDING_ACTIVE_PIXEL_LIST_INPUT_OUTPUT, DxvkBufferSlice(m_activePixelList));
+    } else {
+      ctx.bindResourceBuffer(COMPACT_ACTIVE_PIXELS_BINDING_ACTIVE_PIXEL_LIST_INPUT_OUTPUT, DxvkBufferSlice());
+    }
 
     // Outputs
-    ctx.bindResourceView(COMPACT_ACTIVE_PIXELS_BINDING_DIRECT_ACTIVE_LOCAL_PIXEL_COORDS_OUTPUT,
-                         rtOutput.m_sparseRenderingDirectActiveLocalPixelCoords.view, nullptr);
-    ctx.bindResourceView(COMPACT_ACTIVE_PIXELS_BINDING_INDIRECT_ACTIVE_LOCAL_PIXEL_COORDS_OUTPUT,
-                         rtOutput.m_sparseRenderingIndirectActiveLocalPixelCoords.view, nullptr);
-    ctx.bindResourceView(COMPACT_ACTIVE_PIXELS_BINDING_UNION_ACTIVE_LOCAL_PIXEL_COORDS_OUTPUT,
-                         rtOutput.m_sparseRenderingUnionActiveLocalPixelCoords.view, nullptr);
+    ctx.bindResourceView(COMPACT_ACTIVE_PIXELS_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_OUTPUT,
+                         rtOutput.m_sparseRenderingActiveLocalPixelCoords.view, nullptr);
 
     const VkExtent3D extent = rtOutput.m_compositeOutputExtent;
     const VkExtent3D tileSize = { COMPACT_ACTIVE_PIXELS_TILE_SIZE_X, COMPACT_ACTIVE_PIXELS_TILE_SIZE_Y, 1 };
@@ -321,14 +471,32 @@ namespace dxvk {
     args.enableSparseVolumetricsPrimaryHit = Options::enableSparseVolumetricsPrimaryHit();
     args.enableSparseVolumetricsPrimaryMiss = Options::enableSparseVolumetricsPrimaryMiss();
     args.enableSparsePrimarySpecularAlbedo = Options::enableSparsePrimarySpecularAlbedo();
+    args.enableLightIdentityResolution = ctx.getSceneManager().getLightManager().isLightIdentityTableBuilt() ? 1u : 0u;
 
     NeuralRadianceCache& nrc = ctx.getCommonObjects()->metaNeuralRadianceCache();
-    args.forceNrcTrainingPixelsActive = nrc.isActive() && Options::forceNrcTrainingPixelsActive();
+    args.resampledNrcTrainingPaths = resamplesNrcTrainingPaths(nrc.isActive());
 
-    args.directPixelSamplingRate = Options::directLightingSamplingRate();
-    args.indirectPixelSamplingRate = Options::indirectLightingSamplingRate();
+    args.pixelSamplingRate = Options::samplingRate();
 
     args.activePixelMaskExtent = { m_activePixelMaskExtent.width, m_activePixelMaskExtent.height };
+
+    // The list fields stay zero while the list is not built, so every pass keeps its full-screen launch.
+    args.compactActivePixels = buildsActivePixelList();
+    args.compactedLaunchMask = 0u;
+    args.activePixelListCapacity = 0u;
+    if (args.compactActivePixels) {
+      args.activePixelListCapacity = m_activePixelListCapacity;
+
+      // Only the compute kernels can be launched over the list.
+      if (RtxOptions::renderPassIntegrateDirectRaytraceMode() == DxvkPathtracerIntegrateDirect::RaytraceMode::RayQuery) {
+        args.compactedLaunchMask |= COMPACT_ACTIVE_PIXELS_LAUNCH_INTEGRATE_DIRECT;
+      }
+      args.compactedLaunchMask |= COMPACT_ACTIVE_PIXELS_LAUNCH_INTEGRATE_NEE;
+      args.compactedLaunchMask |= COMPACT_ACTIVE_PIXELS_LAUNCH_RTXDI_INITIAL;
+      if (!args.enableRtxdiReuseForInactivePixels) {
+        args.compactedLaunchMask |= COMPACT_ACTIVE_PIXELS_LAUNCH_RTXDI_REUSE;
+      }
+    }
   }
 
   void SparseRendering::showImguiSettings() {
@@ -342,8 +510,15 @@ namespace dxvk {
 
     RemixGui::Checkbox("Enable Sparse Rendering", &Options::enableSparseRenderingObject());
 
-    RemixGui::DragFloat("Direct Lighting Sampling Rate", &Options::directLightingSamplingRateObject(), 0.01f, 1.0f / 128.0f, 1.0f, "%.3f", sliderFlags);
-    RemixGui::DragFloat("Indirect Lighting Sampling Rate", &Options::indirectLightingSamplingRateObject(), 0.01f, 1.0f / 128.0f, 1.0f, "%.3f", sliderFlags);
+    RemixGui::DragFloat("Sampling Rate", &Options::samplingRateObject(), 0.01f, 1.0f / 128.0f, 1.0f, "%.3f", sliderFlags);
+
+    RemixGui::Checkbox("Compact Active Pixels", &Options::compactActivePixelsObject());
+    if (buildsActivePixelList() && m_activePixelCountPixels > 0u) {
+      ImGui::Text("Active pixels: %u of %u (%.1f%%)", m_activePixelCount, m_activePixelCountPixels,
+                  100.0 * double(m_activePixelCount) / double(m_activePixelCountPixels));
+    } else {
+      ImGui::TextDisabled("Active pixels: not compacted");
+    }
 
     if (RemixGui::CollapsingHeader("Experimental", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
@@ -354,7 +529,6 @@ namespace dxvk {
       ImGui::BeginDisabled(true);
       RemixGui::Checkbox("Sparse Secondary Surface Lighting", &Options::enableSparseSecondaryLightingObject());
       ImGui::EndDisabled();
-      RemixGui::Checkbox("Force NRC Training Pixels Active", &Options::forceNrcTrainingPixelsActiveObject());
       RemixGui::Checkbox("Sparse Volumetrics (Primary Hit)", &Options::enableSparseVolumetricsPrimaryHitObject());
       RemixGui::Checkbox("Sparse Volumetrics (Primary Miss)", &Options::enableSparseVolumetricsPrimaryMissObject());
       RemixGui::Checkbox("Sparse Primary Specular Albedo", &Options::enableSparsePrimarySpecularAlbedoObject());

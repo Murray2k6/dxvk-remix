@@ -131,7 +131,7 @@ RayPortalSurfaceMaterialInteraction rayPortalSurfaceMaterialInteractionCreate(
   if (maskLoaded)
   {
     mask = maskSample;
-    mask.rgb *= uint16BitsToF32(cb.emissiveIntensity) * rayPortalSurfaceMaterial.emissiveIntensity;
+    mask.rgb *= uint16BitsToF32(cb.emissiveIntensity) * rayPortalSurfaceMaterial.emissiveIntensity * cb.preExposure;
   }
 
   // Note: Mask sample color (not alpha) is gamma corrected implicitly by the spritesheet read helper, no need

@@ -1927,7 +1927,7 @@ namespace dxvk {
     enabled.core.features.shaderStorageImageWriteWithoutFormat    = VK_TRUE;
     enabled.core.features.depthBounds                             = supported.core.features.depthBounds;
 
-    enabled.shaderDrawParameters.shaderDrawParameters             = VK_TRUE;
+    enabled.vulkan11Features.shaderDrawParameters                 = VK_TRUE;
 
     enabled.extMemoryPriority.memoryPriority                      = supported.extMemoryPriority.memoryPriority;
 
@@ -1956,7 +1956,7 @@ namespace dxvk {
       enabled.core.features.shaderCullDistance                    = VK_TRUE;
       enabled.core.features.textureCompressionBC                  = VK_TRUE;
       enabled.extDepthClipEnable.depthClipEnable                  = supported.extDepthClipEnable.depthClipEnable;
-      enabled.extHostQueryReset.hostQueryReset                    = supported.extHostQueryReset.hostQueryReset;
+      enabled.vulkan12Features.hostQueryReset                     = supported.vulkan12Features.hostQueryReset;
     }
     
     if (featureLevel >= D3D_FEATURE_LEVEL_9_2) {
@@ -3425,7 +3425,11 @@ namespace dxvk {
 
   Rc<DxvkDevice> D3D11DXGIDevice::CreateDevice(D3D_FEATURE_LEVEL FeatureLevel) {
     DxvkDeviceFeatures deviceFeatures = D3D11Device::GetDeviceFeatures(m_dxvkAdapter, FeatureLevel);
-    return m_dxvkAdapter->createDevice(m_dxvkInstance, deviceFeatures);
+    // NV-DXVK start: D3D11 hosts the shared Remix device
+    auto device = m_dxvkAdapter->createDevice(m_dxvkInstance, deviceFeatures, true);
+    Logger::info(str::format("D3D11: shared VkDevice ", device->handle()));
+    return device;
+    // NV-DXVK end
   }
 
 }

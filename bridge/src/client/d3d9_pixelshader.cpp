@@ -59,8 +59,7 @@ void Direct3DPixelShader9_LSS::onDestroy() {
 
 HRESULT Direct3DPixelShader9_LSS::GetDevice(IDirect3DDevice9** ppDevice) {
   LogFunctionCall();
-  m_pDevice->AddRef();
-  (*ppDevice) = m_pDevice;
+  m_pDevice->reportDevice(ppDevice);
   return S_OK;
 }
 

@@ -2,6 +2,8 @@
 #include "d3d11_gdi.h"
 #include "d3d11_texture.h"
 
+#include "../dxvk/rtx_render/rtx_vram_budget.h"
+
 namespace dxvk {
   
   D3D11CommonTexture::D3D11CommonTexture(
@@ -210,14 +212,35 @@ namespace dxvk {
     }
     
     if (vkImage == VK_NULL_HANDLE)
-      m_image = m_device->GetDXVKDevice()->createImage(imageInfo, memoryProperties);
+      m_image = m_device->GetDXVKDevice()->createImage(imageInfo, memoryProperties,
+          DxvkMemoryStats::Category::AppTexture, "d3d11 texture");
     else
       m_image = m_device->GetDXVKDevice()->createImageFromVkImage(imageInfo, vkImage);
+
+    if (m_image != nullptr) {
+      DxvkAppImageStats& stats = DxvkAppImageStats::get();
+      stats.textures += 1;
+      stats.textureBytes += int64_t(m_image->memSize());
+      stats.created += 1;
+    }
   }
   
   
   D3D11CommonTexture::~D3D11CommonTexture() {
-    
+    if (m_image != nullptr) {
+      DxvkAppImageStats& stats = DxvkAppImageStats::get();
+      stats.textures -= 1;
+      stats.textureBytes -= int64_t(m_image->memSize());
+      stats.destroyed += 1;
+
+      // incRef returns the count including this probe, so more than 2 means another holder.
+      const uint32_t refs = m_image->incRef();
+      m_image->decRef();
+      if (m_remixImported.load(std::memory_order_acquire) && refs > 2) {
+        m_image->markHeldAfterAppRelease();
+        vram_budget::noteImportReleased(m_image.ptr());
+      }
+    }
   }
   
   
@@ -597,7 +620,8 @@ namespace dxvk {
       memType |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     
     MappedBuffer result;
-    result.buffer = m_device->GetDXVKDevice()->createBuffer(info, memType);
+    result.buffer = m_device->GetDXVKDevice()->createBuffer(info, memType, DxvkMemoryStats::Category::AppBuffer,
+      "d3d11 mapped texture buffer");
     result.slice = result.buffer->getSliceHandle();
     return result;
   }
@@ -838,6 +862,76 @@ namespace dxvk {
   D3D11VkInteropSurface::~D3D11VkInteropSurface() {
     
   }
+
+  // NV-DXVK start: Hand a sampled-only image to Remix without copying it
+  HRESULT STDMETHODCALLTYPE D3D11VkInteropSurface::PrepareRemixView(
+      VkDevice expectedDevice, DXGI_FORMAT format, void* hostContext, Rc<DxvkImageView>* view,
+      BOOL* pDeferInitFlush) {
+    if (!view) {
+      return E_POINTER;
+    }
+    *view = nullptr;
+    const bool mayDeferInitFlush = pDeferInitFlush != nullptr && *pDeferInitFlush;
+    if (pDeferInitFlush) {
+      *pDeferInitFlush = FALSE;
+    }
+    const auto& desc = *m_texture->Desc();
+    const auto image = m_texture->GetImage();
+    // DEFAULT images may be rewritten later (texture streaming). Remix
+    // samples the same image, so an update simply shows up; Import widens
+    // the image's barrier stages so those writes order against ray tracing.
+    if (image == nullptr
+        || (desc.Usage != D3D11_USAGE_IMMUTABLE && desc.Usage != D3D11_USAGE_DEFAULT)
+        || desc.ArraySize != 1
+        || desc.SampleDesc.Count != 1 || desc.CPUAccessFlags != 0
+        || desc.BindFlags != D3D11_BIND_SHADER_RESOURCE
+        || desc.MiscFlags != 0 || m_texture->GetDimension() != D3D11_RESOURCE_DIMENSION_TEXTURE2D
+        || image->info().layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        || !m_texture->CheckViewCompatibility(D3D11_BIND_SHADER_RESOURCE, format, 0)) {
+      return E_INVALIDARG;
+    }
+    Com<ID3D11Device> device;
+    m_resource->GetDevice(&device);
+    auto parent = static_cast<D3D11Device*>(device.ptr());
+    auto dxvkDevice = parent->GetDXVKDevice();
+    if (dxvkDevice->handle() != expectedDevice) {
+      return E_INVALIDARG;
+    }
+    DxvkImageViewCreateInfo info = {};
+    info.type = VK_IMAGE_VIEW_TYPE_2D;
+    info.format = parent->LookupFormat(format, DXGI_VK_FORMAT_MODE_COLOR).Format;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    info.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    info.numLevels = desc.MipLevels;
+    info.numLayers = 1;
+    auto result = dxvkDevice->createImageView(image, info);
+    Com<ID3D11DeviceContext> immediate;
+    parent->GetImmediateContext(&immediate);
+    if (hostContext != nullptr && immediate.ptr() == hostContext) {
+      // Remix records into this context's own command stream, after every
+      // command the game has issued so far. Only the initial upload runs on a
+      // separate context; submit it now so it is queued ahead of Remix, unless
+      // the caller submits it from the command stream before it samples the
+      // view (rtx.hostImport.deferPrepareFlush), which keeps the submit off
+      // the game thread.
+      if (mayDeferInitFlush) {
+        *pDeferInitFlush = TRUE;
+      } else {
+        parent->FlushInitContext();
+      }
+    } else {
+      // A separate Remix context: submit the uploads and drain this CS
+      // thread into the shared queue. Import records the consumer barrier.
+      Com<IDXGIVkInteropDevice> interop;
+      if (FAILED(GetDevice(&interop))) {
+        return E_FAIL;
+      }
+      interop->FlushRenderingCommands();
+    }
+    *view = std::move(result);
+    return S_OK;
+  }
+  // NV-DXVK end
   
   
   ULONG STDMETHODCALLTYPE D3D11VkInteropSurface::AddRef() {
@@ -1081,6 +1175,12 @@ namespace dxvk {
       return S_OK;
     }
     
+    // NV-DXVK start: Expose only through a checked private COM interface
+    if (riid == __uuidof(IDXGIRemixTexture)) {
+      *ppvObject = ref(static_cast<IDXGIRemixTexture*>(&m_interop));
+      return S_OK;
+    }
+    // NV-DXVK end
     Logger::warn("D3D11Texture2D::QueryInterface: Unknown interface query");
     Logger::warn(str::format(riid));
     return E_NOINTERFACE;

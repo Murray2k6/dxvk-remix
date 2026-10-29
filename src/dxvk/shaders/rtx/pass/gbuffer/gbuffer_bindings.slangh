@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -24,6 +24,8 @@
 #include "rtx/pass/gbuffer/gbuffer_binding_indices.h"
 
 #include "rtx/utility/shader_types.slangh"
+
+#include "rtxdi/RtxdiParameters.h"
 
 // Inputs
 
@@ -57,6 +59,11 @@ RWTexture2D<float2> SharedRadianceRG;
 layout(r16f, binding = GBUFFER_BINDING_SHARED_RADIANCE_B_OUTPUT)
 RWTexture2D<float> SharedRadianceB;
 
+// RGB excludes the sky, and W is the nearest contributing transparent depth in kilometres.
+// On PSR pixels W is instead the PSR surface's own depth (geometryResolverStorePsrAerialSurfaceDistance).
+layout(rgba16f, binding = GBUFFER_BINDING_ATMOSPHERE_FOREGROUND_OUTPUT)
+RWTexture2D<float4> AtmosphereForeground;
+
 layout(r16f, binding = GBUFFER_BINDING_SHARED_INTEGRATION_SURFACE_PDF_OUTPUT)
 RWTexture2D<float> SharedIntegrationSurfacePdf;
 
@@ -83,10 +90,10 @@ RWTexture2D<float> PrimaryPerceptualRoughness;
 layout(r32f, binding = GBUFFER_BINDING_PRIMARY_LINEAR_VIEW_Z_OUTPUT)
 RWTexture2D<float> PrimaryLinearViewZ;
 
-layout(rgb10_a2, binding = GBUFFER_BINDING_PRIMARY_ALBEDO_OUTPUT)
+layout(rgba16f, binding = GBUFFER_BINDING_PRIMARY_ALBEDO_OUTPUT)
 RWTexture2D<float4> PrimaryAlbedo;
 
-layout(rgb10_a2, binding = GBUFFER_BINDING_PRIMARY_BASE_REFLECTIVITY_OUTPUT)
+layout(rgba16f, binding = GBUFFER_BINDING_PRIMARY_BASE_REFLECTIVITY_OUTPUT)
 RWTexture2D<float4> PrimaryBaseReflectivity;
 
 layout(rgba16f, binding = GBUFFER_BINDING_PRIMARY_VIRTUAL_MVEC_OUTPUT)
@@ -133,10 +140,10 @@ RWTexture2D<float> SecondaryPerceptualRoughness;
 layout(r32f, binding = GBUFFER_BINDING_SECONDARY_LINEAR_VIEW_Z_OUTPUT)
 RWTexture2D<float> SecondaryLinearViewZ;
 
-layout(rgb10_a2, binding = GBUFFER_BINDING_SECONDARY_ALBEDO_OUTPUT)
+layout(rgba16f, binding = GBUFFER_BINDING_SECONDARY_ALBEDO_OUTPUT)
 RWTexture2D<float4> SecondaryAlbedo;
 
-layout(rgb10_a2, binding = GBUFFER_BINDING_SECONDARY_BASE_REFLECTIVITY_OUTPUT)
+layout(rgba16f, binding = GBUFFER_BINDING_SECONDARY_BASE_REFLECTIVITY_OUTPUT)
 RWTexture2D<float4> SecondaryBaseReflectivity;
 
 layout(rgba16f, binding = GBUFFER_BINDING_SECONDARY_VIRTUAL_MVEC_OUTPUT)
@@ -181,11 +188,12 @@ RWTexture2D<float> SharedBiasCurrentColorMask;
 layout(rgba32ui, binding = GBUFFER_BINDING_ALPHA_BLEND_GBUFFER_OUTPUT)
 RWTexture2D<uint4> AlphaBlendGBuffer;
 
-layout(rgba16f, binding = GBUFFER_BINDING_PARTICLE_BUFFER_OUTPUT)
-RWTexture2D<float4> ParticleBuffer;
+[[vk::binding(GBUFFER_BINDING_DLSS_NR_CONTROL_MASK_OUTPUT)]]
+RWTexture2D<float4> DlssNrControlMask;
 
-layout(rg32f, binding = GBUFFER_BINDING_SHARED_TEXTURE_COORD_OUTPUT)
-RWTexture2D<float2> SharedTextureCoord;
+// Texture coordinates in xy, the SCCR depth scale and triangle normal in zw (sccrSharedTextureCoord).
+layout(rgba32f, binding = GBUFFER_BINDING_SHARED_TEXTURE_COORD_OUTPUT)
+RWTexture2D<float4> SharedTextureCoord;
 
 layout(r32ui, binding = GBUFFER_BINDING_SHARED_SURFACE_INDEX_OUTPUT)
 RWTexture2D<uint> SharedSurfaceIndex;
@@ -223,17 +231,8 @@ RWTexture2D<uint2> ReflectionPSRData1;     // Output/Input
 layout(rg32ui, binding = GBUFFER_BINDING_REFLECTION_PSR_DATA_STORAGE_2)
 RWTexture2D<uint2> ReflectionPSRData2;
 
-layout(rg32ui, binding = GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_0)
-RWTexture2D<uint2> TransmissionPSRData0;
-
-layout(rg32ui, binding = GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_1)
-RWTexture2D<uint2> TransmissionPSRData1;
-
-layout(rg32ui, binding = GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_2)
-RWTexture2D<uint2> TransmissionPSRData2;
-
-layout(rg32ui, binding = GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_3)
-RWTexture2D<uint2> TransmissionPSRData3;
+layout(binding = GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE)
+RWStructuredBuffer<RTXDI_PackedReservoir> TransmissionPSRData;
 
 layout(r32ui, binding = GBUFFER_BINDING_PRIMARY_OBJECT_PICKING_OUTPUT)
 RWTexture2D<uint> PrimaryObjectPicking;
@@ -267,4 +266,11 @@ RWTexture2D<float2> NrcTrainingGBufferSurfaceRadianceRG;
 
 layout(r16f, binding = GBUFFER_BINDING_NRC_TRAINING_GBUFFER_SURFACE_RADIANCE_B_OUTPUT)
 RWTexture2D<float> NrcTrainingGBufferSurfaceRadianceB;
+
+// rtx.gbuffer.compactPsr, see GBUFFER_COMPACT_PSR_* in gbuffer_binding_indices.h.
+layout(binding = GBUFFER_BINDING_COMPACT_PSR_LIST)
+RWStructuredBuffer<uint> CompactPsrList;
+
+layout(binding = GBUFFER_BINDING_COMPACT_PSR_ARGS)
+RWStructuredBuffer<uint> CompactPsrArgs;
 

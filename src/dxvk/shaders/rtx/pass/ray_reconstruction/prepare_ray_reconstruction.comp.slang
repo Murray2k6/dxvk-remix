@@ -43,7 +43,7 @@ Texture2D<float4> PrimaryVirtualWorldNormalPerceptualRoughness;
 layout(binding = RAY_RECONSTRUCTION_SECONDARY_ALBEDO_INPUT)
 Texture2D<float4> SecondaryAlbedo;
 
-layout(rgb10_a2, binding = RAY_RECONSTRUCTION_SECONDARY_SPECULAR_ALBEDO_INPUT)
+layout(binding = RAY_RECONSTRUCTION_SECONDARY_SPECULAR_ALBEDO_INPUT)
 Texture2D<float4> SecondarySpecularAlbedo;
 
 layout(binding = RAY_RECONSTRUCTION_SECONDARY_ATTENUATION_INPUT)
@@ -64,6 +64,10 @@ Texture2D<float> InDepth;
 layout(rg16f, binding = RAY_RECONSTRUCTION_MOTION_VECTOR_INPUT)
 Texture2D<float2> InMotionVector;
 
+// Color fed into DLSS-RR (composite output); used for the input-color debug view.
+layout(binding = RAY_RECONSTRUCTION_INPUT_COLOR_INPUT)
+Texture2D<float4> InputColor;
+
 layout(r16f, binding = RAY_RECONSTRUCTION_PRIMARY_CONE_RADIUS_INPUT)
 Texture2D<float> PrimaryConeRadius;
 
@@ -74,13 +78,13 @@ Texture2D<float> DisocclusionMask;
 layout(binding = RAY_RECONSTRUCTION_PRIMARY_ALBEDO_INPUT_OUTPUT)
 RWTexture2D<float4> PrimaryAlbedo;
 
-layout(rgb10_a2, binding = RAY_RECONSTRUCTION_PRIMARY_SPECULAR_ALBEDO_INPUT_OUTPUT)
+layout(rgba16f, binding = RAY_RECONSTRUCTION_PRIMARY_SPECULAR_ALBEDO_INPUT_OUTPUT)
 RWTexture2D<float4> PrimarySpecularAlbedo;
 
 layout(binding = RAY_RECONSTRUCTION_DEBUG_VIEW_OUTPUT)
 RWTexture2D<float4> DebugView;
 
-layout(r16f, binding = RAY_RECONSTRUCTION_PRIMARY_DISOCCLUSION_MASK_OUTPUT)
+layout(r32f, binding = RAY_RECONSTRUCTION_PRIMARY_DISOCCLUSION_MASK_OUTPUT)
 RWTexture2D<float> DisocclusionMaskOutput;
 
 float getRoughnessFactor(float roughness)
@@ -200,6 +204,9 @@ void writeDebugViewOutputs(uint2 pixelCoordinate)
   case DEBUG_VIEW_RAY_RECONSTRUCTION_PRIMARY_SCREEN_SPACE_MOTION_VECTOR:
     storeInDebugView(pixelCoordinate, InMotionVector[pixelCoordinate]);
     break;
+  case DEBUG_VIEW_RAY_RECONSTRUCTION_INPUT_COLOR:
+    storeInDebugView(pixelCoordinate, InputColor[pixelCoordinate].rgb);
+    break;
   case DEBUG_VIEW_NAN:
     bool isValid = true;
 
@@ -222,6 +229,9 @@ void writeDebugViewOutputs(uint2 pixelCoordinate)
 
     // DEBUG_VIEW_RAY_RECONSTRUCTION_PRIMARY_SCREEN_SPACE_MOTION_VECTOR
     isValid &= isValidValue(InMotionVector[pixelCoordinate]);
+
+    // DEBUG_VIEW_RAY_RECONSTRUCTION_INPUT_COLOR
+    isValid &= isValidValue(InputColor[pixelCoordinate]);
 
     accumulateInDebugViewAnd(pixelCoordinate, isValid);
   }
@@ -270,9 +280,10 @@ void preprocessInputsForRR(uint2 pixelCoordinate)
       primaryAlbedo = vec4(0.f, 0.f, 0.f, 1.f);
     }
 
-    PrimaryAlbedo[pixelCoordinate] = primaryAlbedo;
+    // The guides are fp16, so they are clamped to the [0, 1] range a UNORM target would store.
+    PrimaryAlbedo[pixelCoordinate] = saturate(primaryAlbedo);
 
-    PrimarySpecularAlbedo[pixelCoordinate] = primarySpecularAlbedo;
+    PrimarySpecularAlbedo[pixelCoordinate] = saturate(primarySpecularAlbedo);
   }
 
   blurDisocclusionMask(pixelCoordinate);

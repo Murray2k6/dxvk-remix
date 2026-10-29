@@ -42,8 +42,10 @@ struct OpaqueMaterialArgs {
   uint enableThinFilmOverride = 0;
   // Note: This thickness value is normalized on 0-1, predivided by the thinFilmMaxThickness on the CPU.
   float thinFilmNormalizedThicknessOverride = 0.0;
-  uint pad0 = 0;
-  uint pad1 = 0;
+  // NV-DXVK start: Legacy Fresnel controls reuse the existing constant-buffer padding.
+  float legacySpecularLevel = 1.f;
+  float legacyFresnelGrazing = 1.f;
+  // NV-DXVK end
 };
 
 struct TranslucentMaterialArgs {
@@ -55,7 +57,8 @@ struct TranslucentMaterialArgs {
   vec2 animatedWaterSecondaryNormalMotion = vec2(0.f, 0.f);
   float animatedWaterSecondaryNormalLodBias = 0.f;
   uint animatedWaterEnable = 0;
-  uint pad0 = 0;
+  // UV scale of the secondary animated-water sample relative to the primary one.
+  float animatedWaterSecondaryNormalScale = 1.f;
   uint pad1 = 0;
 };
 
@@ -135,8 +138,7 @@ struct TranslucentMaterialOptions {
   RTX_OPTION("rtx.translucentMaterial", float, transmittanceColorScale, 1.0f, "A scale factor to apply to all transmittance color values in the translucent material. Should only be used for debugging or development.");
   RTX_OPTION("rtx.translucentMaterial", float, transmittanceColorBias, 0.0f, "A bias factor to add to all transmittance color values in the opaque material. Should only be used for debugging or development.");
   RTX_OPTION("rtx.translucentMaterial", float, normalIntensity, 1.0f, "An arbitrary strength scale factor to apply when decoding normals in the translucent material. Should only be used for debugging or development.");
-  RTX_OPTION_ARGS("rtx.translucentMaterial", float, refractiveIndexScale, 1.0f, "A scale factor to apply to the index of refraction for all translucent materials. The scale is clamped to [0.0, 3.0]. Should only be used for look development.",
-                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+  RTX_OPTION("rtx.translucentMaterial", float, refractiveIndexScale, 1.0f, "A scale factor to apply to the index of refraction for all translucent materials. The scale is clamped to [0.0, 3.0]. Should only be used for look development.");
 
   // Animated Water
   RTX_OPTION("rtx.translucentMaterial", Vector2, animatedWaterPrimaryNormalMotion, Vector2(0.05f, 0.05f),
@@ -148,6 +150,11 @@ struct TranslucentMaterialOptions {
   RTX_OPTION("rtx.translucentMaterial", float, animatedWaterSecondaryNormalLodBias, 1.0f,
              "LoD bias to use when taking the second normal map sample.\n"
              "Values greater than 0 will cause the secondary normal map to be blurred, resulting in lower frequency waves.");
+  RTX_OPTION("rtx.translucentMaterial", float, animatedWaterSecondaryNormalScale, 1.0f,
+             "The UV scale of the second normal map sample of animated water relative to the first. 1 uses the same "
+             "tiling for both. Below 1 the second sample is a broader wave layer, above 1 a finer one. Lets hosts whose "
+             "water has several normal layers at different scales match them. Only applies to materials without sprite "
+             "sheets.");
   RTX_OPTION("rtx.translucentMaterial", bool, animatedWaterEnable, true,
              "If enabled, draw calls in the AnimatedWater category and a translucent material will have their primary texcoordinates animated, and will also take a second sample from the normal map.\n"
              "Note that objects must be properly categorized as animated water to be rendered with this mode.");
@@ -163,6 +170,7 @@ public:
     args.animatedWaterPrimaryNormalMotion = animatedWaterPrimaryNormalMotion();
     args.animatedWaterSecondaryNormalMotion = animatedWaterSecondaryNormalMotion();
     args.animatedWaterSecondaryNormalLodBias = animatedWaterSecondaryNormalLodBias();
+    args.animatedWaterSecondaryNormalScale = std::clamp(animatedWaterSecondaryNormalScale(), 1.0f / 64.0f, 64.0f);
     args.animatedWaterEnable = animatedWaterEnable();
     args.enableDiffuseLayerOverride = enableDiffuseLayerOverride();
   }

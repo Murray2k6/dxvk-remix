@@ -35,10 +35,10 @@ Texture2D<float> PrimaryPerceptualRoughness;
 layout(r32f, binding = RTXDI_REUSE_BINDING_HIT_DISTANCE_INPUT)
 Texture2D<float> PrimaryHitDistance;
 
-layout(rgb10_a2, binding = RTXDI_REUSE_BINDING_ALBEDO_INPUT)
+layout(binding = RTXDI_REUSE_BINDING_ALBEDO_INPUT)
 Texture2D<float4> PrimaryAlbedo;
 
-layout(rgb10_a2, binding = RTXDI_REUSE_BINDING_BASE_REFLECTIVITY_INPUT)
+layout(binding = RTXDI_REUSE_BINDING_BASE_REFLECTIVITY_INPUT)
 Texture2D<float4> PrimaryBaseReflectivity;
 
 layout(rgba32f, binding = RTXDI_REUSE_BINDING_WORLD_POSITION_INPUT)
@@ -86,7 +86,10 @@ layout(rg32ui, binding = RTXDI_REUSE_BINDING_SUBSURFACE_DIFFUSION_PROFILE_DATA_I
 Texture2D<uint2> SharedSubsurfaceDiffusionProfileData;
 
 layout(r16ui, binding = RTXDI_REUSE_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
-Texture2D<uint16_t> DirectActiveLocalPixelCoords;
+Texture2D<uint16_t> ActiveLocalPixelCoords;
+
+layout(binding = RTXDI_REUSE_BINDING_ACTIVE_PIXEL_LIST_INPUT)
+StructuredBuffer<uint> ActivePixelList;
 
 // Inputs / Outputs
 

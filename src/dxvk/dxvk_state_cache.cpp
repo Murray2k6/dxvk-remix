@@ -22,6 +22,9 @@
 #include "dxvk_device.h"
 #include "dxvk_pipemanager.h"
 #include "dxvk_state_cache.h"
+#include "rtx_render/rtx_pipeline_stats.h"
+
+#include <chrono>
 
 namespace dxvk {
 
@@ -221,8 +224,13 @@ namespace dxvk {
     // Start the worker threads and the file writer
     m_workerBusy.store(numWorkers);
 
+    m_workerCount = numWorkers;
+    m_workerRemixStartMs.reset(new std::atomic<int64_t>[numWorkers]);
     for (uint32_t i = 0; i < numWorkers; i++) {
-      m_workerThreads.emplace_back([this] () { workerFunc(); });
+      m_workerRemixStartMs[i].store(0);
+    }
+    for (uint32_t i = 0; i < numWorkers; i++) {
+      m_workerThreads.emplace_back([this, i] () { workerFunc(i); });
       m_workerThreads[i].set_priority(ThreadPriority::Lowest);
     }
     
@@ -325,13 +333,14 @@ namespace dxvk {
         workerLock = std::unique_lock<dxvk::mutex>(m_workerLock);
 
       // NV-DXVK start: do not compile same shader multiple times
-      if (m_workerItemsInFlight.count(item.hash()) == 0) {
+      if (m_workerItemsInFlight.count(item.inFlightKey()) == 0) {
         if (item.isRemixShader) {
           ++m_workerCompilingRemixShaders;
+          ++m_remixItemsQueued;
         }
 
         m_workerQueue.push(item);
-        m_workerItemsInFlight.insert(item.hash());
+        m_workerItemsInFlight.insert(item.inFlightKey());
       }
       // NV-DXVK end
     };
@@ -385,12 +394,13 @@ namespace dxvk {
     std::unique_lock<dxvk::mutex> workerLock(m_workerLock);
 
     // Do not compile same shader multiple times
-    if (m_workerItemsInFlight.count(item.hash()) == 0) {
+    if (m_workerItemsInFlight.count(item.inFlightKey()) == 0) {
       assert(item.isRemixShader);
       ++m_workerCompilingRemixShaders;
+      ++m_remixItemsQueued;
 
       m_workerQueue.push(item);
-      m_workerItemsInFlight.insert(item.hash());
+      m_workerItemsInFlight.insert(item.inFlightKey());
 
       m_workerCond.notify_all();
     }
@@ -1040,8 +1050,29 @@ namespace dxvk {
   }
 
 
-  void DxvkStateCache::workerFunc() {
+  namespace {
+    int64_t steadyMilliseconds() {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+  }
+
+  uint32_t DxvkStateCache::remixShaderSlowCompileCount() const {
+    if (!m_workerRemixStartMs)
+      return 0;
+    const int64_t now = steadyMilliseconds();
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < m_workerCount; ++i) {
+      const int64_t start = m_workerRemixStartMs[i].load(std::memory_order_relaxed);
+      if (start != 0 && now - start >= kSlowCompileMs)
+        ++count;
+    }
+    return count;
+  }
+
+  void DxvkStateCache::workerFunc(uint32_t workerIndex) {
     env::setThreadName("dxvk-shader");
+    RtxPipelineStats::markBackgroundThread();
 
     while (!m_stopThreads.load()) {
       WorkerItem item;
@@ -1066,7 +1097,10 @@ namespace dxvk {
         m_workerQueue.pop();
       }
 
+      if (item.isRemixShader)
+        m_workerRemixStartMs[workerIndex].store(steadyMilliseconds(), std::memory_order_relaxed);
       compilePipelines(item);
+      m_workerRemixStartMs[workerIndex].store(0, std::memory_order_relaxed);
 
 // NV-DXVK start
       if (item.isRemixShader) {
@@ -1076,8 +1110,8 @@ namespace dxvk {
 
       // NV-DXVK start: do not compile same shader multiple times
       { std::unique_lock<dxvk::mutex> lock(m_workerLock);
-        assert(m_workerItemsInFlight.count(item.hash()) == 1);
-        m_workerItemsInFlight.erase(item.hash());
+        assert(m_workerItemsInFlight.count(item.inFlightKey()) == 1);
+        m_workerItemsInFlight.erase(item.inFlightKey());
       }
       // NV-DXVK end
     }

@@ -191,63 +191,16 @@ message('##############')
 message('# Versioning #')
 message('##############')
 
-full_version = meson.project_version()
-
-git_rev_parse_out = run_command('git',['rev-parse','--verify','--short=8', 'HEAD'])
-git_hash = ''
-if git_rev_parse_out.returncode() != 0
-  error('Failed to get current git hash')
-else
-  git_hash = git_rev_parse_out.stdout().replace('\n','')
-  message('Current git hash: ' + git_hash)
+# vcs_tag reruns this command at every build, so the version follows the commit being built.
+vcs_version_command = [python_interpreter.full_path(), global_src_root_norm + './scripts-common/vcs_version.py', meson.project_version(), global_src_root_norm]
+vcs_version_out = run_command(vcs_version_command, check: false)
+if vcs_version_out.returncode() != 0
+  error('vcs_version.py failed: ' + vcs_version_out.stderr().strip())
 endif
-
-found_tag = ''
-ci_commit_tag = ''
-get_env_out = run_command(python_interpreter.full_path(),[global_src_root_norm + './scripts-common/get_env.py', 'CI_COMMIT_TAG'])
-if get_env_out.returncode() != 0
-  warning('get_env.py failed, ' + get_env_out.stderr().strip())
-else
-  ci_commit_tag = get_env_out.stdout().replace('\n','')
-endif
-b_found_ci_commit_tag = (ci_commit_tag != '')
-
-if b_found_ci_commit_tag
-  message('Found tag in CI_COMMIT_TAG envvar: ' + ci_commit_tag)
-  found_tag = ci_commit_tag
-else
-  git_describe_tag = ''
-  git_describe_out = run_command('git',['describe','--always','--exact-match', git_hash])
-  if git_describe_out.returncode() == 0
-    git_describe_tag = git_describe_out.stdout().replace('\n','')
-    message('Found tag via git describe: ' + git_describe_tag)
-  endif
-  found_tag = git_describe_tag
-endif
-
-b_found_tag = found_tag != ''
-b_found_tag_matches = false
-if b_found_tag
-  b_found_tag_matches = found_tag == meson.project_version()
-endif
-
-if b_found_tag
-  if not b_found_tag_matches
-    warning('Tag does not match current version: ' + meson.project_version() + '. Please reconcile tag with version in meson.build.')
-  else
-    message('Found tag matches current version: ' + meson.project_version())
-    message('This is a release version.')
-  endif
-else
-  message('No tag found at current commit.')
-  message('This is NOT a release version')
-  full_version += '+' + git_hash
-endif
-
-message('Full version: ' + full_version)
+message('Full version at configure time: ' + vcs_version_out.stdout().strip())
 
 bridge_version = vcs_tag(
-  command: [python_interpreter.full_path(), global_src_root_norm + './scripts-common/echo.py', full_version],
+  command: vcs_version_command,
   input:  'version.h.in',
   output: 'version.h')
 
@@ -304,10 +257,13 @@ foreach key : copy_targets.keys()
                     output_path,
                     'NvRemixLauncher32*'])
     else
-        platform_output_path = output_path
-        if cpu_family != 'x86_64'
-          # place non-x64 servers into dedicated folders
-          platform_output_path = output_path + '_' + cpu_family
+        # Note: dir names must match bridge/src/util/util_filesys.h's runtimeDirName()!
+        if cpu_family == 'x86_64'
+          platform_output_path = output_path + '\\.trex'
+        elif cpu_family == 'aarch64'
+          platform_output_path = output_path + '\\.trex_arm64'
+        else
+          error('Unsupported target architecture for server deploy: ' + cpu_family)
         endif
         run_target('copy_' + target_suffix + '_server',
           depends: [ server_exe ],

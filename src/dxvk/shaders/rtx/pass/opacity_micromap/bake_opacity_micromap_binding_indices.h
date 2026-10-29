@@ -36,6 +36,15 @@
 
 #define BAKE_OPACITY_MICROMAP_NUM_THREAD_PER_COMPUTE_BLOCK        256
 
+// NV-DXVK start: [OmmBake] hard bounds. Every data-dependent loop in the bake shader
+// is capped by a compile-time constant as well as by its runtime bound, so garbage inputs (NaN/huge
+// texcoords, a zero or bogus texture extent, a stale constant) cost at most this many taps per
+// micro-triangle instead of an unbounded loop that stalls the queue without a TDR.
+#define BAKE_OPACITY_MICROMAP_MAX_TEXEL_TAPS_HARD_CAP             1024
+#define BAKE_OPACITY_MICROMAP_MAX_TEXTURE_DIMENSION               16384
+#define BAKE_OPACITY_MICROMAP_MAX_MICRO_TRIANGLES_PER_THREAD      8
+// NV-DXVK end
+
 struct BakeOpacityMicromapArgs {
 #ifdef __cplusplus
   uint8_t surface[dxvk::kSurfaceGPUSize];

@@ -686,6 +686,28 @@ namespace dxvk {
             VkImageLayout             OldLayout,
             VkImageLayout             NewLayout);
 
+    // NV-DXVK start: Native Remix API submission uses the immediate stream
+    // Emits a command whose type the caller does not know. push moves it into the chunk and returns false when the
+    // chunk is full.
+    template<typename Push>
+    void EmitRemixCsWith(Push&& push) {
+      auto lock = LockContext();
+      m_cmdData = nullptr;
+
+      if (unlikely(!push(m_csChunk))) {
+        EmitCsChunk(std::move(m_csChunk));
+
+        m_csChunk = AllocCsChunk();
+        push(m_csChunk);
+      }
+    }
+
+    void EnableRemixHost() { m_multithread.SetMultithreadProtected(TRUE); }
+    void RestoreRemixState() { RestoreState(); }
+    // Submits the device's pending initial resource uploads. Safe on the CS thread.
+    void FlushRemixInitUploads();
+    // NV-DXVK end
+
     D3D10DeviceLock LockContext() {
       return m_multithread.AcquireLock();
     }
@@ -775,6 +797,11 @@ namespace dxvk {
             D3D11Buffer*                      pSrcBuffer,
             VkDeviceSize                      SrcOffset,
             VkDeviceSize                      ByteCount);
+
+    // NV-DXVK start: see D3D11CommonTexture::MarkRemixShared
+    void NotifyRemixSharedWrite(
+            D3D11CommonTexture*               pDstTexture);
+    // NV-DXVK end
 
     void CopyImage(
             D3D11CommonTexture*               pDstTexture,

@@ -20,6 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include <version.h>
+#include "build_tag.h"
 
 #include "dxvk_instance.h"
 #include "dxvk_openvr.h"
@@ -28,12 +29,16 @@
 #include "rtx_render/rtx_system_info.h"
 #include "rtx_render/rtx_options.h"
 #include "rtx_render/rtx_mod_manager.h"
+#include "rtx_render/rtx_nsight_capture.h"
+#include "rtx_render/rtx_perf_log.h"
 
 // NV-DXVK start: Integrate Aftermath
 #include "GFSDK_Aftermath_GpuCrashDump.h"
 #include "GFSDK_Aftermath_GpuCrashDumpDecoding.h"
+#include "../util/util_aftermath.h"
 // NV-DXVK end
 
+#include <cctype>
 #include <cstring>
 #include <algorithm>
 #include <unordered_set>
@@ -52,6 +57,7 @@
 
 #include "../util/xxHash/xxhash.h"
 #include "../util/util_env.h"
+#include "../util/util_filesys.h"
 #include "../util/util_sentry.h"
 #include "../util/util_string.h"
 // NV-DXVK end
@@ -74,6 +80,27 @@
 // NV-DXVK end
 
 namespace dxvk {
+  // NV-DXVK start: Share the Vulkan instance across unified frontends
+  Rc<DxvkInstance> DxvkInstance::getSharedInstance() {
+    // Bootstrap before either frontend constructs RTX objects; D3D11 never
+    // enters CreateD3D9, and a later D3D9 call must not truncate this log.
+    static const bool initialized = [] {
+      if (!util::RtxFileSys::isInitialized()) {
+        const auto exeDir = std::filesystem::path(env::getExePath()).parent_path();
+        util::RtxFileSys::init(exeDir.string());
+      }
+      Logger::initRtxLog();
+      util::RtxFileSys::print();
+      const auto remixVersion = std::string("dxvk-remix@") + DXVK_VERSION;
+      sentry::initialize(remixVersion.c_str());
+      sentry::showCrashReportDialogIfNeeded();
+      return true;
+    }();
+    static Rc<DxvkInstance> instance = new DxvkInstance();
+    return instance;
+  }
+  // NV-DXVK end
+
   // NV-DXVK start: initialize new static variables
   std::atomic<bool> DxvkInstance::s_aftermathEnabled{ false };
   bool DxvkInstance::s_aftermathInitFailed = false;
@@ -132,11 +159,6 @@ namespace dxvk {
   bool filterErrorMessages(const char* message) {
     // validation errors that we are currently ignoring --- to fix!
     constexpr std::array ignoredErrors{
-      // renderpass vs. FB/PSO incompatibilities
-      "MessageID = 0x335edc9a",
-      "MessageID = 0x8cb637c2",
-      "MessageID = 0x50685725",
-
       // Depth comparison without the proper depth comparison bit set in image view
       // Expected behavior according to DXVK 2.1's own validation error bypassing logic
       "MessageID = 0x4b9d1597",
@@ -153,13 +175,8 @@ namespace dxvk {
       "vkCreateCuModuleNVX: value of pCreateInfo->pNext must be NULL. This error is based on the Valid Usage documentation for version [0-9]+ of the Vulkan header.  It is possible that you are using a struct from a private extension or an extension that was added to a later version of the Vulkan header, in which case the use of pCreateInfo->pNext is undefined and may not work correctly with validation enabled The Vulkan spec states: pNext must be NULL",
 
       // Vulkan 1.4.313.2 VL Errors
-      "vkCmdBeginRenderPass\\(\\): dependencyCount is incompatible between VkRenderPass 0x[0-9a-fA-F]+.* \\(from VkRenderPass 0x[0-9a-fA-F]+.*\\) and VkRenderPass 0x[0-9a-fA-F]+.* \\(from VkFramebuffer 0x[0-9a-fA-F]+.*\\), [0-9]+ != [0-9]+.",
-      "vkCmdDrawIndexed\\(\\): dependencyCount is incompatible between VkRenderPass 0x[0-9a-fA-F]+.* \\(from VkCommandBuffer 0x[0-9a-fA-F]+.*\\) and VkRenderPass 0x[0-9a-fA-F]+.* \\(from VkPipeline 0x[0-9a-fA-F]+.*\\), [0-9]+ != [0-9]+.",
-      "vkCmdDraw\\(\\): dependencyCount is incompatible between VkRenderPass 0x[0-9a-fA-F]+.* \\(from VkCommandBuffer 0x[0-9a-fA-F]+.*\\) and VkRenderPass 0x[0-9a-fA-F]+.* \\(from VkPipeline 0x[0-9a-fA-F]+.*\\), [0-9]+ != [0-9]+.",
-      "vkAcquireNextImageKHR\\(\\): Semaphore must not be currently signaled.",
       "vkQueueSubmit\\(\\): pSubmits\\[[0-9]+\\].pWaitSemaphores\\[[0-9]+\\] queue \\(VkQueue 0x[0-9a-fA-F]+.*\\) is waiting on semaphore \\(VkSemaphore 0x[0-9a-fA-F]+.*\\[*\\]\\) that has no way to be signaled.",
       "vkQueuePresentKHR\\(\\): pPresentInfo->pWaitSemaphores\\[[0-9]+\\] queue \\(VkQueue 0x[0-9a-fA-F]+.*\\) is waiting on semaphore \\(VkSemaphore 0x[0-9a-fA-F]+.*\\[Presenter: present semaphore\\]\\) that has no way to be signaled.",
-      "vkAcquireNextImageKHR\\(\\): Semaphore must not have any pending operations.",
       "vkQueueSubmit\\(\\): pSubmits\\[[0-9]+\\].pCommandBuffers\\[[0-9]+\\] command buffer VkCommandBuffer 0x[0-9a-fA-F]+.* expects VkImage 0x[0-9a-fA-F]+.* \\(subresource: aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, mipLevel = [0-9]+, arrayLayer = [0-9]+\\) to be in layout VK_IMAGE_LAYOUT_PRESENT_SRC_KHR--instead, current layout is VK_IMAGE_LAYOUT_UNDEFINED.",
       "vkDestroySemaphore\\(\\): can't be called on VkSemaphore 0x[0-9a-fA-F]+.*\\[*\\] that is currently in use by VkQueue 0x[0-9a-fA-F]+.*.",
 // NV-DXVK end
@@ -356,13 +373,33 @@ namespace dxvk {
 
     std::string dumpFilename = str::format(path, exeName, "_", tm.tm_mday, tm.tm_mon, tm.tm_year, "-", tm.tm_hour, tm.tm_min, tm.tm_sec, "_aftermath.nv-gpudmp");
 
-    Logger::err(str::format("Aftermath detected a crash, writing dump to: ", dumpFilename));
+    const AftermathCrashInfo crashInfo = decodeAftermathCrashInfo(pGpuCrashDump, gpuCrashDumpSize);
+
+    // std::hex is sticky within one str::format() call, hence the std::dec reset.
+    Logger::err(str::format("Aftermath detected a crash (", crashInfo.reason,
+      crashInfo.pageFaultAccessType.empty() ? "" :
+        str::format(": ", crashInfo.pageFaultAccessType, " ", crashInfo.pageFaultType,
+                    " at 0x", std::hex, crashInfo.pageFaultingGpuVA, std::dec,
+                    " from ", crashInfo.pageFaultEngine, "/", crashInfo.pageFaultClient),
+      "), writing dump to: ", dumpFilename));
+    for (size_t n = 0; n < crashInfo.pageFaultResourceInfo.size(); n++) {
+      const auto& res = crashInfo.pageFaultResourceInfo[n];
+      Logger::err(str::format("  faulted resource ", n, " : base 0x", std::hex, res.gpuVa, std::dec,
+        ", ", str::formatBytes(static_cast<size_t>(res.size)),
+        res.wasDestroyed ? " (already destroyed)" : ""));
+    }
+    for (const auto& shader : crashInfo.activeShaders) {
+      Logger::err(str::format("  active ", shader.type, " shader: ", shader.name));
+    }
+    if (crashInfo.unregisteredShaderCount > 0 || crashInfo.driverInternalShaderCount > 0) {
+      Logger::err(str::format("  unnamed active shaders: ", crashInfo.unregisteredShaderCount,
+        " unregistered, ", crashInfo.driverInternalShaderCount, " driver internal"));
+    }
 
     std::ofstream dumpFile = std::ofstream(str::tows(dumpFilename.c_str()).c_str(), std::ios::binary);
     if (dumpFile.is_open()) {
       dumpFile.write((char*) pGpuCrashDump, gpuCrashDumpSize);
       dumpFile.close();
-      dxvk::sentry::queueGpuCrashReport(dumpFilename.c_str());
     } else {
       Logger::warn(str::format("Aftermath was trying to write a GPU dump, but it failed, proposed filename: ", dumpFilename));
     }
@@ -394,14 +431,24 @@ namespace dxvk {
     }
   }
 
-  void aftermathMarkerCallback(const void* pMarker, void* pUserData, void** resolvedMarkerData, uint32_t* markerSize) {
-    *resolvedMarkerData = (void*)pMarker;
-    *markerSize = strlen((const char*) pMarker);
+  void aftermathMarkerCallback(const void* pMarker, uint32_t markerDataSize, void* pUserData, PFN_GFSDK_Aftermath_ResolveMarker resolveMarker) {
+    if (pMarker == nullptr || markerDataSize != 0) {
+      return;
+    }
+
+    resolveMarker(pMarker, strlen((const char*)pMarker));
+  }
+
+  const char* remixBuildTag() {
+    return REMIX_BUILD_TAG;
   }
 
   DxvkInstance::DxvkInstance() {
     Logger::info(str::format("Game: ", env::getExeName()));
     Logger::info(str::format("DXVK_Remix: ", DXVK_VERSION));
+    if (REMIX_BUILD_TAG[0] != '\0') {
+      Logger::info(str::format("Build: ", REMIX_BUILD_TAG));
+    }
 
     // NV-DXVK start: Sentry tags (set early so they are attached to any crash report).
     {
@@ -426,6 +473,10 @@ namespace dxvk {
     // Get the merged config for DxvkOptions and other queries
     m_config = RtxOptions::getMergedConfig();
     m_options = DxvkOptions(m_config);
+    // NV-DXVK end
+
+    // NV-DXVK start: Nsight Graphics self-injection must happen before Vulkan instance creation
+    NsightGraphicsCapture::initialize();
     // NV-DXVK end
 
     // NV-DXVK start: Wait for debugger functionality
@@ -458,7 +509,33 @@ namespace dxvk {
       // https://nvidia.custhelp.com/app/answers/detail/a_id/5182/~/unable-to-launch-vulkan-apps%2Fgame-on-notebooks-with-amd-radeon-igpus
       env::setEnvVar("DISABLE_LAYER_AMD_SWITCHABLE_GRAPHICS_1", "1");
     }
-    // NV-DXVK end 
+    // NV-DXVK end
+
+    // Skip NVIDIA's implicit present layer. RtxOptions::Create() above has already loaded
+    // dxvk.conf / rtx.conf / user.conf, so the option value is final here, and the loader reads the manifest's
+    // disable_environment key ("DISABLE_LAYER_NV_PRESENT_1", any value) on every layer scan, i.e. at vkCreateInstance
+    // below. The loader treats the variable as set whatever its value, so it cannot be un-set by writing "0".
+    {
+      constexpr const char* kNvPresentDisableEnv = "DISABLE_LAYER_NV_PRESENT_1";
+      const bool alreadySet = !env::getEnvVar(kNvPresentDisableEnv).empty();
+      if (RtxPerfLog::disableNvPresentLayer()) {
+        const bool ok = alreadySet || env::setEnvVar(kNvPresentDisableEnv, "1");
+        // Also name the layer in the loader's own disable list (loader >= 1.3.234), which does not
+        // depend on the manifest's disable_environment key being honoured. Comma-separated; keep whatever is already there.
+        constexpr const char* kLoaderDisableEnv = "VK_LOADER_LAYERS_DISABLE";
+        const std::string loaderDisable = env::getEnvVar(kLoaderDisableEnv);
+        const std::string loaderDisableNew = loaderDisable.empty() ? std::string("VK_LAYER_NV_present") : loaderDisable + ",VK_LAYER_NV_present";
+        const bool okLoader = loaderDisable.find("VK_LAYER_NV_present") != std::string::npos
+          || env::setEnvVar(kLoaderDisableEnv, loaderDisableNew.c_str());
+        Logger::info(str::format("[PresentPacing] rtx.present.disableNvPresentLayer=True: ",
+          ok ? "set " : "FAILED to set ", kNvPresentDisableEnv, "=1 before Vulkan instance creation",
+          alreadySet ? " (already set in the environment)" : "",
+          okLoader ? "; VK_LOADER_LAYERS_DISABLE now names VK_LAYER_NV_present" : "; FAILED to set VK_LOADER_LAYERS_DISABLE"));
+      } else {
+        Logger::info(str::format("[PresentPacing] rtx.present.disableNvPresentLayer=False: VK_LAYER_NV_present left as the loader decides",
+          alreadySet ? str::format(" (but ", kNvPresentDisableEnv, " is already set in the environment, so it is disabled anyway)") : std::string()));
+      }
+    }
 
     m_extProviders.push_back(&DxvkPlatformExts::s_instance);
     m_extProviders.push_back(&VrInstance::s_instance);
@@ -481,6 +558,17 @@ namespace dxvk {
 
     m_vkl = new vk::LibraryFn();
     m_vki = new vk::InstanceFn(true, this->createInstance());
+
+    // Implicit layers are never in ppEnabledLayerNames, and the API has no query for the
+    // layers the loader actually activated. vkEnumerateInstanceLayerProperties is the closest check: recent loaders
+    // leave out implicit layers whose disable_environment variable is set. For certainty use VK_LOADER_DEBUG=layer.
+    {
+      const bool listed = DxvkNameSet::enumInstanceLayers(m_vkl).supports("VK_LAYER_NV_present") != 0;
+      Logger::info(str::format("[PresentPacing] After vkCreateInstance: VK_LAYER_NV_present ",
+        listed ? "IS" : "is NOT", " listed by vkEnumerateInstanceLayerProperties (explicitly enabled layers: none from Remix",
+        RtxOptions::areValidationLayersEnabled() ? " except VK_LAYER_KHRONOS_validation" : "",
+        "; disableNvPresentLayer=", RtxPerfLog::disableNvPresentLayer() ? "True" : "False", ")"));
+    }
 
     m_adapters = this->queryAdapters();
 
@@ -507,9 +595,11 @@ namespace dxvk {
         if (GFSDK_Aftermath_SUCCEED(aftermathResult)) {
           Logger::info("Aftermath enabled");
           s_aftermathEnabled = true;
+          setAftermathShaderRegistrationEnabled(true);
         } else if (aftermathResult == GFSDK_Aftermath_Result_FAIL_AlreadyInitialized) {
           Logger::info("Aftermath already initialized");
           s_aftermathEnabled = true;
+          setAftermathShaderRegistrationEnabled(true);
         } else {
           Logger::warn(str::format("User requested Aftermath enablement, but it failed.  Code: ", aftermathResult));
           m_options.enableAftermath = false;
@@ -667,6 +757,22 @@ namespace dxvk {
     return nullptr;
   }
 
+  namespace {
+
+    // Returns true when the launch environment asks the Vulkan loader for a validation layer.
+    bool isValidationLayerRequestedByLoader() {
+      for (const char* name : { "VK_LOADER_LAYERS_ENABLE", "VK_INSTANCE_LAYERS" }) {
+        std::string value = env::getEnvVar(name);
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (value.find("validation") != std::string::npos) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+  }
+
   VkInstance DxvkInstance::createInstance() {
     const auto areValidationLayersEnabled = RtxOptions::areValidationLayersEnabled();
     const auto enableValidationLayerExtendedValidation = RtxOptions::enableValidationLayerExtendedValidation();
@@ -679,11 +785,14 @@ namespace dxvk {
       &insExtensions.khrGetSurfaceCapabilities2,
       &insExtensions.khrSurface,
       &insExtensions.khrDeviceProperties2,
+      &insExtensions.extSwapchainColorSpace,
     }};
 
     // Hide VK_EXT_debug_utils behind an environment variable. This extension
     // adds additional overhead to winevulkan
-    if (areValidationLayersEnabled || env::getEnvVar("DXVK_PERF_EVENTS") == "1") {
+    // A validation layer that the launcher enables needs it too, so its messages name objects and the settings sweep
+    // can capture them.
+    if (areValidationLayersEnabled || isValidationLayerRequestedByLoader() || env::getEnvVar("DXVK_PERF_EVENTS") == "1") {
       insExtensionList.push_back(&insExtensions.extDebugUtils);
     }
 
@@ -719,7 +828,7 @@ namespace dxvk {
     extensionsAvailable.enableExtensions(dlfgExtList.size(), dlfgExtList.data(), extensionsEnabled);
     // NV-DXVK end
 
-    // NV-DXVK start: FSR 3.1 — the FidelityFX Vulkan backend uses debug-utils
+    // NV-DXVK start: FSR 3.1 - the FidelityFX Vulkan backend uses debug-utils
     // object naming. Only requested when the FidelityFX runtime is actually
     // present, so installs without it are byte-identical to upstream.
     if (fork_hooks::fsrRuntimeAvailable() && extensionsAvailable.supports(VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
@@ -881,7 +990,8 @@ namespace dxvk {
       // If we have more than one device always skip CPU devices.
       filterFlags.set(DxvkDeviceFilterFlag::SkipCpuDevices);
 
-      if (haveRealDGPU) {
+      // An explicit DXVK_FILTER_DEVICE_NAME may select an iGPU (e.g. testing an AMD iGPU next to an NVIDIA dGPU).
+      if (haveRealDGPU && env::getEnvVar("DXVK_FILTER_DEVICE_NAME").empty()) {
         // Skip integrated and emulated device(s) if we have a real dGPU
         filterFlags.set(DxvkDeviceFilterFlag::SkipIntegratedGPUDevices);
         filterFlags.set(DxvkDeviceFilterFlag::SkipEmulatedGPUDevices);
@@ -921,7 +1031,20 @@ namespace dxvk {
           if (b->deviceProperties().deviceType == deviceTypes[i]) bRank = i;
         }
 
-        return aRank < bRank;
+        if (aRank != bRank)
+          return aRank < bRank;
+
+        // Among adapters of the same device type, prefer ones that support
+        // ray tracing extensions required by RTX Remix.
+        const bool aSupportsRT = a->supportsExtension(VK_KHR_RAY_QUERY_EXTENSION_NAME)
+                               && a->supportsExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+        const bool bSupportsRT = b->supportsExtension(VK_KHR_RAY_QUERY_EXTENSION_NAME)
+                               && b->supportsExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+
+        if (aSupportsRT != bSupportsRT)
+          return aSupportsRT;
+
+        return false;
       });
     
     if (result.size() == 0) {

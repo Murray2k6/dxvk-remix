@@ -104,6 +104,22 @@ public:
     }
   }
 
+  // NV-DXVK start: swap the object stored under an existing key in place, so
+  // everything that recorded its index keeps pointing at it. obj must compare
+  // equal (same key) to the stored object.
+  bool replace(const T& obj) {
+    auto iter = m_bufferMap.find(obj);
+    if (iter == m_bufferMap.end()) {
+      return false;
+    }
+    const uint32_t idx = iter->second;
+    m_bufferMap.erase(iter);
+    m_objects.at(idx) = obj;
+    m_bufferMap.insert({ obj, idx });
+    return true;
+  }
+  // NV-DXVK end
+
   uint32_t getActiveCount() const { return m_objects.size() - m_freeBuffers.size(); }
   uint32_t getTotalCount() const { return m_objects.size(); }
 

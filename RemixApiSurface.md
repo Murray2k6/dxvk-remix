@@ -24,8 +24,8 @@ the API, see [`docs/RemixApi.md`](docs/RemixApi.md).
 | `REMIXAPI_VERSION_GET_MAJOR(version)` | `(((uint64_t)(version) >> 48) & (uint64_t)0xFFFF)` |
 | `REMIXAPI_VERSION_GET_MINOR(version)` | `(((uint64_t)(version) >> 16) & (uint64_t)0xFFFFFFFF)` |
 | `REMIXAPI_VERSION_GET_PATCH(version)` | `(((uint64_t)(version)      ) & (uint64_t)0xFFFF)` |
-| `REMIXAPI_VERSION_MAJOR` | `0` |
-| `REMIXAPI_VERSION_MINOR` | `1000` |
+| `REMIXAPI_VERSION_MAJOR` | `1` |
+| `REMIXAPI_VERSION_MINOR` | `0` |
 | `REMIXAPI_VERSION_PATCH` | `0` |
 | `REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` | `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` |
 | `REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` | `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` |
@@ -33,7 +33,28 @@ the API, see [`docs/RemixApi.md`](docs/RemixApi.md).
 | `REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` | `0x00000100` |
 | `REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` | `0x00001000` |
 | `REMIX_WINAPI_MAX_PATH` | `260` |
+| `REMIXAPI_CAMERA_FRAME_EVENT_CAMERA_CUT` | `0x1u` |
+| `REMIXAPI_CAMERA_FRAME_EVENT_HISTORY_INVALID` | `0x2u` |
+| `REMIXAPI_CAMERA_FRAME_EVENT_ORIGIN_SHIFT` | `0x8u` |
 | `REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT` | `256` |
+| `REMIXAPI_TEXTURE_HOST_IMPORT_FLAG_REPLACE` | `0x1u` |
+| `REMIXAPI_TEXTURE_ENCODING_NONE` | `0u` |
+| `REMIXAPI_TEXTURE_ENCODING_NORMAL_TANGENT_XY` | `1u  // normal: unsigned X/Y, Z rebuilt` |
+| `REMIXAPI_TEXTURE_ENCODING_SMOOTHNESS_IN_RED` | `2u  // roughness = 1 - red` |
+| `REMIXAPI_TEXTURE_ENCODING_SMOOTHNESS_IN_GREEN` | `3u  // roughness = 1 - green` |
+| `REMIXAPI_HOST_SETTING_FLAG_REQUIRES_RESTART` | `0x1u` |
+| `REMIXAPI_HOST_SETTING_FLAG_READ_ONLY` | `0x2u` |
+| `REMIXAPI_HOST_SETTING_FLAG_USER_MENU` | `0x4u` |
+| `REMIXAPI_COLOR_GRADE_VERSION` | `1u` |
+| `REMIXAPI_EXTERNAL_FRAME_VERSION` | `1u` |
+| `REMIXAPI_RETAINED_UPDATE_TRANSFORM` | `0x1u` |
+| `REMIXAPI_RETAINED_UPDATE_VISIBILITY` | `0x2u` |
+| `REMIXAPI_SCREEN_OVERLAY_LAYER_PREMULTIPLIED` | `0x1u  // RGB already multiplied by alpha` |
+| `REMIXAPI_SCREEN_OVERLAY_MAX_LAYERS` | `8u` |
+| `REMIXAPI_MEMORY_PRESSURE_NONE` | `0u` |
+| `REMIXAPI_MEMORY_PRESSURE_ELEVATED` | `1u` |
+| `REMIXAPI_MEMORY_PRESSURE_HIGH` | `2u` |
+| `REMIXAPI_MEMORY_PRESSURE_CRITICAL` | `3u` |
 
 ---
 
@@ -57,6 +78,7 @@ the API, see [`docs/RemixApi.md`](docs/RemixApi.md).
 | `remixapi_TextureHandle` | `struct remixapi_TextureHandle_T*` |
 | `remixapi_Path` | `const wchar_t*` |
 | `remixapi_InstanceCategoryFlags` | `uint32_t` |
+| `remixapi_D3D11TextureToken` | `void*` |
 
 ---
 
@@ -95,6 +117,15 @@ the API, see [`docs/RemixApi.md`](docs/RemixApi.md).
 | `REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SYSTEM_EXT` | `26` |  |
 | `REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT` | `27` |  |
 | `REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_INFO` | `28` |  |
+| `REMIXAPI_STRUCT_TYPE_MESH_INFO_REFRESH_GEOMETRY_EXT` | `29` |  |
+| `REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_SPEC_GLOSS_EXT` | `30` |  |
+| `REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_ALBEDO_TINT_EXT` | `31` |  |
+| `REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MATERIAL_OVERRIDE_EXT` | `32` |  |
+| `REMIXAPI_STRUCT_TYPE_TEXTURE_INFO_HOST_IMPORT_EXT` | `33` |  |
+| `REMIXAPI_STRUCT_TYPE_CAMERA_INFO_FRAME_EVENTS_EXT` | `0x4E560001` | Remix Plus struct types live from 0x4E560000 on, a range upstream never uses, so a new upstream sType cannot collide with them. |
+| `REMIXAPI_STRUCT_TYPE_ASSET_KEY_EXT` | `0x4E560002` |  |
+| `REMIXAPI_STRUCT_TYPE_EXTERNAL_FRAME_EXT` | `0x4E560003` |  |
+| `REMIXAPI_STRUCT_TYPE_COLOR_GRADE_EXT` | `0x4E560004` |  |
 
 ### `remixapi_ErrorCode`
 
@@ -118,6 +149,7 @@ the API, see [`docs/RemixApi.md`](docs/RemixApi.md).
 | `REMIXAPI_ERROR_CODE_HRESULT_VK_CREATE_INSTANCE_FAIL` | `0x88960004` |  |
 | `REMIXAPI_ERROR_CODE_HRESULT_VK_CREATE_DEVICE_FAIL` | `0x88960005` |  |
 | `REMIXAPI_ERROR_CODE_HRESULT_GRAPHICS_QUEUE_FAMILY_MISSING` | `0x88960006` |  |
+| `REMIXAPI_ERROR_CODE_FEATURE_UNAVAILABLE` | `0x4E560001` | Remix Plus error codes live from 0x4E560000 on, like the Remix Plus struct types. The device or the current output does not support the requested feature. |
 
 ### `remixapi_CameraType`
 
@@ -138,10 +170,9 @@ the API, see [`docs/RemixApi.md`](docs/RemixApi.md).
 ### `remixapi_InstanceCategoryBit`
 
 Bit values match upstream NVIDIA dxvk-remix exactly. These are a published
-ABI contract — do NOT reorder or reassign. (An earlier fork build shifted
-IGNORE_ALPHA_CHANNEL to bit 8 to mirror the internal InstanceCategories
-order; that was reverted because the C<->internal mapping is by-name in
-toRtCategories(), so the bit values are free to match upstream and must.)
+ABI contract — do NOT reorder or reassign. The C<->internal mapping is
+by name in toRtCategories(), so the bit values need not follow the internal
+InstanceCategories order.
 
 | Member | Value | Notes |
 | :-- | :-: | :-- |
@@ -167,7 +198,7 @@ toRtCategories(), so the bit values are free to match upstream and must.)
 | `REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY` | `1 << 19` |  |
 | `REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_BAKED_LIGHTING` | `1 << 20` |  |
 | `REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_ALPHA_CHANNEL` | `1 << 21` |  |
-| `REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER` | `1 << 22` |  |
+| `REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER` | `1 << 22` | Deprecated. Reserved for API compatibility and ignored by the runtime. |
 | `REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER` | `1 << 23` |  |
 | `REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS` | `1 << 24` |  |
 | `REMIXAPI_INSTANCE_CATEGORY_BIT_HAIR_CARDS` | `1 << 25` |  |
@@ -200,6 +231,28 @@ Texture upload API
 | `REMIXAPI_FORMAT_BC5_UNORM` | `139,` |  |
 | `REMIXAPI_FORMAT_BC7_UNORM` | `145,` |  |
 | `REMIXAPI_FORMAT_BC7_SRGB` | `146,` |  |
+
+### `remixapi_HostSettingType`
+
+Host settings: a host (game plugin) exposes its own options as live
+controls in the developer menu's "Host Settings" tab. Optional named
+exports; the versioned Interface table is unchanged. Probe with
+GetProcAddress(dll, "remixapi_RegisterHostSetting").
+
+Every value is a double: BOOL 0/1, INT/ENUM an integral value, FLOAT as
+is, ACTION a click counter the menu increments (a button). The runtime
+stores the value; the menu edits it. The host reads
+remixapi_GetHostSettingsGeneration() once per frame (an atomic load) and
+only re-reads values when it changed. All functions are thread-safe and
+may be called from any thread.
+
+| Member | Value | Notes |
+| :-- | :-: | :-- |
+| `REMIXAPI_HOST_SETTING_TYPE_BOOL` | `0` |  |
+| `REMIXAPI_HOST_SETTING_TYPE_INT` | `1` |  |
+| `REMIXAPI_HOST_SETTING_TYPE_FLOAT` | `2` |  |
+| `REMIXAPI_HOST_SETTING_TYPE_ENUM` | `3,` |  |
+| `REMIXAPI_HOST_SETTING_TYPE_ACTION` | `4,` |  |
 
 ---
 
@@ -281,6 +334,10 @@ Texture upload API
 | `int` | `alphaTestType` |  |
 | `uint8_t` | `alphaReferenceValue` |  |
 | `float` | `displaceOut` |  |
+| `remixapi_Bool` | `enableDlssControlMask` |  |
+| `float` | `dlssControlMaskIntensity` |  |
+| `float` | `dlssControlMaskToneStrength` |  |
+| `float` | `dlssControlMaskStructuralStrength` |  |
 
 ### `remixapi_MaterialInfoOpaqueSubsurfaceEXT`
 
@@ -302,6 +359,46 @@ Valid only if remixapi_MaterialInfo contains remixapi_MaterialInfoOpaqueEXT in p
 | `float` | `subsurfaceRadiusScale` |  |
 | `float` | `subsurfaceMaxSampleRadius` |  |
 | `remixapi_Path` | `subsurfaceRadiusTexture` |  |
+
+### `remixapi_MaterialInfoOpaqueSpecGlossEXT`
+
+Valid only if remixapi_MaterialInfo contains remixapi_MaterialInfoOpaqueEXT
+in its pNext chain. Describes a specular/gloss source map bound as the
+roughness texture, for hosts whose content uses that workflow.
+Check remixapi_GetSpecGlossMaterialVersion() before chaining it: a runtime
+that predates it ignores the struct and would read the map as roughness.
+
+| Type | Field | Notes |
+| :-- | :-- | :-- |
+| `remixapi_StructType` | `sType` |  |
+| `void*` | `pNext` |  |
+| `uint32_t` | `roughnessEncoding` | REMIXAPI_TEXTURE_ENCODING_* of the roughness texture. Applies when the texture itself carries no encoding (uploaded with remixapi_CreateTexture); an encoding given at import wins. SMOOTHNESS_IN_* makes roughnessConstant the lower bound of the decoded roughness, as for imported textures. |
+| `float` | `metalStrength` | Per-pixel metalness from the specular map. Requires a SMOOTHNESS_IN_GREEN roughness texture, whose red channel then holds the (gamma-encoded) specular level. metallic = metalStrength * ramp(spec * max(specularTint)) between specularMetalLow and specularMetalHigh, attenuated where the albedo luminance (gamma) approaches metalAlbedoLuminanceMax (>= 1: off). metalStrength 0 disables it; the material's metallicConstant still applies where the map is not sampled. |
+| `float` | `specularMetalLow` |  |
+| `float` | `specularMetalHigh` |  |
+| `float` | `metalAlbedoLuminanceMax` |  |
+| `remixapi_Float3D` | `specularTint` | Specular colour (gamma, 0..1). Non-zero: metal texels take spec * tint as their albedo (their F0). Zero: albedo is kept and the ramp uses spec alone. |
+
+### `remixapi_MaterialInfoOpaqueAlbedoTintEXT`
+
+Valid only if remixapi_MaterialInfo contains remixapi_MaterialInfoOpaqueEXT
+in its pNext chain. Multiplies the RGB of the sampled albedo texture by
+albedoTint, so one untinted texture can be shared by differently tinted
+materials (skin/hair tints). The multiply happens on the texture's encoded
+(gamma) values before the shader linearizes them, the same as multiplying
+8-bit texels on the CPU; for an sRGB-format texture (sampled linear) the
+tint is linearized first. Alpha, albedoConstant (used when there is no
+texture) and the other maps are untouched. (1,1,1) is a no-op. Components
+are clamped to [0, 16].
+Check remixapi_GetMaterialAlbedoTintVersion() before relying on it: a
+runtime that predates it ignores the struct and renders the texture
+untinted.
+
+| Type | Field | Notes |
+| :-- | :-- | :-- |
+| `remixapi_StructType` | `sType` |  |
+| `void*` | `pNext` |  |
+| `remixapi_Float3D` | `albedoTint` |  |
 
 ### `remixapi_MaterialInfoTranslucentEXT`
 
@@ -394,6 +491,37 @@ Valid only if remixapi_MaterialInfo contains remixapi_MaterialInfoOpaqueEXT in p
 | `const remixapi_MeshInfoSurfaceTriangles*` | `surfaces_values` |  |
 | `uint32_t` | `surfaces_count` |  |
 
+### `remixapi_MeshInfoRefreshGeometryEXT`
+
+Link into remixapi_MeshInfo::pNext to REPLACE the geometry of a mesh that
+is already registered under the same hash, instead of the default behavior
+of ignoring the repeated registration.
+
+Intended for CPU-deformed geometry whose topology is fixed but whose vertex
+positions are rewritten by the host every few frames (e.g. facial morphs
+for lip sync, blinks, and expressions). Re-using the hash is what
+makes this work: the mesh handle IS the hash, and the handle feeds both
+ExternalDrawState::computeExternalDrawIdentityHash and the spatial-map hash,
+so minting a fresh hash per update would hand the scene manager a brand-new
+object every time -- a new RtInstance with no previous-frame correspondence,
+i.e. no motion vectors and no denoiser history (ghosting).
+
+On refresh, the runtime carries the previous registration's topology and
+layout hashes over to the new surfaces and leaves only VertexPosition fresh.
+DrawCallCache therefore keeps the same BlasEntry (it buckets on
+TopologicalHash) and processGeometryInfo resolves to kUpdateBVH, which
+ping-pongs the history buffers and populates previousPositionBuffer --
+giving the morph correct motion vectors rather than merely stable ones.
+
+The refresh is ignored (falls back to leaving the existing mesh alone) if no
+mesh is registered under the hash, or if the surface count differs from the
+registered one -- a changed surface count is a different mesh, not a morph.
+
+| Type | Field | Notes |
+| :-- | :-- | :-- |
+| `remixapi_StructType` | `sType` |  |
+| `void*` | `pNext` |  |
+
 ### `remixapi_CameraInfoParameterizedEXT`
 
 | Type | Field | Notes |
@@ -408,6 +536,32 @@ Valid only if remixapi_MaterialInfo contains remixapi_MaterialInfoOpaqueEXT in p
 | `float` | `aspect` |  |
 | `float` | `nearPlane` |  |
 | `float` | `farPlane` |  |
+
+### `remixapi_CameraInfoFrameEventsEXT`
+
+| Type | Field | Notes |
+| :-- | :-- | :-- |
+| `remixapi_StructType` | `sType` |  |
+| `void*` | `pNext` |  |
+| `uint32_t` | `flags` | REMIXAPI_CAMERA_FRAME_EVENT_* |
+| `remixapi_Float3D` | `originShift` | ORIGIN_SHIFT only |
+
+### `remixapi_AssetKeyEXT`
+
+Remix Plus scene interface. Chain on remixapi_MeshInfo or remixapi_MaterialInfo: the asset
+key mods, captures and caches use for this asset instead of the default (the mesh hash / the material's runtime
+content hash), and aliases, the keys older host versions produced, so mods made against them keep matching.
+Replacements are looked up by key, then by each alias in order. 0 is never a key. assetName is optional (logs,
+captures). A runtime that predates the struct ignores it.
+
+| Type | Field | Notes |
+| :-- | :-- | :-- |
+| `remixapi_StructType` | `sType` |  |
+| `void*` | `pNext` |  |
+| `uint64_t` | `key` |  |
+| `const uint64_t*` | `aliases_values` |  |
+| `uint32_t` | `aliases_count` |  |
+| `const char*` | `assetName` |  |
 
 ### `remixapi_CameraInfo`
 
@@ -713,6 +867,111 @@ Most fields correspond to a usd token. Set to null, if no value.
 | `const void*` | `data` | Pointer to pixel data (all mips sequential) |
 | `uint64_t` | `dataSize` | Total size in bytes |
 
+### `remixapi_TextureInfoHostImportEXT`
+
+| Type | Field | Notes |
+| :-- | :-- | :-- |
+| `remixapi_StructType` | `sType` |  |
+| `void*` | `pNext` |  |
+| `uint32_t` | `encoding` |  |
+| `uint32_t` | `vkFormat` |  |
+| `uint32_t` | `flags` |  |
+
+### `remixapi_HostSettingInfo`
+
+| Type | Field | Notes |
+| :-- | :-- | :-- |
+| `uint32_t` | `structSize` | sizeof(remixapi_HostSettingInfo) |
+| `const char*` | `key` | stable unique id (required) |
+| `const char*` | `label` | NULL = key |
+| `const char*` | `section` | group header; NULL = "General" |
+| `const char*` | `tooltip` | optional |
+| `remixapi_HostSettingType` | `type` |  |
+| `uint32_t` | `flags` | REMIXAPI_HOST_SETTING_FLAG_* |
+| `double` | `minValue` | INT/FLOAT range; min >= max = unbounded |
+| `double` | `maxValue` |  |
+| `double` | `step` | drag speed; 0 = derived from the range |
+| `double` | `defaultValue` | target of the reset button |
+| `double` | `currentValue` | the host's live value |
+| `const char* const*` | `enumLabels` | ENUM: labels of values 0..enumCount-1 |
+| `uint32_t` | `enumCount` |  |
+
+### `remixapi_ColorGradeEXT`
+
+Color grading: the grade the tone mapper applies to the linear scene color before the tone curve.
+Optional named exports; the versioned Interface table is unchanged. Probe with
+GetProcAddress(dll, "remixapi_SetColorGradePreset") and so on. See docs/RemixApi.md, "Color grading".
+
+The grade runs in this order, and the default values below are the neutral grade, which changes nothing:
+color = matrix * color                                      matrix: row-major 3x3, identity
+color = balance * color (per channel)                       balance: 1, 1, 1
+color = lerp(luminance(color), color, saturation)           saturation: 1 (BT.709 luminance)
+color = 0.18 * (max(color, 0) / 0.18) ^ contrast            contrast: 1
+The anchor and the shoulder shape the tone curve after the grade, per channel:
+color <= anchor: unchanged                                  anchor: 0.18
+above: anchor + range * t / (1 + t * exp(-shoulder / t^2))  shoulder: 0.01
+with range = peak - anchor and t = (color - anchor) / range, so the curve rolls off towards the peak.
+A larger shoulder keeps the curve straight further above the anchor and bends it later and harder.
+Values are clamped: matrix entries to -4..4, balance to 0..4, saturation to 0..4, contrast to 0.1..4, anchor to
+0.01..0.5 and shoulder to 0.001..1. In these ranges the curve rises monotonically and stays below the peak.
+An anchor or shoulder of exactly 0 takes its default, so a zero-initialized struct gets the standard curve.
+
+Presets are files in rtx.tonemap.gradePresetDirectory (default rtx-remix/colorgrade in the game folder), one
+<name>.conf per preset, plus the built-in presets "None", "Warm Amber" and "Olive Green", which cannot be
+overwritten. Preset names are matched exactly.
+
+A call that sets a new grade blends to it from the grade on screen over blendSeconds (0 = at once), also when a
+blend is still running. The grade an API call sets stays until the next call, or until the player or rtx.conf
+picks another preset (rtx.tonemap.gradePreset). Any thread may call these; they take effect at the next frame.
+
+| Type | Field | Notes |
+| :-- | :-- | :-- |
+| `remixapi_StructType` | `sType` | REMIXAPI_STRUCT_TYPE_COLOR_GRADE_EXT |
+| `void*` | `pNext` |  |
+| `uint32_t` | `version` | REMIXAPI_COLOR_GRADE_VERSION |
+| `float` | `matrix[9]` | row-major: matrix[3 * row + column] |
+| `float` | `balance[3]` | per-channel gain on red, green and blue |
+| `float` | `saturation` |  |
+| `float` | `contrast` |  |
+| `float` | `anchor` | where the tone curve's shoulder starts |
+| `float` | `shoulder` | how late and hard the shoulder bends |
+
+### `remixapi_ExternalFrameEXT`
+
+External frame: the presented image, shared with another Vulkan device or process without a CPU readback.
+An optional named export; the versioned Interface table is unchanged. Probe with
+GetProcAddress(dll, "remixapi_ConfigureExternalFrame"). See docs/RemixApi.md, "External frame".
+
+Call it after Startup, on the thread that calls Present. On success, every Present copies the frame (after
+tone mapping and upscaling, without the developer menu) into the shared image, releases the image to
+VK_QUEUE_FAMILY_EXTERNAL in VK_IMAGE_LAYOUT_GENERAL and signals readySemaphore. The copy after the first one waits
+on releasedSemaphore on the GPU, so the consumer must answer every ready with a released. When Present returns,
+the submission that signals readySemaphore is in the Vulkan queue, so the consumer can wait on it at once.
+
+The image is 2D, R8G8B8A8_UNORM, one mip and one layer, optimal tiling, exclusive sharing, no create flags, usage
+TRANSFER_SRC | TRANSFER_DST | SAMPLED, in a dedicated allocation. Its values are the presented, display-encoded
+values. The three handles are new NT handles (OPAQUE_WIN32) owned by the caller. The semaphores are binary.
+
+frame == NULL stops the export. Calling it again replaces the image and the semaphores, for example after the
+window was resized. The consumer keeps whatever it imported from the old set.
+Returns REMIXAPI_ERROR_CODE_FEATURE_UNAVAILABLE when the device cannot export memory or semaphores, or when the
+output cannot be expressed as R8G8B8A8_UNORM.
+
+| Type | Field | Notes |
+| :-- | :-- | :-- |
+| `remixapi_StructType` | `sType` | REMIXAPI_STRUCT_TYPE_EXTERNAL_FRAME_EXT |
+| `void*` | `pNext` |  |
+| `uint32_t` | `version` | in: 1 |
+| `uint32_t` | `width` | out: the back buffer width |
+| `uint32_t` | `height` | out: the back buffer height |
+| `uint32_t` | `format` | out: VkFormat, VK_FORMAT_R8G8B8A8_UNORM |
+| `uint32_t` | `memoryTypeIndex` | out |
+| `uint64_t` | `allocationSize` | out |
+| `uint8_t` | `deviceUUID[16]` | out: VkPhysicalDeviceIDProperties::deviceUUID |
+| `void*` | `memoryHandle` | out: NT handle, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+| `void*` | `readySemaphore` | out: NT handle, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+| `void*` | `releasedSemaphore` | out: NT handle, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+
 ### `remixapi_InitializeLibraryInfo`
 
 | Type | Field | Notes |
@@ -744,7 +1003,61 @@ not included.
 | `uint64_t` | `usedRenderTargetBytes` |  |
 | `uint64_t` | `driverAllocatedBytes` | Driver-reported allocation on device-local heaps. Sourced from VK_EXT_memory_budget (adapter->getMemoryHeapInfo -> memoryAllocated). This is the Task-Manager / nvidia-smi view of the process's Vulkan footprint. totalAllocatedBytes only counts DXVK's own allocator path, so (driverAllocatedBytes - totalAllocatedBytes) is the non-DXVK overhead: DLSS/NGX internal buffers, raytracing pipeline driver state, bindless descriptor pools, NRC CUDA, pipeline caches, etc. |
 | `uint64_t` | `driverBudgetBytes` |  |
-| `uint32_t` | `forkTextureCacheCount` | Size of the fork-side RtxTextureManager's SparseUniqueCache. Grows with both D3D9-native and plugin-created textures tracked by Remix. If this climbs while plugin's own texture count is stable, the growth is in fork-side streaming/native textures, not plugin uploads. |
+| `uint32_t` | `forkTextureCacheCount` | Size of the runtime RtxTextureManager's SparseUniqueCache. Grows with both D3D9-native and plugin-created textures tracked by Remix. If this climbs while plugin's own texture count is stable, the growth is in runtime streaming/native textures, not plugin uploads. |
+
+### `remixapi_RetainedInstanceUpdate`
+
+| Type | Field | Notes |
+| :-- | :-- | :-- |
+| `uint64_t` | `handle` |  |
+| `remixapi_Transform` | `transform` | absolute; valid with UPDATE_TRANSFORM |
+| `uint32_t` | `flags` | REMIXAPI_RETAINED_UPDATE_* |
+| `remixapi_Bool` | `visible` | valid with UPDATE_VISIBILITY |
+
+### `remixapi_ScreenOverlayLayerD3D11`
+
+| Type | Field | Notes |
+| :-- | :-- | :-- |
+| `void*` | `texture2D` | ID3D11Texture2D* of the registered device |
+| `uint32_t` | `flags` | REMIXAPI_SCREEN_OVERLAY_LAYER_* |
+| `float` | `opacity` | 0..1 |
+| `float` | `rect[4]` | destination x, y, width, height as output fractions; zero width or height = full output |
+
+### `remixapi_InstanceInfoMaterialOverrideEXT`
+
+Per-instance material override. Chain on remixapi_InstanceInfo (DrawInstance,
+CreateRetainedInstance, UpdateRetainedInstance). Every surface of the mesh is
+shaded with `material` instead of the material the mesh was created with, so
+a host can create one mesh per unique geometry and draw it with different
+materials. A null handle, or a handle that is not (or no longer) a live
+material, keeps the mesh's own material.
+With rtx.hostImport.shareGeometryAcrossMaterials on (default), instances of
+one mesh that carry this struct share one geometry copy and one BLAS across
+materials. Materials that alpha-test or blend (in the material or through
+remixapi_InstanceInfoBlendEXT) keep a geometry copy per material, so opacity
+micromaps stay per opacity texture. The option only changes sharing; the
+override is always applied.
+Check remixapi_GetInstanceMaterialOverrideVersion() (resolve by name) before
+relying on it: a runtime that predates it ignores the struct and shades with
+the mesh's own material.
+
+| Type | Field | Notes |
+| :-- | :-- | :-- |
+| `remixapi_StructType` | `sType` |  |
+| `void*` | `pNext` |  |
+| `remixapi_MaterialHandle` | `material` |  |
+
+### `remixapi_MemoryPressureInfo`
+
+| Type | Field | Notes |
+| :-- | :-- | :-- |
+| `uint32_t` | `structSize` | in: sizeof(remixapi_MemoryPressureInfo) |
+| `uint32_t` | `level` | REMIXAPI_MEMORY_PRESSURE_* |
+| `uint32_t` | `requestHostRelease` | 1 = please release far content now |
+| `uint32_t` | `frame` | runtime frame of the sample |
+| `uint64_t` | `usageBytes` | device-local usage, whole process, minus free space inside runtime chunks |
+| `uint64_t` | `budgetBytes` | device-local budget |
+| `uint64_t` | `bytesToRelease` | usage above the level-1 release point |
 
 ---
 
@@ -761,6 +1074,22 @@ Parameters:
 ### `PFN_remixapi_Shutdown`
 
 Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- *(none)*
+
+### `PFN_remixapi_GetSpecGlossMaterialVersion`
+
+Returns: `uint32_t`
+
+Parameters:
+
+- *(none)*
+
+### `PFN_remixapi_GetMaterialAlbedoTintVersion`
+
+Returns: `uint32_t`
 
 Parameters:
 
@@ -1079,6 +1408,152 @@ Parameters:
 
 - `remixapi_TextureHandle handle`
 
+### `PFN_remixapi_PrepareD3D11Texture`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `void* texture2D`
+- `uint32_t dxgiFormat`
+- `remixapi_D3D11TextureToken* out_token`
+
+### `PFN_remixapi_ImportD3D11Texture`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `remixapi_D3D11TextureToken token`
+- `uint64_t hash`
+- `remixapi_TextureHandle* out_handle`
+
+### `PFN_remixapi_ReleaseD3D11Texture`
+
+Returns: `void`
+
+Parameters:
+
+- `remixapi_D3D11TextureToken token`
+
+### `PFN_remixapi_ImportD3D11TextureEx`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `remixapi_D3D11TextureToken token`
+- `uint64_t hash`
+- `uint32_t encoding`
+- `remixapi_TextureHandle* out_handle`
+
+### `PFN_remixapi_PrepareD3D11TextureEx`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `void* texture2D`
+- `uint32_t dxgiFormat`
+- `uint32_t maxDimension`
+- `remixapi_D3D11TextureToken* out_token`
+
+### `PFN_remixapi_RegisterHostSetting`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `const remixapi_HostSettingInfo* info`
+- `remixapi_HostSettingHandle* out_handle`
+
+### `PFN_remixapi_GetHostSettingsGeneration`
+
+Returns: `uint64_t`
+
+Parameters:
+
+- *(none)*
+
+### `PFN_remixapi_GetHostSettingValue`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `remixapi_HostSettingHandle handle`
+- `double* out_value`
+
+### `PFN_remixapi_SetHostSettingValue`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `remixapi_HostSettingHandle handle`
+- `double value`
+
+### `PFN_remixapi_ClearHostSettings`
+
+Returns: `void`
+
+Parameters:
+
+- *(none)*
+
+### `PFN_remixapi_SetColorGradePreset`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `const char* name`
+- `float blendSeconds`
+
+### `PFN_remixapi_SetColorGrade`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `const remixapi_ColorGradeEXT* grade`
+- `float blendSeconds`
+
+### `PFN_remixapi_MixColorGradePresets`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `const char* nameA`
+- `const char* nameB`
+- `float weight`
+
+### `PFN_remixapi_GetColorGrade`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `remixapi_ColorGradeEXT* out`
+
+### `PFN_remixapi_SaveColorGradePreset`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `const char* name`
+- `const remixapi_ColorGradeEXT* grade`
+
+### `PFN_remixapi_ConfigureExternalFrame`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `remixapi_ExternalFrameEXT* frame`
+
 ### `PFN_remixapi_DrawScreenOverlay`
 
 Returns: `remixapi_ErrorCode`
@@ -1157,7 +1632,7 @@ Reordering or inserting in the middle breaks backwards compatibility.
 | `PFN_remixapi_pick_HighlightObjects` | `pick_HighlightObjects` |  |
 | `PFN_remixapi_Startup` | `Startup` |  |
 | `PFN_remixapi_Present` | `Present` |  |
-| `PFN_remixapi_SetCameraMediumMaterial` | `SetCameraMediumMaterial` | Camera-in-medium material. Kept adjacent to Present to mirror the canonical upstream layout (upstream commit 2bac8874 moved it here to fix backwards-compat); fork extension functions are appended below. |
+| `PFN_remixapi_SetCameraMediumMaterial` | `SetCameraMediumMaterial` | Camera-in-medium material. Kept adjacent to Present to mirror the canonical upstream layout for backwards compatibility. Remix Plus extension functions are appended below. |
 | `PFN_remixapi_RegisterCallbacks` | `RegisterCallbacks` | Optional extension functions (present starting in v0.5.1+) |
 | `PFN_remixapi_AutoInstancePersistentLights` | `AutoInstancePersistentLights` |  |
 | `PFN_remixapi_UpdateLightDefinition` | `UpdateLightDefinition` |  |

@@ -459,7 +459,8 @@ uint32_t addGeometry(
   record.modifiedVertexCount = modified.vertexCount;
   record.modifiedIndexCount = modified.indexCount;
   record.numBones = skinning.numBones;
-  record.numBonesPerVertex = skinning.numBonesPerVertex;
+  // API draws leave SkinningData::numBonesPerVertex at 0; the mesh carries the real value.
+  record.numBonesPerVertex = skinning.numBonesPerVertex != 0 ? skinning.numBonesPerVertex : source.numBonesPerVertex;
   record.minBoneIndex = skinning.minBoneIndex;
   record.topology = static_cast<uint32_t>(source.topology);
   record.cullMode = source.cullMode;

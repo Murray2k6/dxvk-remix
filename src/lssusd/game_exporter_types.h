@@ -206,6 +206,8 @@ struct Export {
     std::string exeName;
     std::string iconPath;
     std::string geometryHashRule;
+    // The version of the API asset-key derivation the capture's mesh / material keys follow.
+    std::string assetKeyDerivation;
     double metersPerUnit;
     double timeCodesPerSecond;
     double startTimeCode;

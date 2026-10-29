@@ -66,10 +66,10 @@ void ReadBoneTransform::updateRange(const Rc<DxvkContext>& context, const size_t
     Vector4 rotation(0.0f, 0.0f, 0.0f, 1.0f);
     Vector3 scale(1.0f, 1.0f, 1.0f);
     
-    const PrimInstance* prim = m_batch.resolvePrimTarget(context, i, m_target[i]);
+    const PrimInstance prim = m_batch.resolvePrimTarget(context, i, m_target[i]);
     
-    if (prim != nullptr && prim->getType() == PrimInstance::Type::Instance) {
-      RtInstance* rtInstance = prim->getInstance();
+    if (prim.getType() == PrimInstance::Type::Instance) {
+      RtInstance* rtInstance = prim.getInstance();
       
       if (rtInstance != nullptr) {
         // Get the bone index
@@ -78,7 +78,7 @@ void ReadBoneTransform::updateRange(const Rc<DxvkContext>& context, const size_t
         // Access skinning data from the drawCall via the BLAS input
         BlasEntry* blasEntry = rtInstance->getBlas();
         if (blasEntry != nullptr) {
-          const DrawCallState& drawCall = blasEntry->input;
+          const SceneDraw& drawCall = blasEntry->input;
           const SkinningData& skinningData = drawCall.getSkinningState();
           
           // Check if this drawCall has skinning data and the bone index is valid

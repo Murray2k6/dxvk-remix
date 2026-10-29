@@ -27,6 +27,7 @@
 #include "rtx/utility/packing.slangh"
 #include "rtx/algorithm/resolve.slangh"
 #include "rtx/algorithm/volume_lighting.slangh"
+#include "rtx/algorithm/software_omm.slangh"
 
 static const uint visibilityModeNone = 0;
 static const uint visibilityModeAccurateHitDistance = (1 << 0);        // Return the closest hit and not just any opaque hit
@@ -35,12 +36,48 @@ static const uint visibilityModeDisableCulling = (1 << 2);             // Disabl
 static const uint visibilityModeEnableSubsurfaceMaterials = (1 << 3);  // Enable subsurface materials or skip them
 static const uint visibilityModeEnablePom = (1 << 4);                  // Enable parallax occlusion mapping visibility
 static const uint visibilityModeOpaqueOnly = (1 << 5);                 // Only query visibility for opaque only, no alphatest/blend
+// With visibilityModeAccurateHitDistance, the closest-hit search is only kept while cb.shadowRayFirstHitPrimaryNee is 0.
+// Callers set it when the hit distance matters only for occluded samples that carry no radiance and are read only by NRD,
+// as on the primary NEE shadow ray.
+static const uint visibilityModeAccurateHitDistanceOptional = (1 << 6);
+// The POM self-shadow of an indirect-light query (secondary NEE, the NEE cache, ReSTIR GI). In SCCR mode it is marched
+// coarsely, to rtx.displacement.indirectShadowSteps steps on the ray cone's footprint (sccrIndirectShadowFootprint).
+static const uint visibilityModePomIndirect = (1 << 7);
+
+// Alpha-tests visibility rays at a fixed coarse footprint (rtx.shadowRays.coarseAlphaMip).
+// cb.shadowRayAlphaGradient is 1 / rtx.shadowRays.alphaMipTargetResolution. A UV-space gradient of that length makes
+// the sampler read the mip whose larger side has that many texels, whatever the texture's size. The ray-cone
+// footprint is kept when it is already coarser, and the gradients are made isotropic so no anisotropic taps are spent.
+void visibilityApplyCoarseAlphaFootprint(inout SurfaceInteraction surfaceInteraction)
+{
+  if (cb.shadowRayAlphaGradient > 0.0f)
+  {
+    const float footprint = max(cb.shadowRayAlphaGradient,
+      max(length(surfaceInteraction.textureGradientX), length(surfaceInteraction.textureGradientY)));
+    surfaceInteraction.textureGradientX = vec2(footprint, 0.0f);
+    surfaceInteraction.textureGradientY = vec2(0.0f, footprint);
+  }
+}
 
 // Visibility Helper Functions
+
+#ifdef VISIBILITY_CORE_MATERIAL
+// The cutout candidate from the core material record (integrate_direct_*lean_core and *lean_legacy).
+#include "rtx/algorithm/visibility_core_material.slangh"
+#endif
 
 // Returns the attenuation factor for the surface, i.e. (1.0 - opacity)
 vec3 handleVisibilityVertex<let VisibilityMode : uint>(Ray ray, RayHitInfo rayHitInfo, const bool usePreviousTLAS)
 {
+#ifdef VISIBILITY_CORE_MATERIAL
+  // Without translucent or subsurface handling the candidate only contributes 1 - opacity, which the
+  // core record path computes without the full material records.
+  if ((VisibilityMode & (visibilityModeEnableTranslucentMaterials | visibilityModeEnableSubsurfaceMaterials)) == 0)
+  {
+    return handleVisibilityVertexCore<VisibilityMode>(ray, rayHitInfo, usePreviousTLAS);
+  }
+#endif
+
   RayInteraction rayInteraction = rayInteractionCreate(ray, rayHitInfo);
   
   if (usePreviousTLAS)
@@ -101,6 +138,9 @@ vec3 handleVisibilityVertex<let VisibilityMode : uint>(Ray ray, RayHitInfo rayHi
   if (polymorphicType == surfaceMaterialTypeOpaque)
   {
     const OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial, true);
+
+    // Alpha-test reads use the coarse visibility mip. This does nothing when the option is off.
+    visibilityApplyCoarseAlphaFootprint(surfaceInteraction);
 
     const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
       opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
@@ -264,6 +304,14 @@ struct VisibilityResult {
   bool hasPOMHit;
 };
 
+#ifdef LIGHT_SAMPLING_STATS
+// The per-thread count of visibility ray-query candidates, which the caller resets.
+static uint g_lightSamplingStatsCandidates = 0;
+// The counts of candidates that committed after passing the alpha test, and of candidates that were partially transparent.
+static uint g_lightSamplingStatsAlphaCommits = 0;
+static uint g_lightSamplingStatsPartialHits = 0;
+#endif
+
 VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
   Ray visibilityRay,
   uint8_t rayMask, uint8_t expectedRayPortalIndex, PortalSpace2BitsType rayOriginPortalSpace,
@@ -308,7 +356,11 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
   result.hasOpaqueHit = false;
   result.hasPOMHit = false;
 
-  uint rayFlags = (VisibilityMode & visibilityModeAccurateHitDistance)
+  // An optional closest-hit search is dropped while cb.shadowRayFirstHitPrimaryNee is set, so the query ends at the
+  // first confirmed opaque hit (an opaque or OMM-opaque triangle, or a cutout that passes the alpha test).
+  const bool closestHitSearch = (VisibilityMode & visibilityModeAccurateHitDistance) &&
+    !((VisibilityMode & visibilityModeAccurateHitDistanceOptional) && cb.shadowRayFirstHitPrimaryNee != 0);
+  uint rayFlags = closestHitSearch
     ? RAY_FLAG_NONE
     : RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
 
@@ -344,15 +396,53 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
 
     while (rayQuery.Proceed())
     {
+#ifdef LIGHT_SAMPLING_STATS
+      // Counts the candidate hits the ray query hands back, for statistics only.
+      g_lightSamplingStatsCandidates++;
+#endif
       if ((VisibilityMode & visibilityModeOpaqueOnly) == 0 && rayQuery.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
       {
         RayHitInfo rayHitInfo;
         RAY_HIT_INFO_CREATE_RAY_QUERY_CANDIDATE(rayHitInfo, rayQuery)
 
+        // rtx.alphaBake.softwareOmm. The candidate's software micromap state is acted on as hardware micromaps do.
+        // A transparent micro-triangle is skipped. An opaque one is committed without the alpha test and without changing
+        // the attenuation, and ends the search only in first-hit mode. An unknown one, or a surface without data, takes
+        // the path below. With only the counters on, the state is counted but not used.
+        uint softOmmCandidate = SOFT_OMM_STATE_NONE;
+        if (cb.surfaceSoftOmmTable != 0xFFFFFFFFu)
+        {
+          softOmmCandidate = softOmmCandidateState(rayHitInfo, rayQuery.CandidateTriangleBarycentrics(), usePreviousTLAS);
+          softOmmCountCandidate(softOmmCandidate);
+          if ((cb.softOmmFlags & SOFT_OMM_FLAG_VISIBILITY) == 0u)
+          {
+            softOmmCandidate = SOFT_OMM_STATE_NONE;
+          }
+        }
+        if (softOmmCandidate == SOFT_OMM_STATE_TRANSPARENT)
+        {
+          continue;
+        }
+        if (softOmmCandidate == SOFT_OMM_STATE_OPAQUE)
+        {
+          rayQuery.CommitNonOpaqueTriangleHit();
+          if (!closestHitSearch)
+          {
+            break;
+          }
+          continue;
+        }
+
         vec3 surfaceAttenuation = handleVisibilityVertex<VisibilityMode>(visibilityRay, rayHitInfo, usePreviousTLAS);
 
         vec3 prevAttenuation = result.attenuation;
         result.attenuation *= surfaceAttenuation;
+#ifdef LIGHT_SAMPLING_STATS
+        {
+          const float transmission = calcBt709Luminance(surfaceAttenuation);
+          g_lightSamplingStatsPartialHits += (transmission > 0.0f && transmission < 1.0f) ? 1u : 0u;
+        }
+#endif
 
         // Find an opaque hit
         if ((1.0f - calcBt709Luminance(result.attenuation)) >= cb.resolveOpaquenessThreshold)
@@ -362,6 +452,9 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
           {
             result.attenuation = prevAttenuation;
           }
+#ifdef LIGHT_SAMPLING_STATS
+          g_lightSamplingStatsAlphaCommits++;
+#endif
           rayQuery.CommitNonOpaqueTriangleHit();
           break;
         }
@@ -421,7 +514,8 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
   // ViewModel instances shouldn't occlude anything but ViewModel surfaces and primary rays
   bool hasRayOriginatedFromViewModel = false,
   bool usePreviousTLAS = false,
-  uint primarySurfaceIndex = SURFACE_INDEX_INVALID, float2 texCoords = vec2(0.0f),
+  // SharedTextureCoord in full (sccrSharedTextureCoord), not just the texture coordinates.
+  uint primarySurfaceIndex = SURFACE_INDEX_INVALID, float4 texCoords = vec4(0.0f),
   bool isThinOpaqueSubsurface = false,
   vec3 shadingNormal = vec3(0.0f), bool clearOpaqueHitAttenuation = true)
 {
@@ -486,9 +580,34 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
       {
         OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial, true);
         
-        pomAttenuation = opaqueSurfaceMaterialInteractionCalcHeightThroughput(
-          minimalSurfaceInteraction, visibilityRay.direction, opaqueSurfaceMaterial, texCoords
+        // Indirect-light queries take coarse SCCR self-shadows.
+        const float pomShadowFootprint = (VisibilityMode & visibilityModePomIndirect) != 0 ?
+          sccrIndirectShadowFootprint(coneRadius, texCoords) : kSccrFullShadow;
+        bool hasShellExit;
+        vec3 shellExitPosition;
+        vec3 shellExitNormal;
+        pomAttenuation = opaqueSurfaceMaterialInteractionCalcHeightThroughputShell(
+          minimalSurfaceInteraction, visibilityRay.direction, opaqueSurfaceMaterial, texCoords, pomShadowFootprint,
+          primarySurfaceIndex, hasShellExit, shellExitPosition, shellExitNormal
         );
+
+        // A shell pixel's self-shadow march followed the light ray from the relief point to where it leaves the mesh
+        // surface, so the scene shadow ray starts there, lifted off along that triangle's outward normal. Starting from
+        // the mesh point instead grazes the mesh's own uncarved neighbors near creases and outlines.
+        if (hasShellExit && pomAttenuation > 0.001f)
+        {
+          const vec3 shellOrigin = shellExitPosition + calculateRayOffset(minimalSurfaceInteraction.positionError, shellExitNormal);
+          visibilityRay.tMax = max(visibilityRay.tMax - dot(shellOrigin - visibilityRay.origin, vec3(visibilityRay.direction)), 0.0f);
+          visibilityRay.origin = shellOrigin;
+        }
+
+        // The shell self-shadow debug view shows direct-light queries only.
+        if (cb.debugView == DEBUG_VIEW_SCCR_SHELL_SHADOW && (VisibilityMode & visibilityModePomIndirect) == 0 &&
+            cb.pomMode == DisplacementMode::SCCR)
+        {
+          storeInDebugView(getDispatchRaysIndex().xy,
+                           sccrShellShadowDebugColor(opaqueSurfaceMaterial, primarySurfaceIndex, texCoords, visibilityRay.direction));
+        }
     
         if (pomAttenuation <= 0.001f)
         {
@@ -515,4 +634,26 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
 #endif
 
   return result;
+}
+
+// Takes only the texture coordinates of SharedTextureCoord and passes zero for the rest.
+VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
+  MinimalSurfaceInteraction minimalSurfaceInteraction, float3 targetPosition,
+  uint8_t rayMask, uint8_t expectedRayPortalIndex, PortalSpace2BitsType rayOriginPortalSpace, bool pomOpaqueSurfaceEncountered,
+  float coneRadius, float spreadAngle, float tMaxFactor,
+  bool hasRayOriginatedFromViewModel,
+  bool usePreviousTLAS,
+  uint primarySurfaceIndex, float2 texCoords,
+  bool isThinOpaqueSubsurface = false,
+  vec3 shadingNormal = vec3(0.0f), bool clearOpaqueHitAttenuation = true)
+{
+  return traceVisibilityRay<VisibilityMode>(
+    minimalSurfaceInteraction, targetPosition,
+    rayMask, expectedRayPortalIndex, rayOriginPortalSpace, pomOpaqueSurfaceEncountered,
+    coneRadius, spreadAngle, tMaxFactor,
+    hasRayOriginatedFromViewModel,
+    usePreviousTLAS,
+    primarySurfaceIndex, float4(texCoords, 0.0f, 0.0f),
+    isThinOpaqueSubsurface,
+    shadingNormal, clearOpaqueHitAttenuation);
 }

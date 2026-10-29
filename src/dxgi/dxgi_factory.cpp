@@ -5,7 +5,9 @@
 namespace dxvk {
 
   DxgiFactory::DxgiFactory(UINT Flags)
-  : m_instance    (new DxvkInstance()),
+  // NV-DXVK start: Share the instance across unified frontends
+  : m_instance    (DxvkInstance::getSharedInstance()),
+  // NV-DXVK end
     m_monitorInfo (this),
     m_options     (m_instance->config()),
     m_flags       (Flags) {

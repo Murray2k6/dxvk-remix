@@ -207,6 +207,7 @@ namespace dxvk {
 
 
   void D3D9VertexDecl::Classify() {
+    m_remixElementsHash = m_elements.empty() ? 0 : XXH3_64bits(m_elements.data(), m_elements.size() * sizeof(D3DVERTEXELEMENT9));
     for (const auto& element : m_elements) {
       if (element.Stream == 0 && element.Type != D3DDECLTYPE_UNUSED)
         m_size = std::max(m_size, element.Offset + GetDecltypeSize(D3DDECLTYPE(element.Type)));

@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -25,8 +25,6 @@
 
 #include "dxvk_device.h"
 #include "dxvk_context.h"
-#include "../d3d9/d3d9_state.h"
-#include "../d3d9/d3d9_spec_constants.h"
 
 // NV-DXVK start: FSR FG integration
 #include "rtx_render/rtx_fork_hooks.h"
@@ -2232,33 +2230,18 @@ namespace dxvk {
       DxvkRenderTargets attachments;
       DxvkRenderPassOps ops;
 
-      VkPipelineStageFlags clearStages = 0;
-      VkAccessFlags        clearAccess = 0;
-      
       if ((clearAspects | discardAspects) & VK_IMAGE_ASPECT_COLOR_BIT) {
-        clearStages |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        clearAccess |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
         attachments.color[0].view = imageView;
         attachments.color[0].layout = imageView->pickLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
         ops.colorOps[0] = colorOp;
       }
       else {
-        clearStages |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
-          | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        clearAccess |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-
         attachments.depth.view = imageView;
         attachments.depth.layout = imageView->pickLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 
         ops.depthOps = depthOp;
       }
-
-      ops.barrier.srcStages = clearStages;
-      ops.barrier.srcAccess = clearAccess;
-      ops.barrier.dstStages = imageView->imageInfo().stages;
-      ops.barrier.dstAccess = imageView->imageInfo().access;
 
       this->renderPassBindFramebuffer(makeFramebufferInfo(attachments), ops, 1, &clearValue);
       this->renderPassUnbindFramebuffer();
@@ -2910,9 +2893,6 @@ namespace dxvk {
     uint32_t            index,
     uint32_t            value) {
     ScopedCpuProfileZone();
-    // NV-DXVK start: terrain baking
-    static_assert(D3D9SpecConstantId::Count <= DxvkLimits::MaxNumSpecConstants);
-    // NV-DXVK end
     auto& specConst =
       pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
       ? m_state.gp.state.sc.specConstants[index]
@@ -2922,6 +2902,38 @@ namespace dxvk {
 
     if (specConst != value) {
       specConst = value;
+
+      m_flags.set(
+        pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
+        ? DxvkContextFlag::GpDirtyPipelineState
+        : pipeline == VK_PIPELINE_BIND_POINT_COMPUTE
+          ? DxvkContextFlag::CpDirtyPipelineState
+          : DxvkContextFlag::RpDirtyPipelineState);
+    }
+  }
+
+
+  const DxvkScInfo& DxvkContext::getSpecConstantsInfo(VkPipelineBindPoint pipeline) const {
+    return
+      pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
+      ? m_state.gp.state.sc
+      : pipeline == VK_PIPELINE_BIND_POINT_COMPUTE
+      ? m_state.cp.state.sc
+      : m_state.rp.state.sc;
+  }
+
+  void DxvkContext::setSpecConstantsInfo(
+    VkPipelineBindPoint pipeline,
+    const DxvkScInfo& newSpecConstantInfo) {
+    DxvkScInfo& specConstantInfo =
+      pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
+      ? m_state.gp.state.sc
+      : pipeline == VK_PIPELINE_BIND_POINT_COMPUTE
+      ? m_state.cp.state.sc
+      : m_state.rp.state.sc;
+
+    if (specConstantInfo != newSpecConstantInfo) {
+      specConstantInfo = newSpecConstantInfo;
 
       m_flags.set(
         pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
@@ -3489,14 +3501,7 @@ namespace dxvk {
       DxvkRenderTargets attachments;
       DxvkRenderPassOps ops;
 
-      VkPipelineStageFlags clearStages = 0;
-      VkAccessFlags        clearAccess = 0;
-
       if (imageView->info().aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
-        clearStages |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        clearAccess |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
-          | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-
         attachments.color[0].view = imageView;
         attachments.color[0].layout = imageView->pickLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
@@ -3505,11 +3510,6 @@ namespace dxvk {
         ops.colorOps[0].storeLayout = imageView->imageInfo().layout;
       }
       else {
-        clearStages |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
-          | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        clearAccess |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
-          | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-
         attachments.depth.view = imageView;
         attachments.depth.layout = imageView->pickLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 
@@ -3518,11 +3518,6 @@ namespace dxvk {
         ops.depthOps.loadLayout = imageView->imageInfo().layout;
         ops.depthOps.storeLayout = imageView->imageInfo().layout;
       }
-
-      ops.barrier.srcStages = clearStages;
-      ops.barrier.srcAccess = clearAccess;
-      ops.barrier.dstStages = imageView->imageInfo().stages;
-      ops.barrier.dstAccess = imageView->imageInfo().access;
 
       // We cannot leverage render pass clears
       // because we clear only part of the view
@@ -4445,17 +4440,11 @@ namespace dxvk {
     const DxvkRenderTargets&    renderTargets,
           DxvkRenderPassOps&    renderPassOps) {
     ScopedCpuProfileZone();
-    VkAccessFlags access = 0;
 
     if (renderTargets.depth.view != nullptr) {
       renderPassOps.depthOps = DxvkDepthAttachmentOps {
         VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_LOAD_OP_LOAD,
         renderTargets.depth.layout, renderTargets.depth.layout };
-
-      access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-
-      if (renderTargets.depth.layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
-        access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     } else {
       renderPassOps.depthOps = DxvkDepthAttachmentOps { };
     }
@@ -4466,18 +4455,10 @@ namespace dxvk {
             VK_ATTACHMENT_LOAD_OP_LOAD,
             renderTargets.color[i].layout,
             renderTargets.color[i].layout };
-
-        access |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
-               |  VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
       } else {
         renderPassOps.colorOps[i] = DxvkColorAttachmentOps { };
       }
     }
-
-    renderPassOps.barrier.srcStages = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
-    renderPassOps.barrier.srcAccess = access;
-    renderPassOps.barrier.dstStages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    renderPassOps.barrier.dstAccess = access;
   }
 
 
@@ -5949,7 +5930,16 @@ namespace dxvk {
       m_cmd->trackDescriptorPool(std::move(m_descPool));
 
       m_descPool = m_device->createDescriptorPool();
-      set = m_descPool->alloc(layout, name);
+      VkResult vr = VK_SUCCESS;
+      set = m_descPool->alloc(layout, name, &vr);
+
+      // A null set handed to the driver crashes inside it, so a refused set stops here with the driver's reason.
+      if (set == VK_NULL_HANDLE) {
+        const std::string message = str::format("DxvkContext: a fresh descriptor pool refused a descriptor set for ",
+                                                name != nullptr ? name : "an internal pass", " (VkResult ", int32_t(vr), ")");
+        Logger::err(message);
+        throw DxvkError(std::string(message));
+      }
     }
 
     return set;
@@ -5980,6 +5970,45 @@ namespace dxvk {
     m_cmd->addStatCtr(DxvkStatCounter::CmdTraceRaysCalls, 1);
   }
 
+  // NV-DXVK start: Indirect ray dispatch support
+  void DxvkContext::traceRaysIndirect(const Rc<DxvkBuffer>& argBuffer, VkDeviceSize argOffset) {
+    ScopedCpuProfileZone();
+    auto argSlice = argBuffer->getSliceHandle(argOffset, sizeof(VkTraceRaysIndirectCommandKHR));
+
+    if (m_execBarriers.isBufferDirty(argSlice, DxvkAccess::Read)) {
+      m_execBarriers.recordCommands(m_cmd);
+    }
+
+    if (this->commitRaytracingState()) {
+      this->commitRaytracingInitBarriers();
+
+      m_cmd->trackResource<DxvkAccess::Read>(argBuffer);
+
+      m_queryManager.beginQueries(m_cmd,
+        VK_QUERY_TYPE_PIPELINE_STATISTICS);
+
+      m_cmd->cmdTraceRaysIndirectKHR(
+        &m_state.rp.pipeline->m_raygenShaderBindingTable,
+        &m_state.rp.pipeline->m_missShaderBindingTable,
+        &m_state.rp.pipeline->m_hitShaderBindingTable,
+        &m_state.rp.pipeline->m_callableShaderBindingTable,
+        argBuffer->getDeviceAddress() + argOffset);
+
+      m_queryManager.endQueries(m_cmd,
+        VK_QUERY_TYPE_PIPELINE_STATISTICS);
+
+      this->commitRaytracingPostBarriers();
+
+      m_execBarriers.accessBuffer(argSlice,
+        VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+        VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+        argBuffer->info().stages,
+        argBuffer->info().access);
+    }
+
+    m_cmd->addStatCtr(DxvkStatCounter::CmdTraceRaysCalls, 1);
+  }
+  // NV-DXVK end
 
   void DxvkContext::trackDrawBuffer() {
     ScopedCpuProfileZone();

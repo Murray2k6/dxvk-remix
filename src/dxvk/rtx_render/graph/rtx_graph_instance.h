@@ -27,11 +27,29 @@
 
 namespace dxvk {
 class GraphManager;
+class RetainedScene;
+
+// The owner of a graph instance that belongs to a scene-owned object (a RetainedScene entry) instead of a
+// ReplacementInstance. It maps each prim index of the mesh replacement to what the entry has for it, and resolves a
+// mesh prim through the scene at every call, so a rebuild of the entry is followed without notice.
+struct ScenePrimOwner {
+  struct Slot {
+    PrimInstance::Type type = PrimInstance::Type::None;
+    uint32_t submesh = 0;       // Instance: the entry's submesh
+    RtLight* light = nullptr;   // Light: the entry's light, owned by the entry
+  };
+  const RetainedScene* scene = nullptr;
+  uint64_t handle = 0;          // 0 = the graph instance has no scene owner
+  std::vector<Slot> slots;      // by prim index of the replacement
+
+  // Returns an empty PrimInstance when the index is out of range or the entry has no instance for it.
+  PrimInstance resolve(uint32_t primIndex) const;
+};
 
 class GraphInstance {
 public:
-  GraphInstance(GraphManager* graphManager, const XXH64_hash_t graphHash, const size_t batchIndex, const uint64_t id, const RtGraphState& initialGraphState)
-    : m_graphManager(graphManager), m_graphHash(graphHash), m_batchIndex(batchIndex), m_id(id), m_initialGraphState(&initialGraphState) {
+  GraphInstance(GraphManager* graphManager, const XXH64_hash_t graphHash, const size_t batchIndex, const uint64_t id, std::shared_ptr<const RtGraphState> initialGraphState)
+    : m_graphManager(graphManager), m_graphHash(graphHash), m_batchIndex(batchIndex), m_id(id), m_initialGraphState(std::move(initialGraphState)) {
   }
 
   GraphInstance(const GraphInstance& other) = delete;
@@ -64,6 +82,14 @@ public:
     return m_primInstanceOwner;
   }
 
+  // Set before the instance's first update (GraphManager::addInstance), and never together with a ReplacementInstance.
+  const ScenePrimOwner& getSceneOwner() const {
+    return m_sceneOwner;
+  }
+  void setSceneOwner(ScenePrimOwner owner) {
+    m_sceneOwner = std::move(owner);
+  }
+
   const RtGraphState& getInitialGraphState() const {
     assert(m_initialGraphState != nullptr && "Initial Graph State not initialized");
     return *m_initialGraphState;
@@ -72,9 +98,11 @@ public:
 private:
   GraphManager* m_graphManager;
   PrimInstanceOwner m_primInstanceOwner;
-  // RtGraphState is owned by ReplacementManager, and should only be invalidated when assets are reloaded,
-  // which should clear the scene and delete all graphs.
-  const RtGraphState* m_initialGraphState;
+  ScenePrimOwner m_sceneOwner;
+  // Keeps the RtGraphState alive past the source AssetReplacement's lifetime: graphManager.update()
+  // runs before invalidateChangedReplacements in the same frame-end, so the instance may still
+  // be accessed while its bucket is being retired.
+  std::shared_ptr<const RtGraphState> m_initialGraphState;
 
   // Hash of the batch this instance is in.
   const XXH64_hash_t m_graphHash;

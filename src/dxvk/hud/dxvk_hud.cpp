@@ -2,6 +2,7 @@
 
 #include "dxvk_hud.h"
 #include "dxvk_scoped_annotation.h"
+#include "../rtx_render/rtx_options.h"
 
 namespace dxvk::hud {
   
@@ -50,6 +51,10 @@ namespace dxvk::hud {
     addItem<HudCompilerActivityItem>("compiler", -1, device);
     addItem<HudRtxActivityItem>("rtx", -1, device);
     addItem<HudScrollingLineItem>("line", -1);
+
+    // A configuration that selected no item starts with the HUD hidden; the toggle shows the fallback set.
+    if (m_hudItems.selectsNothing() && RtxOptions::showDxvkHudObject().isDefault())
+      RtxOptions::showDxvkHud.setDeferred(false);
   }
   
   
@@ -67,6 +72,8 @@ namespace dxvk::hud {
     const Rc<DxvkContext>&  ctx,
           VkSurfaceFormatKHR surfaceFormat,
           VkExtent2D        surfaceSize) {
+    if (!RtxOptions::showDxvkHud())
+      return;
     ScopedGpuProfileZone(ctx, "Render DXVK HUD");
     this->setupRendererState(ctx, surfaceFormat, surfaceSize);    
     this->renderHudElements(ctx);

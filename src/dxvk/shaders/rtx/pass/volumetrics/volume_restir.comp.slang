@@ -29,7 +29,6 @@
 //!variant volume_restir_spatial_resampling.comp
 //!>       VOLUME_RESTIR_MODE=SPATIAL_REUSE
 
-// Atmosphere variants
 
 
 //!end-variants

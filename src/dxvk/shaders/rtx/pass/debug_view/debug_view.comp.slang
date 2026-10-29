@@ -85,37 +85,7 @@ Texture2D<uint> Instrumentation;
 [[vk::binding(DEBUG_VIEW_BINDING_TERRAIN_INPUT)]]
 Texture2D<float4> TerrainTexture;
 
-// Fork: cloud-occluded sky-ambient transmittance LUT (32x16 R16F).
-// Visualized by DEBUG_VIEW_CLOUD_SKY_TRANSMITTANCE_LUT.
-[[vk::binding(DEBUG_VIEW_BINDING_CLOUD_SKY_TRANSMITTANCE_LUT_INPUT)]]
-Texture2D<float> CloudSkyTransmittanceLut;
 
-// Fork: Nubis Cubed sun-direction optical-depth voxel grid (R16F 3D).
-// Visualized by DEBUG_VIEW_CLOUD_D_SUN.
-[[vk::binding(DEBUG_VIEW_BINDING_CLOUD_D_SUN_INPUT)]]
-Texture3D<float> DebugViewCloudDSun;
-
-// Fork: Nubis Cubed zenith optical-depth voxel grid (R16F 3D).
-// Visualized by DEBUG_VIEW_CLOUD_D_AMBIENT.
-[[vk::binding(DEBUG_VIEW_BINDING_CLOUD_D_AMBIENT_INPUT)]]
-Texture3D<float> DebugViewCloudDAmbient;
-
-// Fork: Nubis Cubed screen-space cloud render RT (RGBA16F, premultiplied
-// radiance in rgb + cloud transmittance in alpha). Visualized by
-// DEBUG_VIEW_CLOUD_RENDER_RT (enum 876).
-[[vk::binding(DEBUG_VIEW_BINDING_CLOUD_RENDER_RT_INPUT)]]
-Texture2D<float4> DebugViewCloudRenderRT;
-
-// Fork: cloud NVDF body SDF (Nubis3 conversion Phase A; R16F 3D, signed km,
-// negative inside, texture y = VERTICAL — see cloud_nvdf.h). Visualized by
-// DEBUG_VIEW_CLOUD_NVDF_SDF (enum 879).
-[[vk::binding(DEBUG_VIEW_BINDING_CLOUD_NVDF_SDF_INPUT)]]
-Texture3D<float> DebugViewCloudNvdfSdf;
-
-// Fork: the post-denoise cumulus shadow factor texture and its debug view
-// (enum 878) were removed 2026-06-19 with the screen-space cloud-shadow system.
-// The cloud shadow now folds onto the sun radiance in the NEE; enum 875/877
-// read the D_sun grid directly for cloud-on-terrain shadow diagnostics.
 
 [[vk::binding(DEBUG_VIEW_BINDING_VOLUME_RESERVOIRS_INPUT)]]
 Texture3D<uint4> VolumeReservoirs;
@@ -181,14 +151,6 @@ SamplerState LinearSampler;
 #include "rtx/utility/noise.slangh"
 #include "rtx/external/NRD.slangh"
 
-// Fork: atmosphere helpers for cloud-diagnostic debug views (enum 875).
-// Pulled in WITHOUT defining ATMOSPHERE_AVAILABLE — the helpers we need
-// (sampleCloudGroundShadow_OptionB_explicit) take their D_sun texture +
-// sampler as explicit parameters, so they don't rely on common-bindings
-// globals. The ATMOSPHERE_AVAILABLE-gated sampleDSun / sampleDAmbient
-// fall back to safe no-op stubs in this translation unit, which is
-// correct — the enum-875 case uses the explicit-parameter variant.
-#include "rtx/pass/atmosphere/atmosphere_common.slangh"
 
 float4 sampleTexture(Texture2D<float4> texture, ivec2 threadId)
 {
@@ -398,237 +360,6 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
   case DEBUG_VIEW_TERRAIN_MAP_OPACITY:
     value = vec4(sampleTexture(TerrainTexture, threadId).aaa, 1);
     break;
-  case DEBUG_VIEW_CLOUD_SKY_TRANSMITTANCE_LUT:
-    {
-      // Stretch the 32x16 LUT to fill the screen via linear sampling.
-      // Heatmap: black = clear sky (transmittance 1.0), red = full cloud
-      // occlusion (transmittance 0.0). X axis = azimuth, Y axis = elevation.
-      const vec2 uv = (vec2(threadId) + 0.5f) / vec2(cb.debugViewResolution);
-      const float trans = CloudSkyTransmittanceLut.SampleLevel(LinearSampler, uv, 0).r;
-      const float occlusion = saturate(1.0f - trans);
-      value = vec4(occlusion, 0.0f, 0.0f, 1.0f);
-    }
-    break;
-  case DEBUG_VIEW_CLOUD_D_SUN:
-    {
-      // Sample the Nubis Cubed D_sun voxel grid at the mid-Z slice (w = 0.5);
-      // map pixel UV directly to the horizontal grid UV. Grayscale: bright =
-      // high sun-direction optical depth (deep cloud cover above this voxel),
-      // dark = clear sky between voxel and sun. Cumulus cells should be
-      // visible as cellular patterns.
-      const vec2 uv = (vec2(threadId) + 0.5f) / vec2(cb.debugViewResolution);
-      const vec3 uvw = vec3(uv, 0.5f);
-      const float opticalDepth = DebugViewCloudDSun.SampleLevel(LinearSampler, uvw, 0).r;
-      // Scale for visibility: typical optical depth in cumulus is 0..5.
-      const float intensity = saturate(opticalDepth * 0.2f);
-      value = vec4(intensity, intensity, intensity, 1.0f);
-    }
-    break;
-  case DEBUG_VIEW_CLOUD_D_AMBIENT:
-    {
-      // Sample the Nubis Cubed D_ambient (zenith) voxel grid at the mid-Z
-      // slice. Mostly uniform brightness expected: the zenith path is mostly
-      // empty air above the cloud slab. Some banding where the slab is dense.
-      const vec2 uv = (vec2(threadId) + 0.5f) / vec2(cb.debugViewResolution);
-      const vec3 uvw = vec3(uv, 0.5f);
-      const float opticalDepth = DebugViewCloudDAmbient.SampleLevel(LinearSampler, uvw, 0).r;
-      const float intensity = saturate(opticalDepth * 0.2f);
-      value = vec4(intensity, intensity, intensity, 1.0f);
-    }
-    break;
-  case DEBUG_VIEW_CLOUD_NVDF_SDF:
-    {
-      // Horizontal slice of the cloud NVDF body SDF (fork — Nubis3 Phase A).
-      // Screen X -> tile U (world X), screen Y -> tile W (world Z); the slice
-      // sits at height fraction 0.25 (lower quartile — where cloud bases and
-      // the fattest body cross-sections live). The SDF stores raw signed km,
-      // negative inside.
-      //   Inside:  warm ramp (deep core = bright red/orange)
-      //   Outside: cool ramp (far clear sky = dark blue)
-      //   |sdf| < ~half a voxel: green band — the zero-crossing iso-line.
-      // Validation: bodies read as smooth blobby cells, the green line traces
-      // their outlines with no speckle, and the pattern must be seamless
-      // across the tile wrap (the slice shows exactly one tile period).
-      const vec2 uv = (vec2(threadId) + 0.5f) / vec2(cb.debugViewResolution);
-      const vec3 uvw = vec3(uv.x, 0.25f, uv.y);
-      const float sdfKm = DebugViewCloudNvdfSdf.SampleLevel(LinearSampler, uvw, 0).r;
-      // Half-voxel band at the default 12 km tile: ~23 m.
-      const float kIsoBandKm = 0.025f;
-      // Visualization ranges: inside distances saturate at ~1.5 km (deep
-      // cumulus core), outside at ~4 km (typical inter-cluster gap).
-      if (abs(sdfKm) < kIsoBandKm) {
-        value = vec4(0.0f, 1.0f, 0.0f, 1.0f);
-      } else if (sdfKm < 0.0f) {
-        const float t = saturate(-sdfKm / 1.5f);
-        value = vec4(0.3f + 0.7f * t, 0.3f * t, 0.0f, 1.0f);
-      } else {
-        const float t = saturate(sdfKm / 4.0f);
-        value = vec4(0.0f, 0.1f * (1.0f - t), 0.15f + 0.55f * (1.0f - t), 1.0f);
-      }
-    }
-    break;
-  case DEBUG_VIEW_CLOUD_GROUND_SHADOW_PRODSHAPE:
-    {
-      // Production-call-shape diagnostic for sampleCloudGroundShadow_OptionB.
-      // This case calls the helper with the EXACT per-pixel call shape that
-      // the upcoming NEE wiring (Task 6) will use: worldPos from the
-      // G-buffer hit position, sunDir from atmosphereArgs.sunDirection,
-      // and cb.isZUp != 0u for the coordinate-frame flag. The D_sun
-      // texture and its sampler are plumbing parameters (the same pointer
-      // for every pixel) — they are passed explicitly because the debug
-      // view binds D_sun at a different slot from the production global,
-      // but the call shape that varies per pixel (worldPos, sunDir, args,
-      // isZUp) is identical to what production will use.
-      //
-      // Visual gate: compare against DEBUG_VIEW_CLOUD_D_SUN (enum 873) at
-      // the same scene. If the cumulus patterns spatially agree, the
-      // isZUp handling is correct. If they disagree, isZUp is mismatched
-      // between the debug call path and the production call path — fix
-      // before wiring NEE.
-
-      // G-buffer worldPos at this pixel — same source the production NEE
-      // entry points use (minimalSurfaceInteraction.position).
-      GBufferMemoryMinimalSurfaceInteraction memory;
-      memory.encodedWorldPositionWorldTriangleTBN =
-          PreviousWorldPosition_WorldTriangleNormal[threadId];
-      memory.positionError = 0;
-      const MinimalSurfaceInteraction si = minimalSurfaceInteractionCreate(memory);
-      const vec3 worldPos = si.position;
-
-      // Sun direction. CRITICAL FRAME NOTE: cb.atmosphereArgs.sunDirection
-      // is stored in CANONICAL Y-UP space (rtx_atmosphere.cpp:321-323:
-      // sunDirection.y = sin(elevation)). Production NEE at
-      // sampleAtmosphereSunLight pre-swaps Y-up → Z-up caller frame
-      // (atmosphere_common.slangh:941) BEFORE calling the helper, which
-      // re-swaps back to Y-up via its isZUp flag. Pre-swap to match;
-      // skipping this was the cause of this case painting solid-white
-      // in-game (helper bailed at slab-bottom intersect because a Y-up
-      // vector was being treated as Z-up and double-swapped).
-      const bool isZUpFlag = (cb.isZUp != 0u);
-      // atmosphereYUpToWorld undoes the up flip before the axis swap, which is the order the
-      // CPU-side toWorld() in syncDistantLights uses and the only one that is correct - the two do
-      // not commute. Shared rather than re-derived on purpose: this case exists to mirror
-      // production, so a private copy of the conversion is the one thing it must not have.
-      const vec3 sunDirCallerFrame = atmosphereYUpToWorld(
-          cb.atmosphereArgs.sunDirection, isZUpFlag, cb.atmosphereArgs.flipUpAxis != 0);
-      const vec3 sunDir = normalize(sunDirCallerFrame);
-
-      // CRITICAL: match production NEE call shape exactly.
-      //   (worldPos, sunDir, atmosphereArgs, isZUp != 0u)
-      // Any divergence here defeats the purpose of the diagnostic.
-      const float shadow = sampleCloudGroundShadow_OptionB_explicit(
-          worldPos, sunDir, cb.atmosphereArgs, isZUpFlag,
-          DebugViewCloudDSun, LinearSampler);
-
-      value = vec4(shadow, shadow, shadow, 1.0f);
-    }
-    break;
-  case DEBUG_VIEW_CLOUD_RENDER_RT:
-    {
-      // Fork diagnostic. Visualizes the Nubis Cubed cloud render RT
-      // produced by cloud_render.comp.slang (C4 of the 2026-05-12
-      // workstream). The RT is at downscale extent; map pixel UV directly
-      // to the texture via Load. Premultiplied radiance is shown as-is;
-      // alpha (cloud transmittance) is ignored for the debug case — what
-      // matters here is the per-pixel cloud color from the Nubis Cubed
-      // lighting equations (top-bright / bottom-dark cumulus gradient,
-      // silver lining at backlit edges, less-flat shadow side).
-      //
-      // Compare against the live sky (debug view off) to inspect the raw
-      // cloud-render output before compositing. The cloud-render RT value is
-      // the same scene as the live sky's cloud layer minus the sky-miss
-      // composite.
-      vec4 cloudSample = DebugViewCloudRenderRT.Load(int3(threadId, 0));
-      value = vec4(cloudSample.rgb, 1.0f);
-    }
-    break;
-  case DEBUG_VIEW_CLOUD_GROUND_SHADOW_RAW_OD:
-    {
-      // Fork diagnostic (2026-05-17). Sibling of enum 875 — same per-pixel
-      // call shape (G-buffer worldPos + atmosphereArgs.sunDirection + cb.isZUp)
-      // but the math stops at the dSunTex.SampleLevel call. NO exp(), NO mix.
-      // Exists because 875 paints solid white in-game, and the post-exp/mix
-      // collapse hides which of {OD~=0, cloudShadowStrength=0, sun below horizon,
-      // surface above slab} is responsible. RGB encodes three independent
-      // signals so one screenshot answers the question.
-      //
-      // Discrimination key (compare on flat terrain at midday):
-      //   R uniform + B uniform        → scene-scale: every pixel reads same UVW
-      //                                  (fix cloudVoxelGridExtentKm or
-      //                                  worldPosKm → UVW conversion)
-      //   R patterned, matches 873     → consumer works; exp/mix is killing it
-      //                                  (raise cloudShadowMarchStrength or
-      //                                  the bake's OD scale)
-      //   R patterned but unrelated    → world-anchoring / slab-bottom bug
-      //                                  (probe intersectCloudSlabBottomFromBelow
-      //                                  and cloudVoxelWorldToUVW)
-      //   R dark, G even darker        → magnitude underflow: bake OD tiny
-      //
-      // Math is duplicated (not refactored from sampleCloudGroundShadow_OptionB_impl)
-      // so the diagnostic carries zero risk to the production helper it inspects.
-
-      // G-buffer worldPos at this pixel — same source the production NEE
-      // entry points use (minimalSurfaceInteraction.position).
-      GBufferMemoryMinimalSurfaceInteraction memory;
-      memory.encodedWorldPositionWorldTriangleTBN =
-          PreviousWorldPosition_WorldTriangleNormal[threadId];
-      memory.positionError = 0;
-      const MinimalSurfaceInteraction si = minimalSurfaceInteractionCreate(memory);
-      const vec3 worldPos = si.position;
-
-      // Sun direction sourced from the atmosphere CB. CRITICAL FRAME NOTE:
-      // args.sunDirection is stored in CANONICAL Y-UP space
-      // (rtx_atmosphere.cpp:321-323: sunDirection.y = sin(elevation)). The
-      // production NEE call at sampleAtmosphereSunLight pre-swaps Y-up →
-      // Z-up caller frame (line 941) BEFORE passing it to the helper, which
-      // then re-swaps back to Y-up via its isZUp flag. We skip that
-      // round-trip here: sunDir is consumed in Y-up directly, so the
-      // isZUp swap below applies to worldPos ONLY. Mishandling this was
-      // the cause of enum 875 painting solid-white in-game (helper bailed
-      // at the slab-bottom intersection because a Y-up vector was being
-      // re-interpreted as Z-up and double-swapped).
-      const bool isZUpFlag = (cb.isZUp != 0u);
-      const vec3 sunDirYUp = normalize(cb.atmosphereArgs.sunDirection);
-
-      // Replicates sampleCloudGroundShadow_OptionB_impl up through the
-      // dSunTex.SampleLevel call. worldPos comes from the G-buffer in
-      // caller's frame; swap to Y-up only if engine is Z-up.
-      const vec3 worldPosYUp =
-          worldToAtmosphereYUp(worldPos, isZUpFlag, cb.atmosphereArgs.flipUpAxis != 0);
-      const float kmPerWorldUnit = 1.0f / max(cb.atmosphereArgs.worldUnitsPerKm, 1e-6f);
-      const vec3 worldPosKm = worldPosYUp * kmPerWorldUnit;
-      const float slabTopY = cb.atmosphereArgs.cloudAltitude
-                            + cb.atmosphereArgs.cloudVoxelGridVerticalKm;
-
-      vec3 outColor;
-      if (worldPosKm.y > slabTopY) {
-        // Surface above slab — paint magenta so this branch is visually
-        // distinct from "lookup ran but returned ~zero."
-        outColor = vec3(1.0f, 0.0f, 1.0f);
-      } else {
-        float tToEntry;
-        const bool reached = intersectCloudSlabBottomFromBelow(
-            worldPosKm, sunDirYUp, cb.atmosphereArgs, tToEntry);
-        if (!reached) {
-          // Sun below horizon or otherwise unreachable — paint blue.
-          outColor = vec3(0.0f, 0.0f, 1.0f);
-        } else {
-          const vec3 cloudEntryPosKm = worldPosKm + tToEntry * sunDirYUp;
-          const vec3 uvw = cloudVoxelWorldToUVW(cloudEntryPosKm,
-                                                 cb.atmosphereArgs,
-                                                 /*isZUp=*/false);
-          const float opticalDepth = DebugViewCloudDSun.SampleLevel(LinearSampler, uvw, 0).r;
-          outColor.r = saturate(opticalDepth * 0.2f);
-          outColor.g = saturate(opticalDepth);
-          outColor.b = uvw.x;
-        }
-      }
-      value = vec4(outColor, 1.0f);
-    }
-    break;
-  // DEBUG_VIEW_CLOUD_SHADOW_FACTOR_RAW (enum 878) removed 2026-06-19 with the
-  // screen-space cloud-shadow system. Use enum 875/877 (D_sun grid reads) for
-  // cloud-on-terrain shadow diagnostics.
   case DEBUG_VIEW_NRC_UPDATE_RADIANCE:
   case DEBUG_VIEW_NRC_UPDATE_THROUGHPUT:
   case DEBUG_VIEW_NRC_UPDATE_RADIANCE_MULTIPLIED_BY_THROUGHPUT:
@@ -639,33 +370,6 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
     value = DebugView[Nrc::calculateTrainingPixelCoordinate(threadId, cb.nrcArgs)];
     break;
 
-  case DEBUG_VIEW_EXPOSURE_HISTOGRAM:
-    // Show histogram or weight as a bar across the top on the screen, technically not safe, but the first handful of threads should be fine.
-    if (threadId.y < 32 && threadId.x < cb.debugViewResolution.x * 0.5)
-    {
-      const uint histogramBucket = (float(threadId.x) / (cb.debugViewResolution.x * 0.5)) * 256;
-      vec4 histogramOrWeight = DebugView[uint2(histogramBucket, 0)];
-      if (threadId.y < 16)
-      {
-        // Show weight
-        value = float4(0,histogramOrWeight.yz,0);
-      }
-      else
-      {
-        // Show weighted histogram
-        value = histogramOrWeight.y > 0 ? float4(0,1,0,0) : histogramOrWeight.xxxx;
-      }
-      
-      if (histogramBucket == 0 && value.x > 0)
-      {
-        value = float4(1, 0, 0, 0); // Red, we have pixels that are in the ignore bucket.
-      }
-    }
-    else
-    {
-      value = RenderOutput[upscaledPixelCoordinate];
-    }
-    break;
   case DEBUG_VIEW_INSTRUMENTATION_THREAD_DIVERGENCE:
     value = float4(Instrumentation[threadId], 0, 0, 0);
     break;
@@ -858,9 +562,6 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
     // DEBUG_VIEW_NRC_UPDATE_NUMBER_OF_BOUNCES
     // DEBUG_VIEW_NRC_UPDATE_NUMBER_OF_PATH_SEGMENTS
     // DEBUG_VIEW_NRC_UPDATE_NUMBER_OF_INDIRECT_PATH_SEGMENTS
-
-    // Skipped
-    // DEBUG_VIEW_EXPOSURE_HISTOGRAM
 
     // DEBUG_VIEW_INSTRUMENTATION_THREAD_DIVERGENCE
     isValid &= isValidValue(Instrumentation[threadId]);

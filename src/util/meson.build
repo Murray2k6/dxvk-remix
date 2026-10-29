@@ -1,4 +1,6 @@
 util_src = files([
+  'util_aftermath.cpp',
+  'util_aftermath.h',
   'util_env.cpp',
   'util_string.cpp',
   'util_fps_limiter.cpp',
@@ -11,8 +13,6 @@ util_src = files([
   'util_sentry.cpp',
 
   'thread.cpp',
-  
-  'util_shared_res.cpp',
   
   'com/com_guid.cpp',
   'com/com_private_data.cpp',
@@ -54,24 +54,26 @@ util_src = files([
 
   'util_crash_report.h',
 
+  'util_frame_pacer.h',
+
   'util_threadpool.h',
+  'util_stress.cpp',
+  'util_stress.h',
   'util_atomic_queue.h',
 
   'util_renderprocessor.h',
   
   'util_version.h',
 
-  'util_watchdog.h',
-  
   'util_global_time.cpp',
   'util_global_time.h',
 ])
 
 util_lib = static_library('util', util_src,
-  dependencies        : [ sentry_dep ],
+  dependencies        : [ sentry_dep, aftermath_dep ],
   include_directories : [ dxvk_include_path ],
   override_options    : ['cpp_std='+dxvk_cpp_std])
 
 util_dep = declare_dependency(
   link_with           : [ util_lib ],
-  dependencies        : [ sentry_dep ])
+  dependencies        : [ sentry_dep, aftermath_dep ])

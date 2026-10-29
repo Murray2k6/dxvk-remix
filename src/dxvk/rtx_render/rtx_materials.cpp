@@ -29,7 +29,7 @@ namespace dxvk {
 
 XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
   // Only fields consumed by determineMaterialData(), mergeLegacyMaterial(), and
-  // InstanceManager surface alpha/blend setup. D3DMATERIAL9 constants, color-source
+  // InstanceManager surface alpha/blend setup. Fixed-function material colours, color-source
   // intermediates, texture slots, and alphaTestEnabled are excluded.
   struct LegacyMaterialIdentityHashData {
     XXH64_hash_t colorTextureHash0;
@@ -110,23 +110,68 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
       &LegacyMaterialIdentityHashData::padding>(data);
 }
 
+// The option values the material records read, captured once per GPU-write batch.
+// Every option getter locks the global option mutex, which would serialize a multi-threaded write of
+// tens of thousands of records. Option values only change between frames, so the captured values are
+// the ones every record in the batch would read.
+namespace {
+  struct MaterialWriteGlobals {
+    bool active = false;
+    bool diffuseLayerOverride = false;
+    float emissiveIntensity = 0.f;
+    float displacementFactor = 0.f;
+    float displacementInFactor = 0.f;
+    float displacementOutFactor = 0.f;
+  } g_materialWriteGlobals;
+}
+
+void beginMaterialGpuWriteBatch() {
+  MaterialWriteGlobals& g = g_materialWriteGlobals;
+  g.active = false;
+  g.diffuseLayerOverride = TranslucentMaterialOptions::enableDiffuseLayerOverride();
+  g.emissiveIntensity = RtxOptions::emissiveIntensity();
+  g.displacementFactor = RtxOptions::Displacement::displacementFactor();
+  g.displacementInFactor = g.displacementFactor * RtxOptions::Displacement::displacementInFactor();
+  g.displacementOutFactor = g.displacementFactor * RtxOptions::Displacement::displacementOutFactor();
+  g.active = true;
+}
+
+void endMaterialGpuWriteBatch() {
+  g_materialWriteGlobals.active = false;
+}
+
 bool getEnableDiffuseLayerOverrideHack() {
+  if (g_materialWriteGlobals.active) {
+    return g_materialWriteGlobals.diffuseLayerOverride;
+  }
   return TranslucentMaterialOptions::enableDiffuseLayerOverride();
 }
 
 float getEmissiveIntensity() {
+  if (g_materialWriteGlobals.active) {
+    return g_materialWriteGlobals.emissiveIntensity;
+  }
   return RtxOptions::emissiveIntensity();
 }
 
 float getDisplacementFactor() {
+  if (g_materialWriteGlobals.active) {
+    return g_materialWriteGlobals.displacementFactor;
+  }
   return RtxOptions::Displacement::displacementFactor();
 }
 
 float getDisplacementInFactor() {
+  if (g_materialWriteGlobals.active) {
+    return g_materialWriteGlobals.displacementInFactor;
+  }
   return RtxOptions::Displacement::displacementFactor() * RtxOptions::Displacement::displacementInFactor();
 }
 
 float getDisplacementOutFactor() {
+  if (g_materialWriteGlobals.active) {
+    return g_materialWriteGlobals.displacementOutFactor;
+  }
   return RtxOptions::Displacement::displacementFactor() * RtxOptions::Displacement::displacementOutFactor();
 }
 
@@ -192,5 +237,11 @@ template<> RayPortalMaterialData LegacyMaterialData::as() const {
   return portalMat;
 }
 
+
+MaterialData MaterialData::fromLegacy(const LegacyMaterialData& legacyMaterial) {
+  MaterialData material(legacyMaterial.as<OpaqueMaterialData>());
+  material.m_usesLegacyDefaults = true;
+  return material;
+}
 
 } // namespace dxvk

@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -20,7 +20,9 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
+#include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <unordered_set>
 
 #include "dxvk_adapter.h"
@@ -44,6 +46,8 @@
 // NV-DXVK start: FSR 3.1 runtime probe
 #include "rtx_render/rtx_fork_hooks.h"
 // NV-DXVK end
+#include "rtx_render/rtx_perf_log.h" // rtx.present.queueGlobalPriority
+#include "rtx_render/rtx_pipeline_stats.h" // rtx.debug.logPipelineStats
 
 namespace dxvk {
 
@@ -372,10 +376,90 @@ namespace dxvk {
 
   Rc<DxvkDevice> DxvkAdapter::createDevice(
     const Rc<DxvkInstance>&   instance,
-          DxvkDeviceFeatures  enabledFeatures) {
+          DxvkDeviceFeatures  enabledFeatures,
+          bool                initRtx) {
+    // NV-DXVK start: One Remix device per adapter in the unified module
+    // Keep ownership outside the adapter/instance to avoid a reference cycle.
+    // A device stays listed until module teardown, or until the last D3D9 device on it retires it.
+    struct SharedDevice {
+      Rc<DxvkDevice> device;
+      bool rtxInitialized;
+    };
+    static std::mutex deviceMutex;
+    static std::vector<SharedDevice> devices;
+    std::lock_guard<std::mutex> lock(deviceMutex);
+
+    // A retired device has destroyed its common objects and cannot serve a new frontend.
+    devices.erase(std::remove_if(devices.begin(), devices.end(), [this](const SharedDevice& shared) {
+      return shared.device->adapter().ptr() == this && shared.device->isRetired();
+    }), devices.end());
+
+    for (auto& shared : devices) {
+      if (shared.device->adapter().ptr() == this) {
+        if (initRtx && !shared.rtxInitialized) {
+          // Dummy resources may already be in use by the raster frontend.
+          shared.device->getCommon()->getRtxInitializer().initialize();
+          shared.rtxInitialized = true;
+        }
+        Logger::info(str::format("DxvkAdapter: reusing shared VkDevice ", shared.device->handle()));
+        return shared.device;
+      }
+    }
+
+    // Enable the supported frontend union before the first vkCreateDevice.
+    enabledFeatures.core.features.depthBiasClamp |= m_deviceFeatures.core.features.depthBiasClamp;
+    enabledFeatures.core.features.depthBounds |= m_deviceFeatures.core.features.depthBounds;
+    enabledFeatures.core.features.depthClamp |= m_deviceFeatures.core.features.depthClamp;
+    enabledFeatures.core.features.drawIndirectFirstInstance |= m_deviceFeatures.core.features.drawIndirectFirstInstance;
+    enabledFeatures.core.features.dualSrcBlend |= m_deviceFeatures.core.features.dualSrcBlend;
+    enabledFeatures.core.features.fillModeNonSolid |= m_deviceFeatures.core.features.fillModeNonSolid;
+    enabledFeatures.core.features.fragmentStoresAndAtomics |= m_deviceFeatures.core.features.fragmentStoresAndAtomics;
+    enabledFeatures.core.features.fullDrawIndexUint32 |= m_deviceFeatures.core.features.fullDrawIndexUint32;
+    enabledFeatures.core.features.geometryShader |= m_deviceFeatures.core.features.geometryShader;
+    enabledFeatures.core.features.imageCubeArray |= m_deviceFeatures.core.features.imageCubeArray;
+    enabledFeatures.core.features.independentBlend |= m_deviceFeatures.core.features.independentBlend;
+    enabledFeatures.core.features.logicOp |= m_deviceFeatures.core.features.logicOp;
+    enabledFeatures.core.features.multiDrawIndirect |= m_deviceFeatures.core.features.multiDrawIndirect;
+    enabledFeatures.core.features.multiViewport |= m_deviceFeatures.core.features.multiViewport;
+    enabledFeatures.core.features.occlusionQueryPrecise |= m_deviceFeatures.core.features.occlusionQueryPrecise;
+    enabledFeatures.core.features.pipelineStatisticsQuery |= m_deviceFeatures.core.features.pipelineStatisticsQuery;
+    enabledFeatures.core.features.robustBufferAccess |= m_deviceFeatures.core.features.robustBufferAccess;
+    enabledFeatures.core.features.sampleRateShading |= m_deviceFeatures.core.features.sampleRateShading;
+    enabledFeatures.core.features.samplerAnisotropy |= m_deviceFeatures.core.features.samplerAnisotropy;
+    enabledFeatures.core.features.shaderClipDistance |= m_deviceFeatures.core.features.shaderClipDistance;
+    enabledFeatures.core.features.shaderCullDistance |= m_deviceFeatures.core.features.shaderCullDistance;
+    enabledFeatures.core.features.shaderFloat64 |= m_deviceFeatures.core.features.shaderFloat64;
+    enabledFeatures.core.features.shaderImageGatherExtended |= m_deviceFeatures.core.features.shaderImageGatherExtended;
+    enabledFeatures.core.features.shaderInt64 |= m_deviceFeatures.core.features.shaderInt64;
+    enabledFeatures.core.features.shaderStorageImageReadWithoutFormat |= m_deviceFeatures.core.features.shaderStorageImageReadWithoutFormat;
+    enabledFeatures.core.features.shaderStorageImageWriteWithoutFormat |= m_deviceFeatures.core.features.shaderStorageImageWriteWithoutFormat;
+    enabledFeatures.core.features.tessellationShader |= m_deviceFeatures.core.features.tessellationShader;
+    enabledFeatures.core.features.textureCompressionBC |= m_deviceFeatures.core.features.textureCompressionBC;
+    enabledFeatures.core.features.variableMultisampleRate |= m_deviceFeatures.core.features.variableMultisampleRate;
+    enabledFeatures.core.features.vertexPipelineStoresAndAtomics |= m_deviceFeatures.core.features.vertexPipelineStoresAndAtomics;
+    enabledFeatures.extCustomBorderColor.customBorderColorWithoutFormat |= m_deviceFeatures.extCustomBorderColor.customBorderColorWithoutFormat;
+    enabledFeatures.extCustomBorderColor.customBorderColors |= m_deviceFeatures.extCustomBorderColor.customBorderColors;
+    enabledFeatures.extDepthClipEnable.depthClipEnable |= m_deviceFeatures.extDepthClipEnable.depthClipEnable;
+    enabledFeatures.extMemoryPriority.memoryPriority |= m_deviceFeatures.extMemoryPriority.memoryPriority;
+    enabledFeatures.extRobustness2.nullDescriptor |= m_deviceFeatures.extRobustness2.nullDescriptor;
+    enabledFeatures.extRobustness2.robustBufferAccess2 |= m_deviceFeatures.extRobustness2.robustBufferAccess2;
+    enabledFeatures.extRobustness2.robustImageAccess2 |= m_deviceFeatures.extRobustness2.robustImageAccess2;
+    enabledFeatures.extShaderDemoteToHelperInvocation.shaderDemoteToHelperInvocation |= m_deviceFeatures.extShaderDemoteToHelperInvocation.shaderDemoteToHelperInvocation;
+    enabledFeatures.extTransformFeedback.geometryStreams |= m_deviceFeatures.extTransformFeedback.geometryStreams;
+    enabledFeatures.extTransformFeedback.transformFeedback |= m_deviceFeatures.extTransformFeedback.transformFeedback;
+    enabledFeatures.extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor |= m_deviceFeatures.extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor;
+    enabledFeatures.extVertexAttributeDivisor.vertexAttributeInstanceRateZeroDivisor |= m_deviceFeatures.extVertexAttributeDivisor.vertexAttributeInstanceRateZeroDivisor;
+    enabledFeatures.vulkan11Features.shaderDrawParameters |= m_deviceFeatures.vulkan11Features.shaderDrawParameters;
+    enabledFeatures.vulkan12Features.drawIndirectCount |= m_deviceFeatures.vulkan12Features.drawIndirectCount;
+    enabledFeatures.vulkan12Features.hostQueryReset |= m_deviceFeatures.vulkan12Features.hostQueryReset;
+    enabledFeatures.vulkan12Features.samplerMirrorClampToEdge |= m_deviceFeatures.vulkan12Features.samplerMirrorClampToEdge;
+    enabledFeatures.vulkan12Features.shaderOutputLayer |= m_deviceFeatures.vulkan12Features.shaderOutputLayer;
+    enabledFeatures.vulkan12Features.shaderOutputViewportIndex |= m_deviceFeatures.vulkan12Features.shaderOutputViewportIndex;
+    // NV-DXVK end
+
     DxvkDeviceExtensions devExtensions;
 
-    std::array<DxvkExt*, 43> devExtensionList = {{
+    std::array<DxvkExt*, 45> devExtensionList = {{
       &devExtensions.amdMemoryOverallocationBehaviour,
       &devExtensions.amdShaderFragmentMask,
       &devExtensions.ext4444Formats,
@@ -421,6 +505,8 @@ namespace dxvk {
       &devExtensions.khrExternalSemaphore,
       &devExtensions.khrExternalSemaphoreWin32,
       &devExtensions.extShaderAtomicFloat,
+      &devExtensions.extMutableDescriptorType,
+      &devExtensions.khrShaderIntegerDotProduct,
     }};
 
     // Only enable Cuda interop extensions in 64-bit builds in
@@ -485,11 +571,125 @@ namespace dxvk {
       extensionsEnabled);
     // NV-DXVK end
 
-    // NV-DXVK start: FSR 3.1 — required by the FidelityFX SDK's internal
+    // NV-DXVK start: FSR 3.1 - required by the FidelityFX SDK's internal
     // allocator. Only requested when the FidelityFX runtime is actually present.
     if (fork_hooks::fsrRuntimeAvailable() && m_deviceExtensions.supports(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME))
       extensionsEnabled.add(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
     // NV-DXVK end
+
+    // rtx.present.queueGlobalPriority. The extension is only enabled
+    // when the option asks for a priority and the driver exposes KHR (preferred) or EXT.
+    DxvkExt globalPriorityExt = { VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME, DxvkExtMode::Optional };
+    bool applyGlobalPriority = false;
+    VkDeviceQueueGlobalPriorityCreateInfoKHR globalPriorityInfo = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR };
+    const char* globalPriorityName = "unset";
+    {
+      const uint32_t requested = std::min(RtxPerfLog::queueGlobalPriority(), 4u);
+      static const VkQueueGlobalPriorityKHR kPriorities[4] = {
+        VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR, VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR,
+        VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR, VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR };
+      static const char* const kPriorityNames[4] = { "LOW", "MEDIUM", "HIGH", "REALTIME" };
+      const bool khr = m_deviceExtensions.supports(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME) != 0;
+      const bool ext = m_deviceExtensions.supports(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME) != 0;
+      if (requested == 0) {
+        Logger::info(str::format("[PresentPacing] rtx.present.queueGlobalPriority=0: queue global priority not set (driver default)",
+          "; driver exposes VK_KHR_global_priority=", khr ? "yes" : "no", " VK_EXT_global_priority=", ext ? "yes" : "no"));
+      } else if (khr || ext) {
+        if (!khr) {
+          globalPriorityExt = DxvkExt { VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME, DxvkExtMode::Optional };
+        }
+        extensionsEnabled.add(globalPriorityExt.name());
+        globalPriorityInfo.globalPriority = kPriorities[requested - 1];
+        globalPriorityName = kPriorityNames[requested - 1];
+        applyGlobalPriority = true;
+        Logger::info(str::format("[PresentPacing] rtx.present.queueGlobalPriority=", requested, ": requesting ",
+          globalPriorityName, " for all Remix queues via ", globalPriorityExt.name()));
+      } else {
+        Logger::warn(str::format("[PresentPacing] rtx.present.queueGlobalPriority=", requested,
+          ": the driver exposes neither VK_KHR_global_priority nor VK_EXT_global_priority; priority not applied"));
+      }
+    }
+
+    // VK_KHR_present_id + VK_KHR_present_wait for rtx.present.presentWaitPacing.
+    // Enabled whenever the driver offers both extensions and both features (they cost nothing unless a
+    // present carries an id), so the option can be switched at runtime. Logged once per device.
+    VkPhysicalDevicePresentIdFeaturesKHR presentIdFeatures = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR };
+    VkPhysicalDevicePresentWaitFeaturesKHR presentWaitFeatures = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR };
+    bool enablePresentWait = false;
+    {
+      const bool idExt = m_deviceExtensions.supports(VK_KHR_PRESENT_ID_EXTENSION_NAME) != 0;
+      const bool waitExt = m_deviceExtensions.supports(VK_KHR_PRESENT_WAIT_EXTENSION_NAME) != 0;
+      bool idFeature = false, waitFeature = false;
+      if (idExt && waitExt) {
+        presentIdFeatures.pNext = &presentWaitFeatures;
+        presentWaitFeatures.pNext = nullptr;
+        VkPhysicalDeviceFeatures2 features2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        features2.pNext = &presentIdFeatures;
+        m_vki->vkGetPhysicalDeviceFeatures2(m_handle, &features2);
+        idFeature = presentIdFeatures.presentId == VK_TRUE;
+        waitFeature = presentWaitFeatures.presentWait == VK_TRUE;
+      }
+      if (idFeature && waitFeature) {
+        std::array presentWaitExtensions = { &devExtensions.khrPresentId, &devExtensions.khrPresentWait };
+        m_deviceExtensions.enableExtensions(presentWaitExtensions.size(), presentWaitExtensions.data(), extensionsEnabled);
+        enablePresentWait = devExtensions.khrPresentId && devExtensions.khrPresentWait;
+      }
+      if (enablePresentWait) {
+        Logger::info("[PresentWait] VK_KHR_present_id + VK_KHR_present_wait supported and enabled (presentId, presentWait features on);"
+          " rtx.present.presentWaitPacing can be used");
+      } else {
+        Logger::warn(str::format("[PresentWait] VK_KHR_present_id / VK_KHR_present_wait NOT enabled: extensions exposed id=",
+          idExt ? "yes" : "no", " wait=", waitExt ? "yes" : "no", ", features presentId=", idFeature ? "yes" : "no",
+          " presentWait=", waitFeature ? "yes" : "no", ". rtx.present.presentWaitPacing will do nothing"));
+      }
+    }
+
+    // VK_KHR_pipeline_executable_properties for rtx.debug.logPipelineStats. Only
+    // requested when the option is on at device creation (restart required) and the driver reports the
+    // pipelineExecutableInfo feature; otherwise the device is created exactly as before.
+    if (RtxPipelineStats::logPipelineStats()) {
+      const bool ext = m_deviceExtensions.supports(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) != 0;
+      const bool feature = ext && m_deviceFeatures.khrPipelineExecutableProperties.pipelineExecutableInfo == VK_TRUE;
+      if (feature) {
+        devExtensions.khrPipelineExecutableProperties.setMode(DxvkExtMode::Optional);
+        std::array pipelineStatsExtensions = { &devExtensions.khrPipelineExecutableProperties };
+        m_deviceExtensions.enableExtensions(pipelineStatsExtensions.size(), pipelineStatsExtensions.data(), extensionsEnabled);
+      }
+      if (devExtensions.khrPipelineExecutableProperties) {
+        Logger::info("[PipelineStats] rtx.debug.logPipelineStats: VK_KHR_pipeline_executable_properties enabled;"
+          " compute, ray tracing and graphics pipelines are created with VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR");
+      } else {
+        Logger::warn(str::format("[PipelineStats] rtx.debug.logPipelineStats is on but VK_KHR_pipeline_executable_properties is NOT"
+          " available (extension exposed=", ext ? "yes" : "no", ", pipelineExecutableInfo feature=", feature ? "yes" : "no",
+          "); no pipeline statistics will be logged"));
+      }
+    }
+
+    // Device-loss diagnostics (GpuBreadcrumbs) on GPUs other than NVIDIA, which use Aftermath instead.
+    // VK_AMD_buffer_marker marks pass boundaries and VK_EXT_device_fault reports the faulting address.
+    // The feature struct lives on this function's stack until vkCreateDevice and is unlinked after it.
+    VkPhysicalDeviceFaultFeaturesEXT deviceFaultFeatures = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT };
+    bool enableDeviceFault = false;
+    if (m_deviceInfo.core.properties.vendorID != static_cast<uint32_t>(DxvkGpuVendor::Nvidia)) {
+      if (m_deviceExtensions.supports(VK_AMD_BUFFER_MARKER_EXTENSION_NAME) != 0) {
+        devExtensions.amdBufferMarker.setMode(DxvkExtMode::Optional);
+        std::array markerExtensions = { &devExtensions.amdBufferMarker };
+        m_deviceExtensions.enableExtensions(markerExtensions.size(), markerExtensions.data(), extensionsEnabled);
+      }
+      if (m_deviceExtensions.supports(VK_EXT_DEVICE_FAULT_EXTENSION_NAME) != 0) {
+        VkPhysicalDeviceFeatures2 features2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        features2.pNext = &deviceFaultFeatures;
+        m_vki->vkGetPhysicalDeviceFeatures2(m_handle, &features2);
+        if (deviceFaultFeatures.deviceFault == VK_TRUE) {
+          devExtensions.extDeviceFault.setMode(DxvkExtMode::Optional);
+          std::array faultExtensions = { &devExtensions.extDeviceFault };
+          m_deviceExtensions.enableExtensions(faultExtensions.size(), faultExtensions.data(), extensionsEnabled);
+          enableDeviceFault = devExtensions.extDeviceFault;
+        }
+      }
+      Logger::info(str::format("[DeviceFault] VK_AMD_buffer_marker ", devExtensions.amdBufferMarker ? "enabled" : "not available",
+        ", VK_EXT_device_fault ", enableDeviceFault ? "enabled" : "not available"));
+    }
 
     // Enable additional extensions if necessary
     extensionsEnabled.merge(m_extraExtensions);
@@ -521,10 +721,17 @@ namespace dxvk {
     enabledFeatures.vulkan12Features.descriptorBindingVariableDescriptorCount = m_deviceFeatures.vulkan12Features.descriptorBindingVariableDescriptorCount;
     enabledFeatures.vulkan12Features.shaderInt8 = m_deviceFeatures.vulkan12Features.shaderInt8;
     enabledFeatures.vulkan12Features.shaderFloat16 = m_deviceFeatures.vulkan12Features.shaderFloat16;
+    // NV-DXVK start: Optional SHARC hash-table capabilities
+    enabledFeatures.core.features.shaderInt64 = m_deviceFeatures.core.features.shaderInt64;
+    enabledFeatures.vulkan12Features.shaderBufferInt64Atomics = m_deviceFeatures.vulkan12Features.shaderBufferInt64Atomics;
+    // NV-DXVK end
     enabledFeatures.vulkan12Features.uniformAndStorageBuffer8BitAccess = m_deviceFeatures.vulkan12Features.uniformAndStorageBuffer8BitAccess;
     enabledFeatures.khrAccelerationStructureFeatures.accelerationStructure = m_deviceFeatures.khrAccelerationStructureFeatures.accelerationStructure;
     enabledFeatures.khrRayQueryFeatures.rayQuery = m_deviceFeatures.khrRayQueryFeatures.rayQuery;
     enabledFeatures.khrDeviceRayTracingPipelineFeatures.rayTracingPipeline = m_deviceFeatures.khrDeviceRayTracingPipelineFeatures.rayTracingPipeline;
+    // NV-DXVK start: Indirect ray dispatch support
+    enabledFeatures.khrDeviceRayTracingPipelineFeatures.rayTracingPipelineTraceRaysIndirect = m_deviceFeatures.khrDeviceRayTracingPipelineFeatures.rayTracingPipelineTraceRaysIndirect;
+    // NV-DXVK end
     enabledFeatures.vulkan12Features.scalarBlockLayout = m_deviceFeatures.vulkan12Features.scalarBlockLayout;
     enabledFeatures.vulkan12Features.uniformBufferStandardLayout = m_deviceFeatures.vulkan12Features.uniformBufferStandardLayout;
     
@@ -651,6 +858,47 @@ namespace dxvk {
       enabledFeatures.khrSynchronization2.synchronization2 = VK_TRUE;
     }
     // NV-DXVK end
+
+    // Micromap builds, micromap barriers and OMM ray tracing pipelines are only valid with the micromap feature enabled.
+    if (devExtensions.extOpacityMicromap && m_deviceFeatures.extOpacityMicromap.micromap) {
+      enabledFeatures.extOpacityMicromap.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
+      enabledFeatures.extOpacityMicromap.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extOpacityMicromap);
+      enabledFeatures.extOpacityMicromap.micromap = VK_TRUE;
+    }
+
+    if (devExtensions.extMutableDescriptorType && m_deviceFeatures.extMutableDescriptorType.mutableDescriptorType) {
+      enabledFeatures.extMutableDescriptorType.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT;
+      enabledFeatures.extMutableDescriptorType.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extMutableDescriptorType);
+      enabledFeatures.extMutableDescriptorType.mutableDescriptorType = VK_TRUE;
+    }
+
+    if (m_deviceFeatures.khrShaderIntegerDotProduct.shaderIntegerDotProduct) {
+      enabledFeatures.khrShaderIntegerDotProduct.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
+      enabledFeatures.khrShaderIntegerDotProduct.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrShaderIntegerDotProduct);
+      enabledFeatures.khrShaderIntegerDotProduct.shaderIntegerDotProduct = VK_TRUE;
+    }
+
+    // Feature structs live on this function's stack until vkCreateDevice.
+    if (enablePresentWait) {
+      presentIdFeatures.presentId = VK_TRUE;
+      presentWaitFeatures.presentWait = VK_TRUE;
+      presentWaitFeatures.pNext = nullptr;
+      presentIdFeatures.pNext = std::exchange(enabledFeatures.core.pNext, &presentIdFeatures);
+      presentWaitFeatures.pNext = std::exchange(enabledFeatures.core.pNext, &presentWaitFeatures);
+    }
+
+    if (devExtensions.khrPipelineExecutableProperties) {
+      enabledFeatures.khrPipelineExecutableProperties = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
+      enabledFeatures.khrPipelineExecutableProperties.pipelineExecutableInfo = VK_TRUE;
+      enabledFeatures.khrPipelineExecutableProperties.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrPipelineExecutableProperties);
+    }
+
+    // Only the deviceFault feature is enabled. The vendor binary is not used.
+    if (enableDeviceFault) {
+      deviceFaultFeatures.deviceFault = VK_TRUE;
+      deviceFaultFeatures.deviceFaultVendorBinary = VK_FALSE;
+      deviceFaultFeatures.pNext = std::exchange(enabledFeatures.core.pNext, &deviceFaultFeatures);
+    }
 
     // NV-DXVK start: Moved logging to where it is on more recent DXVK to properly show enabled features, also added more information to be logged
     // (Still needs driver version from latest DXVK though at the time of writing this, but we can wait on that since it needs larger changes)
@@ -800,7 +1048,7 @@ namespace dxvk {
     if (queueFamilies.imageAcquire != VK_QUEUE_FAMILY_IGNORED) {
       handleQueueFamily(queueFamilies.imageAcquire, queueInfos.imageAcquire);
     }
-    
+
     if (queueFamilies.fsrPresent != VK_QUEUE_FAMILY_IGNORED) {
       handleQueueFamily(queueFamilies.fsrPresent, queueInfos.fsrPresent);
     }
@@ -840,7 +1088,7 @@ namespace dxvk {
       
       VkDeviceQueueCreateInfo queueCreateInfo;
       queueCreateInfo.sType             = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-      queueCreateInfo.pNext             = nullptr;
+      queueCreateInfo.pNext             = applyGlobalPriority ? &globalPriorityInfo : nullptr;
       queueCreateInfo.flags             = 0;
       queueCreateInfo.queueFamilyIndex  = queueFamily;
       queueCreateInfo.queueCount        = clampedQueueCount;
@@ -871,6 +1119,100 @@ namespace dxvk {
 
     VkDevice device = VK_NULL_HANDLE;
     VkResult vr = m_vki->vkCreateDevice(m_handle, &info, nullptr, &device);
+
+    // A refused global priority (VK_ERROR_NOT_PERMITTED, typically HIGH/REALTIME
+    // without the needed privilege) or a driver that rejects the struct: retry without it.
+    if (applyGlobalPriority) {
+      if (vr == VK_SUCCESS) {
+        Logger::info(str::format("[PresentPacing] queue global priority ", globalPriorityName, " applied to ",
+          queueCreateInfos.size(), " queue familie(s)"));
+      } else {
+        Logger::warn(str::format("[PresentPacing] vkCreateDevice with queue global priority ", globalPriorityName, " failed (",
+          vr, vr == VK_ERROR_NOT_PERMITTED_KHR ? ", VK_ERROR_NOT_PERMITTED" : "", "); retrying without a queue global priority"));
+        for (auto& qci : queueCreateInfos) {
+          qci.pNext = nullptr;
+        }
+        extensionsEnabled.disableExtension(globalPriorityExt);
+        extensionNameList = extensionsEnabled.toNameList();
+        info.enabledExtensionCount      = extensionNameList.count();
+        info.ppEnabledExtensionNames    = extensionNameList.names();
+        applyGlobalPriority = false;
+        vr = m_vki->vkCreateDevice(m_handle, &info, nullptr, &device);
+      }
+    }
+
+    // Never let the optional pacing extensions cost a device. On failure retry
+    // without them; either way unlink the stack-local feature structs before the chain is copied out.
+    const auto unlinkPresentWaitFeatures = [&]() {
+      for (VkStructureType sType : { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+                                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR }) {
+        // info.pNext is const void*, which the vk:: helper cannot walk.
+        const void** ppNext = &info.pNext;
+        while (*ppNext) {
+          auto s = static_cast<VkBaseOutStructure*>(const_cast<void*>(*ppNext));
+          if (s->sType == sType) {
+            *ppNext = s->pNext;
+            break;
+          }
+          ppNext = static_cast<const void**>(static_cast<void*>(&s->pNext));
+        }
+        vk::removeStructFromPNextChain(&enabledFeatures.core.pNext, sType);
+      }
+    };
+    if (enablePresentWait && vr != VK_SUCCESS) {
+      Logger::warn(str::format("[PresentWait] vkCreateDevice failed (", vr, ") with VK_KHR_present_id/present_wait; retrying without them"));
+      unlinkPresentWaitFeatures();
+      extensionsEnabled.disableExtension(devExtensions.khrPresentId);
+      extensionsEnabled.disableExtension(devExtensions.khrPresentWait);
+      extensionNameList = extensionsEnabled.toNameList();
+      info.enabledExtensionCount      = extensionNameList.count();
+      info.ppEnabledExtensionNames    = extensionNameList.names();
+      enablePresentWait = false;
+      vr = m_vki->vkCreateDevice(m_handle, &info, nullptr, &device);
+    }
+    if (enablePresentWait) {
+      unlinkPresentWaitFeatures();
+    }
+
+    // The device-loss diagnostics extensions must never cost the device either.
+    const auto unlinkDeviceFaultFeatures = [&]() {
+      const void** ppNext = &info.pNext;
+      while (*ppNext) {
+        auto s = static_cast<VkBaseOutStructure*>(const_cast<void*>(*ppNext));
+        if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT) {
+          *ppNext = s->pNext;
+          break;
+        }
+        ppNext = static_cast<const void**>(static_cast<void*>(&s->pNext));
+      }
+      vk::removeStructFromPNextChain(&enabledFeatures.core.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT);
+    };
+    if (vr != VK_SUCCESS && (devExtensions.amdBufferMarker || enableDeviceFault)) {
+      Logger::warn(str::format("[DeviceFault] vkCreateDevice failed (", vr, ") with VK_AMD_buffer_marker / VK_EXT_device_fault; retrying without them"));
+      unlinkDeviceFaultFeatures();
+      extensionsEnabled.disableExtension(devExtensions.amdBufferMarker);
+      extensionsEnabled.disableExtension(devExtensions.extDeviceFault);
+      extensionNameList = extensionsEnabled.toNameList();
+      info.enabledExtensionCount      = extensionNameList.count();
+      info.ppEnabledExtensionNames    = extensionNameList.names();
+      enableDeviceFault = false;
+      vr = m_vki->vkCreateDevice(m_handle, &info, nullptr, &device);
+    }
+    if (enableDeviceFault) {
+      unlinkDeviceFaultFeatures();
+    }
+
+    // A diagnostics-only extension must never cost the device.
+    if (vr != VK_SUCCESS && devExtensions.khrPipelineExecutableProperties) {
+      Logger::warn(str::format("[PipelineStats] vkCreateDevice failed (", vr, ") with VK_KHR_pipeline_executable_properties; retrying without it"));
+      vk::removeStructFromPNextChain(&enabledFeatures.core.pNext,
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR);
+      extensionsEnabled.disableExtension(devExtensions.khrPipelineExecutableProperties);
+      extensionNameList = extensionsEnabled.toNameList();
+      info.enabledExtensionCount      = extensionNameList.count();
+      info.ppEnabledExtensionNames    = extensionNameList.names();
+      vr = m_vki->vkCreateDevice(m_handle, &info, nullptr, &device);
+    }
 
     if (vr != VK_SUCCESS && enableCudaInterop) {
       // Enabling certain Vulkan extensions can cause device creation to fail on
@@ -911,7 +1253,15 @@ namespace dxvk {
     Rc<DxvkDevice> result = new DxvkDevice(m_vki, instance, this,
       new vk::DeviceFn(true, m_vki->instance(), device),
       devExtensions, enabledFeatures, queueInfos);
-    result->initResources();
+    RtxPipelineStats::setCaptureEnabled(devExtensions.khrPipelineExecutableProperties);
+    if (initRtx) {
+      result->initResources();
+    } else {
+      // Still clear the dummy resources -- every client needs those. Only the
+      // RtxInitializer is skipped until a Remix frontend requests this device.
+      result->initDummyResources();
+      Logger::info("DxvkAdapter: device created without the RTX runtime (non-Remix client)");
+    }
 
     // NV-DXVK start: Update Sentry GPU tags now that the real adapter has been chosen.
     // The instance constructor already set these from m_adapters[0] as a fallback; correct
@@ -944,6 +1294,10 @@ namespace dxvk {
     }
     // NV-DXVK end
 
+    // NV-DXVK start: Publish only fully initialized devices
+    devices.push_back({ result, initRtx });
+    Logger::info(str::format("DxvkAdapter: created shared VkDevice ", result->handle()));
+    // NV-DXVK end
     return result;
   }
 
@@ -1232,6 +1586,28 @@ namespace dxvk {
     if (m_deviceExtensions.supports(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
       m_deviceFeatures.extShaderAtomicFloat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
       m_deviceFeatures.extShaderAtomicFloat.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extShaderAtomicFloat);
+    }
+
+    if (m_deviceExtensions.supports(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME)) {
+      m_deviceFeatures.extOpacityMicromap.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
+      m_deviceFeatures.extOpacityMicromap.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extOpacityMicromap);
+    }
+
+    if (m_deviceExtensions.supports(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME)) {
+      m_deviceFeatures.extMutableDescriptorType.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT;
+      m_deviceFeatures.extMutableDescriptorType.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extMutableDescriptorType);
+    }
+
+    // The feature struct is core in Vulkan 1.3, so a 1.3 device takes it without the extension.
+    if (m_deviceInfo.core.properties.apiVersion >= VK_API_VERSION_1_3
+     || m_deviceExtensions.supports(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) {
+      m_deviceFeatures.khrShaderIntegerDotProduct.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
+      m_deviceFeatures.khrShaderIntegerDotProduct.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrShaderIntegerDotProduct);
+    }
+
+    if (m_deviceExtensions.supports(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+      m_deviceFeatures.khrPipelineExecutableProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
+      m_deviceFeatures.khrPipelineExecutableProperties.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrPipelineExecutableProperties);
     }
 
     m_vki->vkGetPhysicalDeviceFeatures2(m_handle, &m_deviceFeatures.core);

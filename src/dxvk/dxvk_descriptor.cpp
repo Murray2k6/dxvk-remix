@@ -90,17 +90,19 @@ namespace dxvk {
 // NV-DXVK end
     const uint32_t maxSets = 8192;
 
+    // Ray tracing and compute passes bind dozens of storage images and several acceleration structures per set.
+    // Drivers that enforce the per-type counts (Intel's does) need room for them, or a pool fills after two such sets.
     std::array<VkDescriptorPoolSize, 10> pools = { {
       { VK_DESCRIPTOR_TYPE_SAMPLER,                     maxSets * 2  },
       { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,               maxSets * 2  },
-      { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,               maxSets / 64 },
+      { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,               maxSets * 2  },
       { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,              maxSets * 4  },
       { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,              maxSets * 1  },
       { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,        maxSets * 1  },
-      { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,        maxSets / 64 },
+      { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,        maxSets / 8  },
       { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,      maxSets * 1  },
       { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,      maxSets },
-      { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,  10 } } };
+      { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,  maxSets / 8  } } };
 
     VkDescriptorPoolCreateInfo info;
     info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -130,7 +132,7 @@ namespace dxvk {
   }
 
   // NV-DXVK start: Adding global bindless resources
-  VkDescriptorSet DxvkDescriptorPool::alloc(VkDescriptorSetLayout layout, const char *name) {
+  VkDescriptorSet DxvkDescriptorPool::alloc(VkDescriptorSetLayout layout, const char *name, VkResult* result) {
     VkDescriptorSetAllocateInfo info;
     info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     info.pNext = nullptr;
@@ -139,7 +141,10 @@ namespace dxvk {
     info.pSetLayouts = &layout;
 
     VkDescriptorSet set = VK_NULL_HANDLE;
-    if (m_vkd->vkAllocateDescriptorSets(m_vkd->device(), &info, &set) != VK_SUCCESS)
+    const VkResult vr = m_vkd->vkAllocateDescriptorSets(m_vkd->device(), &info, &set);
+    if (result != nullptr)
+      *result = vr;
+    if (vr != VK_SUCCESS)
       return VK_NULL_HANDLE;
 
     if (name && m_vkd->vkSetDebugUtilsObjectNameEXT) {

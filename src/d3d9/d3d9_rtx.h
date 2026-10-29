@@ -5,9 +5,26 @@
 #include "../util/util_threadpool.h"
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <vector>
 #include <optional>
+#include <unordered_map>
+
+#include "../util/thread.h"
+
+// The D3D9 frontend (draws converted for ray tracing). The API-only build (meson option enable_d3d9_frontend=false)
+// sets it to 0: D3D9 draws are then only rasterized, and the module hosts the Remix API alone.
+#ifndef REMIX_D3D9_FRONTEND
+#define REMIX_D3D9_FRONTEND 1
+#endif
+// D3D9Rtx fills the D3D9 frontend's draw records in both builds.
+#include "../frontends/d3d9/d3d9_draw_call.h"
+#if REMIX_D3D9_FRONTEND
+#include "../frontends/d3d9/d3d9_camera.h"
+#include "../frontends/d3d9/d3d9_frontend.h"
+#include "../frontends/d3d9/d3d9_raster_replay.h"
+#endif
 
 namespace dxvk {
   struct D3D9BufferSlice;
@@ -45,6 +62,11 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, useVertexCapturedTexcoords, false, "When enabled, vertex shader output texcoords always override input texcoords from the vertex declaration. Enable for games where the vertex shader applies meaningful UV transformations that should be used for ray tracing (e.g. animated UVs via shader constants).");
     RTX_OPTION("rtx", bool, useWorldMatricesForShaders, true, "When enabled, Remix will utilize the world matrices being passed from the game via D3D9 fixed function API, even when running with shaders.  Sometimes games pass these matrices and they are useful, however for some games they are very unreliable, and should be filtered out.  If you're seeing precision related issues with shader vertex capture, try disabling this setting.");
     RTX_OPTION("rtx", bool, enableIndexBufferMemoization, true, "CPU performance optimization, should generally be enabled.  Will reduce main thread time by caching processIndexBuffer operations and reusing when possible, this will come at the expense of some CPU RAM.");
+    RTX_OPTION("rtx", uint32_t, geometryHashMemoSelfCheckFrames, 0,
+               "Diagnostic for the geometry hash memo: every this many frames, every memo hit is hashed again in full "
+               "and compared with the stored value. A mismatch, which means a buffer write did not update the buffer's "
+               "content version, is logged as [GeometryHashMemoCheck] (the first 20) and counted as "
+               "memoSelfCheckMismatch in [PerfD3D9]. The fresh hash is used on those frames. 0 = off.");
     RTX_OPTION("rtx", uint32_t, numGeometryProcessingThreads, 2, "The desired number of CPU threads to dedicate to geometry processing  Will be limited by the number of CPU cores.  There may be some advantage to lowering this number in games which are fairly simple and use a low number of draw calls per frame.  The default was determined by looking at a game with around 2000 draw calls per frame, and with a reasonably high average triangle count per draw.");
 
     // Copy of the parameters issued to D3D9 on DrawXXX
@@ -154,6 +176,27 @@ namespace dxvk {
     void EndFrame(const Rc<DxvkImage>& targetImage, bool callInjectRtx = true);
 
     /**
+      * \brief: Records whether the game window is inactive or minimized, where a game may keep drawing without presenting.
+      * Safe to call from any thread. Under the bridge the window procedure runs on the message-channel thread,
+      * which must not touch frame state, so onBeginScene and onReset end such frames on the D3D9 thread.
+      */
+    void setWindowInactive(bool inactive) {
+      m_windowInactive.store(inactive, std::memory_order_release);
+    }
+
+    /**
+      * \brief: Runs at BeginScene on the D3D9 thread with the device lock held.
+      * Without presents, it ends the frame without injection once the frame has more scenes than the last presented frame had.
+      */
+    void onBeginScene();
+
+    /**
+      * \brief: Runs at Reset and ResetEx on the D3D9 thread with the device lock held.
+      * Without presents, it ends a frame that has a draw without injection.
+      */
+    void onReset();
+
+    /**
       * \brief: Signal that we're about to present the image.
       */
     void OnPresent(const Rc<DxvkImage>& targetImage);
@@ -176,27 +219,53 @@ namespace dxvk {
     }
 
   private: 
-    // Reused fixed-size blocks: once allocated, a block is never reallocated, so background
-    // skinning can keep raw Matrix4* into a prior copy. m_blocks can grow, but the heap
-    // Block objects and their `m_matrices` array storage stay pinned. The write cursor
-    // rewinds each frame; old blocks are retained to avoid per-frame allocs.
+    // Reused fixed-size blocks of bone matrices for the skinning tasks. A block is never reallocated, so a task can
+    // keep a raw pointer into it, and the write cursor rewinds each frame. A geometry worker can run a task after its
+    // frame has ended, so a block is written again only after every staged copy in it is released.
+    // It is declared before m_pGeometryWorkers, whose destruction releases the copies of tasks that never ran.
     struct SkinningMatrixPool {
       static constexpr size_t kMatricesPerBlock = 256 * 256;
       struct Block {
         std::array<Matrix4, kMatricesPerBlock> m_matrices;
+        std::atomic<uint32_t> m_readers = 0;
       };
+
+      // A staged copy of bone matrices. Its block is not written again while the copy exists.
+      class Staged {
+      public:
+        Staged() = default;
+        Staged(Block& block, const Matrix4* pMatrices);
+        Staged(Staged&& other) noexcept;
+        Staged(const Staged&) = delete;
+        Staged& operator=(const Staged&) = delete;
+        Staged& operator=(Staged&&) = delete;
+        ~Staged();
+
+        const Matrix4* matrices() const {
+          return m_pMatrices;
+        }
+
+      private:
+        Block* m_pBlock = nullptr;
+        const Matrix4* m_pMatrices = nullptr;
+      };
+
       std::vector<std::unique_ptr<Block>> m_blocks;
       size_t m_blockIndex = 0;          // which block the next write will use
       size_t m_nextIndexInBlock = 0;    // next free slot in m_blocks[m_blockIndex]
 
       void clear();
-      const Matrix4* stageBones(const Matrix4* source, size_t matrixCount);
+      Staged stageBones(const Matrix4* source, size_t matrixCount);
     } m_stagedBones;
 
     inline static const uint32_t kMaxConcurrentDraws = 6 * 1024; // some games issuing >3000 draw calls per frame...  account for some consumer thread lag with x2
     using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws>;
     const std::unique_ptr<GeometryProcessor> m_pGeometryWorkers;
     AtomicQueue<DrawCallState, kMaxConcurrentDraws> m_drawCallStateQueue;
+#if REMIX_D3D9_FRONTEND
+    // The D3D9 frontend's CS-thread half: every committed draw goes through it.
+    frontends::d3d9::D3D9Frontend m_frontend;
+#endif
 
     DrawCallState m_activeDrawCallState;
 
@@ -217,6 +286,14 @@ namespace dxvk {
 
     const bool m_enableDrawCallConversion;
     bool m_rtxInjectTriggered = false;
+
+    // While the window is inactive or minimized a game may draw whole frames without presenting them.
+    // Frames are then ended at scene boundaries until the first present after the window is active again.
+    std::atomic<bool> m_windowInactive { false };
+    bool m_endingFramesWithoutPresent = false;
+    uint32_t m_scenesThisFrame = 0;
+    uint32_t m_scenesLastPresentedFrame = 0;
+
     bool m_forceGeometryCopy = false;
     DWORD m_texcoordIndex = 0;
 
@@ -225,6 +302,40 @@ namespace dxvk {
     Rc<DxvkBuffer> m_vsVertexCaptureData;
 
     fast_unordered_cache<Rc<DxvkSampler>> m_samplerCache;
+
+    // Memoized geometry hashes, keyed by buildGeometryHashMemoizationKey(). Written from the
+    // geometry worker threads once a hash completes and read from the main thread, hence the mutex.
+    static constexpr size_t kMaxGeometryHashCacheEntries = 16384;
+    std::unordered_map<XXH64_hash_t, GeometryHashes> m_geometryHashCache;
+    mutable dxvk::mutex m_geometryHashCacheMutex;
+    uint32_t m_geometryHashCacheHits = 0;
+    uint32_t m_geometryHashCacheMisses = 0;
+    // D3D9 frames seen (EndFrame), for rtx.geometryHashMemoSelfCheckFrames.
+    uint32_t m_d3d9FrameIndex = 0;
+
+    DxvkBufferSlice allocVertexCaptureBuffer(const VkDeviceSize size);
+
+    // [PerfD3D9] d3d9ThreadCpuMsPerFrame (rtx.profile.detailedLogging), see sampleThreadCpuForPerfLog().
+    bool m_perfThreadCpuValid = false;
+    DWORD m_perfThreadId = 0;
+    uint64_t m_perfThreadCpu100ns = 0;
+    void sampleThreadCpuForPerfLog();
+    // Returns false when there is no implicit swapchain back buffer to end the frame on.
+    bool endFrameWithoutPresent();
+    static PrepareDrawFlags countPrepareOutcome(const PrepareDrawFlags flags);
+
+    // rtx.textureCategoryCache: every texture-list lookup a draw makes for one texture hash.
+    struct TextureListInfo {
+      CategoryFlags categories = 0;     // DrawCallState::computeTextureListCategories() + SmoothNormals
+      bool lightmap = false;            // rtx.lightmapTextures
+      bool ignoreBakedLighting = false; // rtx.ignoreBakedLightingTextures
+      bool ui = false;                  // rtx.uiTextures
+    };
+    static constexpr size_t kMaxTextureListCacheEntries = 65536;
+    fast_unordered_cache<TextureListInfo> m_textureListCache;
+    uint64_t m_textureListCacheGeneration = ~0ull;
+    // Never null. The pointer is valid until the next call.
+    const TextureListInfo* getTextureListInfo(const XXH64_hash_t& textureHash);
 
     // NOTE: to avoid calculating matrix inverse,
     //       m_seenCameraPositions doesn't contain the actual positions,
@@ -261,6 +372,8 @@ namespace dxvk {
 
     void prepareVertexCapture(const int vertexIndexOffset);
 
+    // True when every vertex element the draw reads lies inside its stream's buffer.
+    bool verticesInRange(const VertexContext vertexContext[caps::MaxStreams], int vertexIndexOffset, uint32_t vertexCount) const;
     void processVertices(const VertexContext vertexContext[caps::MaxStreams], int vertexIndexOffset, RasterGeometry& geoData);
 
     bool processRenderState();
@@ -269,6 +382,76 @@ namespace dxvk {
     bool processTextures();
 
     PrepareDrawFlags internalPrepareDraw(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext);
+    // internalPrepareDraw = head + body (the early change test runs between them). The head (post-injection
+    // gate, makeDrawCallType) runs for every draw; false = stop with `flags`.
+    bool prepareDrawHead(const DrawContext& drawContext, PrepareDrawFlags& flags);
+    PrepareDrawFlags prepareDrawBody(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext);
+    // processRenderState's clip plane and D3D9 light steps, also run for draws the early change test skips.
+    void updateClipPlanes();
+    void emitDirtyLights();
+
+#if REMIX_D3D9_FRONTEND
+    // D3D9 v2: describe a draw committed to ray tracing by ids and versions for the
+    // frontend's app-thread half. Called after internalPrepareDraw, while m_activeDrawCallState still holds the draw.
+    // flags: what the preparation returned (a skip stores the ApplyDrawState bit).
+    void observeFrontendInputs(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams],
+                               const DrawContext& drawContext, bool userPointer, PrepareDrawFlags flags);
+    // The identity part of the frontend record (ids, versions, range, shaders, declaration, extras; no material).
+    void fillFrontendIdentity(translator::DrawInputs& in, const IndexContext& indexContext,
+                              const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext,
+                              bool userPointer);
+    // Fixed-function skinning: the world matrices the draw's vertices blend with, firstBone .. firstBone + boneCount - 1.
+    // Returns false when the blend indices cannot be read on the host.
+    bool usedBoneRange(const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext,
+                       uint32_t& firstBone, uint32_t& boneCount);
+    // usedBoneRange's scans, by vertex buffer version and range.
+    static constexpr size_t kMaxBoneRangeCacheEntries = 4096;
+    std::unordered_map<XXH64_hash_t, std::pair<uint32_t, uint32_t>> m_boneRangeCache;
+    // The content of the index range the draw reads, seeded with the primitive count (translator::DrawInputs::kIndexContent).
+    // Returns 0 when the range is not host-mapped or lies outside the buffer.
+    XXH64_hash_t hashIndexRange(const IndexContext& indexContext, const DrawContext& drawContext);
+    struct IndexRangeHash {
+      uint64_t resourceId = 0;
+      uint64_t version = 0;
+      VkDeviceSize offset = 0;
+      VkDeviceSize size = 0;
+      uint32_t primitiveCount = 0;
+      XXH64_hash_t hash = 0;
+    } m_lastIndexRange;
+    // Describes a dynamic-source draw by the bytes it draws (translator::DrawInputs::kContent): the vertex range the last
+    // preparation copied, hashed for each dynamic stream. Leaves the record as it is when a dynamic stream or a dynamic
+    // index buffer cannot be read on the host.
+    void describeContent(translator::DrawInputs& in, const IndexContext& indexContext,
+                         const VertexContext vertexContext[caps::MaxStreams]) const;
+    // The clip planes, stream frequencies and viewport, hashed (translator::DrawInputs::extra).
+    XXH64_hash_t hashDrawExtras() const;
+    // The pre-key over every D3D9 input the preparation reads.
+    translator::EarlyKey buildEarlyKey(const translator::DrawInputs& identity, const Matrix4& objectToWorld) const;
+    // Skip a draw of an object the scene owns before preparing it. True = handled (flags set).
+    bool tryEarlySkip(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams],
+                      const DrawContext& drawContext, PrepareDrawFlags& flags);
+    // True when the draw's render states mark it as a per-draw draw (rtx.d3d9v2.perDrawRenderState). Such a draw skips
+    // the early change test and decide.
+    bool perDrawMarked() const;
+    // The prepared draw's fog, as the frontend records it.
+    translator::FogRecord frontendFog() const;
+    // Sends the camera the frontend chose for this draw (first draw of its type in the frame).
+    void sendFrontendCamera(const frontends::d3d9::Decision& decision, const Matrix4& worldToView, const Matrix4& viewToProjection,
+                            const frontends::d3d9::CameraSource& source);
+    // The draw a camera feed comes from, for rtx.d3d9v2.log's camera cut lines.
+    frontends::d3d9::CameraSource frontendCameraSource(const translator::DrawInputs& in, const frontends::d3d9::PreparedState& prepared,
+                                                       bool early) const;
+    frontends::d3d9::D3D9FrontendApp m_frontendApp;
+    // The frontend's verdict for the draw being prepared, consumed by CommitGeometryToRT.
+    frontends::d3d9::Decision m_frontendDecision;
+    // The last VS constants hash, reused while no VS constant was written and the shader is the same.
+    uint64_t m_frontendVsConstantsVersion = 0;
+    XXH64_hash_t m_frontendVsConstantsShader = 0;
+    XXH64_hash_t m_frontendVsConstantsHash = 0;
+#endif
+    // The first vertex of the last preparation's vertex range (the base vertex plus the lowest index), which
+    // describeContent hashes from.
+    int32_t m_preparedVertexOffset = 0;
 
     void triggerInjectRTX();
 
@@ -287,7 +470,18 @@ namespace dxvk {
 
     Future<AxisAlignedBoundingBox> computeAxisAlignedBoundingBox(const RasterGeometry& geoData);
 
-    Future<GeometryHashes> computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue);
+    // `memoizationKey` identifies the complete set of inputs this hash is derived from. Pass 0 to
+    // force a full re-hash (the behaviour before memoization existed).
+    Future<GeometryHashes> computeHash(RasterGeometry& geoData, const uint32_t maxIndexValue, const XXH64_hash_t memoizationKey);
+
+    // Builds the memoization key for the current draw call, or returns 0 when this draw is not
+    // eligible for memoization.
+    XXH64_hash_t buildGeometryHashMemoizationKey(const RasterGeometry& geoData,
+                                                 const VertexContext vertexContext[caps::MaxStreams],
+                                                 const IndexContext& indexContext,
+                                                 const uint32_t startIndex,
+                                                 const int vertexIndexOffset,
+                                                 const uint32_t maxIndexValue) const;
 
     void submitActiveDrawCallState();
   };

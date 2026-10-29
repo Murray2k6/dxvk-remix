@@ -352,3 +352,16 @@ namespace dxvk::bit {
 
   };
 }
+
+// NV-DXVK start: Shared by unified D3D9 and D3D11 frontends
+namespace dxvk {
+  template<typename T>
+  uint32_t CompactSparseList(T* pData, uint32_t mask) {
+    uint32_t count = 0;
+    for (uint32_t id : bit::BitMask(mask)) {
+      pData[count++] = pData[id];
+    }
+    return count;
+  }
+}
+// NV-DXVK end

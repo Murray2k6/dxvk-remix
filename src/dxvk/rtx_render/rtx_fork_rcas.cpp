@@ -37,9 +37,8 @@ namespace dxvk {
       PUSH_CONSTANTS(RcasArgs)
 
       BEGIN_PARAMETER()
-        TEXTURE2D(RCAS_INPUT)
+        SAMPLER2D(RCAS_INPUT)
         RW_TEXTURE2D(RCAS_OUTPUT)
-        SAMPLER(RCAS_LINEAR_SAMPLER)
       END_PARAMETER()
     };
 
@@ -71,7 +70,7 @@ namespace dxvk {
 
     ctx->bindResourceView(RCAS_INPUT, inputColor.view, nullptr);
     ctx->bindResourceView(RCAS_OUTPUT, outputColor.view, nullptr);
-    ctx->bindResourceSampler(RCAS_LINEAR_SAMPLER, linearSampler);
+    ctx->bindResourceSampler(RCAS_INPUT, linearSampler);
 
     const VkExtent3D workgroups = util::computeBlockCount(
       extent,
@@ -82,9 +81,8 @@ namespace dxvk {
   namespace fork_hooks {
 
     void dispatchRcasSharpening(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput) {
-      // FSR runs RCAS inside its own upscale dispatch, and NIS has its own
-      // sharpening stage, so the standalone pass is only for the upscalers that
-      // do not sharpen at all.
+      // FSR runs RCAS inside its own upscale dispatch and NIS has its own sharpening stage,
+      // so the standalone pass runs only for upscalers that do not sharpen.
       const bool upscalerNeedsSharpening =
         ctx.m_currentUpscaler == RtxContext::InternalUpscaler::DLSS ||
         ctx.m_currentUpscaler == RtxContext::InternalUpscaler::DLSS_RR ||
@@ -105,7 +103,9 @@ namespace dxvk {
       ctx.getCommonObjects()->metaRCAS().dispatch(
         &ctx,
         rtOutput.m_finalOutput.resource(Resources::AccessType::Read),
-        rtOutput.m_postFxIntermediateTexture,
+        // The intermediate texture is an AliasedResource that shares memory with the DLSS-NR input,
+        // so the write must be claimed through resource(AccessType::Write).
+        rtOutput.m_postFxIntermediateTexture.resource(Resources::AccessType::Write),
         ctx.getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
         sharpness);
 
@@ -113,7 +113,7 @@ namespace dxvk {
         rtOutput.m_finalOutput.resource(Resources::AccessType::Write).image,
         { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         { 0, 0, 0 },
-        rtOutput.m_postFxIntermediateTexture.image,
+        rtOutput.m_postFxIntermediateTexture.image(Resources::AccessType::Read),
         { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         { 0, 0, 0 },
         rtOutput.m_finalOutputExtent);

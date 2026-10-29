@@ -31,7 +31,7 @@
 #include "rtx/concept/camera/camera.slangh"
     
 #define VOLUME_LIGHTING_NO_JITTER
-#include "rtx/algorithm/volume_lighting.slangh"
+#include "rtx/algorithm/volume_lighting_consumer.slangh"
 
 struct VsOut
 {
@@ -107,7 +107,7 @@ float3 evalLighting(GpuDustParticle particle)
   surfaceInteraction.position = particle.position;
   float3 viewDir = particle.position - cameraGetWorldPosition(cb.camera);
   
-  return evalVolumetricNEE(FilteredAccumulatedRadianceY, FilteredAccumulatedRadianceCoCg, cb.volumeArgs, surfaceInteraction, normalize(viewDir), froxelVolumeMain, true, particleCb.anisotropy);
+  return evalVolumetricConsumerNEE(FilteredAccumulatedRadianceY, FilteredAccumulatedRadianceCoCg, cb.volumeArgs, surfaceInteraction, normalize(viewDir), froxelVolumeMain, true, particleCb.anisotropy);
 }
 
 float calculateOpacity(GpuDustParticle particle)

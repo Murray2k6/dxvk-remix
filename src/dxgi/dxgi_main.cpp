@@ -3,7 +3,7 @@
 
 namespace dxvk {
   
-  Logger Logger::s_instance("dxgi.log");
+  // Defined for the whole unified module in d3d9_main.cpp; see there.
   
   HRESULT createDxgiFactory(UINT Flags, REFIID riid, void **ppFactory) {
     try {

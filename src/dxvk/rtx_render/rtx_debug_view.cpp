@@ -19,6 +19,7 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include "rtx_pre_exposure.h"
 #include "rtx_debug_view.h"
 #include "dxvk_device.h"
 #include "dxvk_context.h"
@@ -35,7 +36,6 @@
 #include "rtx_imgui.h"
 #include "dxvk_scoped_annotation.h"
 #include "rtx_context.h"
-#include "rtx_atmosphere.h"
 #include "rtx_terrain_baker.h"
 #include "rtx_neural_radiance_cache.h"
 #include "rtx_nrd_context.h"
@@ -87,8 +87,22 @@ namespace dxvk {
         {DEBUG_VIEW_TEXCOORDS_GRADIENT_X, "Texture Coordinates Gradient X"},
         {DEBUG_VIEW_TEXCOORDS_GRADIENT_Y, "Texture Coordinates Gradient Y"},
         {DEBUG_VIEW_TEXCOORD_GENERATION_MODE, "Texture Coordinates Generation Mode"},
+        {DEBUG_VIEW_EYE_REGIONS, "Eye Regions (whites/cornea/iris)",
+                                "Colors the regions eye shading distinguishes, blended over the diffuse albedo:\n"
+                                "Red: iris (rtx.eye.irisRadius) - the albedo/iris texture blend region\n"
+                                "Blue: cornea (rtx.eye.irisRadius + 0.04) - eyeCalcNormalFrame's normal-bump region\n"
+                                "Green: whites - outside both of the above\n"
+                                "White dot: the computed eye center (where the projected UV is exactly 0.5, 0.5)\n"
+                                "Unblended diffuse albedo: not classified as an eye\n"
+                                "Parameterize via:\n"
+                                "Debug Knob [0]: region color overlay opacity, 0-1 [Default: 0.5]"},
         {DEBUG_VIEW_VIRTUAL_MOTION_VECTOR, "Virtual Motion Vector"},
         {DEBUG_VIEW_SCREEN_SPACE_MOTION_VECTOR, "Screen-Space Motion Vector"},
+        {DEBUG_VIEW_CLOUD_MOTION_VECTOR_MASK, "Cloud Motion Vector Mask",
+                                              "Where the sky provider's clouds replace the motion vectors and depth the upscalers and frame generation read.\n"
+                                              "Red: the cloud's weight in the motion vector\n"
+                                              "Green: cloud opacity\n"
+                                              "Blue: the depth is the cloud's"},
         {DEBUG_VIEW_TRIANGLE_NORMAL, "Triangle Normal"},
         {DEBUG_VIEW_INTERPOLATED_VERTEX_NORMAL, "Interpolated Vertex Normal"},
         {DEBUG_VIEW_GEOMETRY_NORMAL, "Geometry Normal"},
@@ -121,6 +135,14 @@ namespace dxvk {
         {DEBUG_VIEW_ANISOTROPY, "Anisotropy"},
         {DEBUG_VIEW_ANISOTROPIC_ROUGHNESS, "Anisotropic Roughness"},
         {DEBUG_VIEW_OPACITY, "Opacity"},
+        {DEBUG_VIEW_CUTOUT_DIAGNOSIS, "Cutout Diagnosis",
+                                "Diagnostic: why a primary surface shows where its texture is transparent.\n"
+                                "R = the albedo texel under the hit has alpha < 0.5, G = the surface is flagged fully opaque,\n"
+                                "B = an alpha test is set. YELLOW = transparent texel on a surface without its alpha state\n"
+                                "(submitted without the test). MAGENTA = test set, texel transparent, kept anyway (resolver).\n"
+                                "Blue/green/cyan = normal. Paler = decal or particle surface.\n"
+                                "Debug Knob y = 1: frac(uv) in RG, blue where uv is outside [0, 1].\n"
+                                "Debug Knob y = 2: albedo mip sampled, black (0) .. white (10); red = mip 6 or coarser."},
         {DEBUG_VIEW_EMISSIVE_RADIANCE, "Emissive Radiance"},
         {DEBUG_VIEW_EMISSIVE_TRIANGLE_INTENSITY, "Emissive Triangle Intensity"},
         {DEBUG_VIEW_SURFACE_AREA, "Surface Area"},
@@ -139,77 +161,6 @@ namespace dxvk {
                                 "0: AlbedoOpacity, 1: Normal, 2: Tangent, 3: Height,\n"
                                 "4: Roughness, 5: Metallic, 6: Emissive"},
 
-        {DEBUG_VIEW_CLOUD_SKY_TRANSMITTANCE_LUT, "Atmosphere: Cloud Sky Transmittance LUT",
-                                "Fork diagnostic. Visualizes the 32x16 cloud-occluded sky-ambient\n"
-                                "transmittance LUT baked by cloud_sky_transmittance_lut.comp.slang.\n"
-                                "Stretched to fill the screen; red = full occlusion (thick cumulus),\n"
-                                "black = clear sky in that direction.\n"
-                                "X axis = azimuth [0, 360 deg], Y axis = elevation [-90, +90 deg]\n"
-                                "(bottom half = below horizon, always clear)."},
-        {DEBUG_VIEW_CLOUD_D_SUN, "Atmosphere: Cloud D_sun Voxel Grid",
-                                "Fork diagnostic. Visualizes the Nubis Cubed sun-direction optical-\n"
-                                "depth voxel grid (mid-Z slice). Grayscale: bright = thick cloud\n"
-                                "between voxel and sun, dark = clear sky path. Cumulus cells should\n"
-                                "appear as cellular patterns. Move the sun to verify the pattern\n"
-                                "shifts. Scaling: intensity = saturate(opticalDepth * 0.2)."},
-        {DEBUG_VIEW_CLOUD_D_AMBIENT, "Atmosphere: Cloud D_ambient Voxel Grid",
-                                "Fork diagnostic. Visualizes the Nubis Cubed zenith optical-depth\n"
-                                "voxel grid (mid-Z slice). Expected: mostly uniform brightness\n"
-                                "(zenith path is mostly empty air above the slab); some banding\n"
-                                "where the slab is dense. Scaling: intensity = saturate(opticalDepth * 0.2)."},
-        {DEBUG_VIEW_CLOUD_GROUND_SHADOW_PRODSHAPE, "Atmosphere: Cloud Ground Shadow (Production Call Shape)",
-                                "Fork diagnostic - CRITICAL GATE for the Nubis Cubed cloud-on-terrain\n"
-                                "shadow workstream. Paints sampleCloudGroundShadow_OptionB output at\n"
-                                "each G-buffer pixel using the EXACT per-pixel call shape\n"
-                                "(worldPos, sunDir, args, isZUp) the upcoming NEE wiring will use.\n"
-                                "Grayscale: white = sun unoccluded by clouds, black = full shadow.\n"
-                                "Visual gate: stand on flat terrain at sunset and compare with the\n"
-                                "Cloud D_sun Voxel Grid view (873). Cumulus shadow patches in this\n"
-                                "view should spatially match the D_sun cumulus pattern. If they\n"
-                                "disagree on cumulus position, isZUp handling is mismatched between\n"
-                                "the debug-view call path and the production NEE call path - fix\n"
-                                "before wiring NEE in Task 6."},
-        {DEBUG_VIEW_CLOUD_RENDER_RT, "Atmosphere: Cloud Render RT (Nubis Cubed)",
-                                "Fork diagnostic. Visualizes the Nubis Cubed cloud render RT produced\n"
-                                "by cloud_render.comp.slang (C4 of the 2026-05-12 workstream). Per-\n"
-                                "pixel cloud radiance from the page-137 two-HG-lobe direct term +\n"
-                                "page-142 ambient pow(1 - dim_profile, 0.5) * exp(-D_ambient).\n"
-                                "Visual gate: toggle this debug view off and on with Sky Mode = Physical\n"
-                                "Atmosphere active to inspect the raw cloud render before compositing.\n"
-                                "Expected look: top-bright / bottom-dark cumulus\n"
-                                "gradient, less-flat shadow side, stronger silver lining at backlit\n"
-                                "edges. Tune via the Atmosphere -> Clouds -> Nubis Cubed Lighting\n"
-                                "ImGui block (six magic-constant sliders)."},
-        {DEBUG_VIEW_CLOUD_GROUND_SHADOW_RAW_OD, "Atmosphere: Cloud Ground Shadow RAW OD (Sibling of 875)",
-                                "Fork diagnostic (2026-05-17). Sibling of enum 875: same per-pixel\n"
-                                "call shape but the math stops at the dSunTex.SampleLevel call - NO\n"
-                                "exp(), NO mix(cloudShadowStrength). Exists because 875 paints solid\n"
-                                "white in-game and we need the pre-exp/mix truth.\n"
-                                "Channels:\n"
-                                "  R = saturate(OD * 0.2)   matches 873's vis scale; direct A/B vs bake\n"
-                                "  G = saturate(OD)         raw magnitude; distinguishes amplified-tiny\n"
-                                "                           from actually-visible-sized\n"
-                                "  B = uvw.x at the consumer's lookup position\n"
-                                "Sentinels:\n"
-                                "  magenta = surface above slab; blue = sun below horizon / unreachable\n"
-                                "Discrimination (stand on flat terrain at midday):\n"
-                                "  R uniform AND B uniform   -> SCENE-SCALE bug (every pixel reads same\n"
-                                "                                UVW; fix cloudVoxelGridExtentKm or the\n"
-                                "                                worldPosKm -> UVW conversion)\n"
-                                "  R patterned, matches 873  -> consumer works; exp+mix is killing it\n"
-                                "  R patterned but unrelated -> world-anchoring / slab-bottom bug\n"
-                                "  R dark, G even darker     -> magnitude underflow (bake OD tiny)"},
-        {DEBUG_VIEW_CLOUD_NVDF_SDF, "Atmosphere: Cloud NVDF SDF Slice (Nubis3)",
-                                "Fork diagnostic (Nubis3 conversion Phase A). Horizontal slice of the\n"
-                                "cloud-body signed distance field at height fraction 0.25, one full\n"
-                                "noise-tile period. Screen X = world X, screen Y = world Z.\n"
-                                "  Green band = the zero-crossing iso-line (cloud body outline)\n"
-                                "  Warm ramp  = inside (bright = deep core, saturates ~1.5 km)\n"
-                                "  Cool ramp  = outside (dark = far clear sky, saturates ~4 km)\n"
-                                "Validation gates: bodies read as smooth blobby cells matching the\n"
-                                "placement-map clusters; the green outline is clean (no speckle =\n"
-                                "JFA converged); the pattern is seamless across the tile wrap; and\n"
-                                "dragging Cloud Cell Size re-bakes it live (amortized, ~6 frames)."},
         {DEBUG_VIEW_CASCADE_LEVEL, "Terrain: Cascade Level"},
 
         {DEBUG_VIEW_VIRTUAL_HIT_DISTANCE, "Virtual Hit Distance"},
@@ -247,7 +198,6 @@ namespace dxvk {
 
         {DEBUG_VIEW_POST_TONEMAP_OUTPUT, "Final Output"},
         {DEBUG_VIEW_PRE_TONEMAP_OUTPUT, "Final Output (Pre Tonemap)"},
-        {DEBUG_VIEW_EXPOSURE_HISTOGRAM, "Exposure Histogram"},
 
         {DEBUG_VIEW_VIEW_MODEL, "View Model: Final Output"},
         {DEBUG_VIEW_RESTIR_GI_INITIAL_SAMPLE, "ReSTIR GI Initial Sample"},
@@ -265,6 +215,14 @@ namespace dxvk {
         {DEBUG_VIEW_NEE_CACHE_TASK, "NEE Cache Task"},
         {DEBUG_VIEW_NEE_CACHE_TRIANGLE_CANDIDATE, "NEE Cache Triangle Candidate"},
 
+        // Debug Knob X picks the indirect vertex of the SHARC views (0 = first indirect hit).
+        {DEBUG_VIEW_SHARC_QUERY_OUTCOME, "SHARC Query Outcome (green hit, red miss, blue too close, yellow footprint, grey rejected)"},
+        {DEBUG_VIEW_SHARC_REJECT_REASON, "SHARC Reject Reason"},
+        {DEBUG_VIEW_SHARC_CACHED_RADIANCE, "SHARC Cached Radiance"},
+        {DEBUG_VIEW_SHARC_TERMINATION_BOUNCE, "SHARC Termination Bounce"},
+        {DEBUG_VIEW_SHARC_GRID_CELLS, "SHARC Grid Cells"},
+        {DEBUG_VIEW_SHARC_CELL_AGE, "SHARC Cell Age"},
+
         {DEBUG_VIEW_RTXDI_GRADIENTS, "RTXDI Gradients"},
         {DEBUG_VIEW_RTXDI_CONFIDENCE, "RTXDI Confidence"},
 
@@ -273,8 +231,6 @@ namespace dxvk {
         {DEBUG_VIEW_STOCHASTIC_ALPHA_BLEND_GEOMETRY_HASH, "Stochastic Alpha Blend Geometry Hash"},
         {DEBUG_VIEW_STOCHASTIC_ALPHA_BLEND_BACKGROUND_TRANSPARENCY, "Stochastic Alpha Blend Background Transparency"},
 
-        {DEBUG_VIEW_RAY_RECONSTRUCTION_PARTICLE_LAYER, "DLSS-RR Particle Layer"},
-        {DEBUG_VIEW_RAY_RECONSTRUCTION_PARTICLE_LAYER_ALPHA, "DLSS-RR Particle Layer Alpha"},
         {DEBUG_VIEW_RAY_RECONSTRUCTION_DIFFUSE_ALBEDO, "DLSS-RR Diffuse Albedo"},
         {DEBUG_VIEW_RAY_RECONSTRUCTION_SPECULAR_ALBEDO, "DLSS-RR Specular Albedo"},
         {DEBUG_VIEW_RAY_RECONSTRUCTION_HIT_DISTANCE, "DLSS-RR Hit Distance"},
@@ -282,6 +238,7 @@ namespace dxvk {
         {DEBUG_VIEW_RAY_RECONSTRUCTION_PRIMARY_WORLD_SHADING_NORMAL, "DLSS-RR Normal"},
         {DEBUG_VIEW_RAY_RECONSTRUCTION_PRIMARY_SCREEN_SPACE_MOTION_VECTOR, "DLSS-RR Motion Vector"},
         {DEBUG_VIEW_RAY_RECONSTRUCTION_PRIMARY_DISOCCLUSION_MASK, "DLSS-RR Disocclusion Mask"},
+        {DEBUG_VIEW_RAY_RECONSTRUCTION_INPUT_COLOR, "DLSS-RR Input Color"},
 
         {DEBUG_VIEW_GEOMETRY_FLAGS_FIRST_SAMPLED_LOBE_IS_SPECULAR, "Geometry Flags: First Sampled Lobe Is Specular"},
         {DEBUG_VIEW_INTEGRATE_INDIRECT_FIRST_RAY_THROUGHPUT, "Indirect First Ray Throughput"},
@@ -372,6 +329,39 @@ namespace dxvk {
                                                                             "Valid values will be greyscale."
                                                                             "\nColored pixels indicate errors happened"
                                                                             "\nwhen passing POM state between passes."},
+        {DEBUG_VIEW_POM_CONE_RATIO,                                        "SCCR Cone Ratio",
+                                                                            "Grey: sqrt of the cone ratio. Blue: cones not generated yet."
+                                                                            "\nRed: displaced material without a cone map (SCCR mode only)."},
+        {DEBUG_VIEW_POM_CONE_ERROR,                                        "SCCR Cone Error",
+                                                                            "Texels between the SCCR hit and a 256-step linear march:"
+                                                                            "\ngreen 0, red 2 or more. Dark red: SCCR not running (not SCCR mode, or no displaced material bound)."},
+        {DEBUG_VIEW_POM_DEPTH_SCALE,                                       "SCCR World Depth Scale",
+                                                                            "Texture density against rtx.displacement.referenceWorldUnitsPerUv:"
+                                                                            "\ngreen at the reference, red tiled denser (deeper in UV, full at 4x),"
+                                                                            "\nblue stretched (full at 1/4). Magenta: unknown. Dark red: SCCR not running (not SCCR mode,"
+                                                                            "\nor no displaced material bound)."},
+        {DEBUG_VIEW_SCCR_SHELL_EDGES,                                      "SCCR Shell Edges",
+                                                                            "Shell data (rtx.displacement.shell.enable): mid grey none; light grey, thin dark lines:"
+                                                                            "\nwelded edges; green: welded across split vertices (hard edge or UV seam). Boundaries: red open,"
+                                                                            "\norange non-manifold, blue flipped winding, yellow degenerate direction at an end."
+                                                                            "\nCorner dots: yellow degenerate direction, magenta unwelded."},
+        {DEBUG_VIEW_SCCR_SHELL_STEPS,                                      "SCCR Shell Steps",
+                                                                            "Shell march steps (solves, crossings, refinement) over the step budget: green few, red all."
+                                                                            "\nPlain SCCR pixels as in SCCR Shell Result."},
+        {DEBUG_VIEW_SCCR_SHELL_CROSSINGS,                                  "SCCR Shell Prisms Crossed",
+                                                                            "Prisms the shell march crossed into: dark green none, yellow one, red maxPrisms."
+                                                                            "\nPlain SCCR pixels as in SCCR Shell Result."},
+        {DEBUG_VIEW_SCCR_SHELL_RESULT,                                     "SCCR Shell Result",
+                                                                            "Why the shell march stopped: green hit, red boundary exit, yellow outer exit (both shade plain"
+                                                                            "\nSCCR at the hit); magenta out of steps or prisms, cyan fold or failed solve."
+                                                                            "\nPlain SCCR: black no displacement, mid grey no shell data, orange entry failed; blue beyond the"
+                                                                            "\nhand-off (camera-to-hit distance along the ray), bright just past maxDistance, a quarter as bright at 4x."
+                                                                            "\nDark violet: shell march off (shell.enable, maxDistance 0 or referenceWorldUnitsPerUv 0)."
+                                                                            "\nDark red: SCCR not running (not SCCR mode, or no displaced material bound)."},
+        {DEBUG_VIEW_SCCR_SHELL_SHADOW,                                     "SCCR Shell Shadow Steps",
+                                                                            "Shell self-shadow march (rtx.displacement.shell.shadows), direct light: steps over the budget,"
+                                                                            "\ngreen few, red all; darker where shadowed (to 0.4 fully). Blue: light not leaving the shell (lit)."
+                                                                            "\nMid grey: carved point not found. Black: not a shell pixel, or shell shadows off."},
         {DEBUG_VIEW_RAYTRACED_RENDER_TARGET_GEOMETRY,                      "Raytraced Render Target Geometry" },
         {DEBUG_VIEW_RAYTRACED_RENDER_TARGET_DIRECT,                        "Hit Raytraced Render Target in Direct"},
         {DEBUG_VIEW_RAYTRACED_RENDER_TARGET_INDIRECT,                      "Hit Raytraced Render Target in Indirect"},
@@ -413,26 +403,14 @@ namespace dxvk {
                                                   "  1: World Normal\n"
                                                   "  2: World Tangent\n"
                                                   "  3: World Bitangent" },
-        {DEBUG_VIEW_SPARSE_RENDERING_DIRECT_PIXEL_SAMPLING_RATE,        "Sparse Rendering Direct Final Sampling Probability",
-                                                                        "Shows the per-pixel direct-lighting final sampling probability." },
-        {DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_PIXEL_SAMPLING_RATE,      "Sparse Rendering Indirect Final Sampling Probability",
-                                                                        "Shows the per-pixel indirect-lighting final sampling probability." },
+        {DEBUG_VIEW_SPARSE_RENDERING_PIXEL_SAMPLING_RATE,        "Sparse Rendering Final Sampling Probability",
+                                                                 "Shows the per-pixel final sampling probability." },
         {DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_PIXELS_MASK,         "Sparse Rendering Active Pixel Mask",
                                                                  "Shows the actual stochastic active pixels selected this frame." },
-        {DEBUG_VIEW_SPARSE_RENDERING_DIRECT_ACTIVE_PIXELS_PERCENTAGE, "Sparse Rendering Direct Active Pixels Percentage",
-                                                                 "Shows the per-pixel direct-lighting sampling probability." },
-        {DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_ACTIVE_PIXELS_PERCENTAGE, "Sparse Rendering Indirect Active Pixels Percentage",
-                                                                 "Shows the per-pixel indirect-lighting sampling probability." },
-        {DEBUG_VIEW_SPARSE_RENDERING_DIRECT_ACTIVE_PIXELS_OUTPUT_SCALE, "Sparse Rendering Direct Active Pixel Output Scale",
-                                                                 "Shows 1 / direct sampling probability on pixels selected by the active pixel mask." },
-        {DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_ACTIVE_PIXELS_OUTPUT_SCALE, "Sparse Rendering Indirect Active Pixel Output Scale",
-                                                                 "Shows 1 / indirect sampling probability on pixels selected by the active pixel mask." },
-        {DEBUG_VIEW_SPARSE_RENDERING_UNION_ACTIVE_THREADS, "Sparse Rendering Union Active Threads",
-                                                                 "Outputs 1 for pixels whose composite thread was union-active (direct or indirect active, or a primary miss)." },
-        {DEBUG_VIEW_SPARSE_RENDERING_DIRECT_ACTIVE_THREADS, "Sparse Rendering Direct Active Threads",
-                                                                 "Outputs 1 for pixels whose composite thread was direct-active." },
-        {DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_ACTIVE_THREADS, "Sparse Rendering Indirect Active Threads",
-                                                                 "Outputs 1 for pixels whose composite thread was indirect-active." },
+        {DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_PIXELS_OUTPUT_SCALE, "Sparse Rendering Active Pixel Output Scale",
+                                                                 "Shows 1 / sampling probability on pixels selected by the active pixel mask." },
+        {DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_THREADS,             "Sparse Rendering Active Threads",
+                                                                 "Outputs 1 for pixels whose composite thread was active (or a primary miss)." },
 
         {DEBUG_VIEW_SHADOW_TERMINATOR_OFFSET, "Shadow Terminator Offset"},
       };
@@ -670,11 +648,6 @@ namespace dxvk {
         TEXTURE2D(DEBUG_VIEW_BINDING_ALTERNATE_DISOCCLUSION_THRESHOLD_INPUT)
         TEXTURE2D(DEBUG_VIEW_BINDING_PREV_WORLD_POSITION_INPUT)
         TEXTURE2D(DEBUG_VIEW_BINDING_SHARED_TERMINATOR_FIX_INPUT)
-        TEXTURE2D(DEBUG_VIEW_BINDING_CLOUD_SKY_TRANSMITTANCE_LUT_INPUT)
-        TEXTURE3D(DEBUG_VIEW_BINDING_CLOUD_D_SUN_INPUT)
-        TEXTURE3D(DEBUG_VIEW_BINDING_CLOUD_D_AMBIENT_INPUT)
-        TEXTURE2D(DEBUG_VIEW_BINDING_CLOUD_RENDER_RT_INPUT)
-        TEXTURE3D(DEBUG_VIEW_BINDING_CLOUD_NVDF_SDF_INPUT)
 
         RW_TEXTURE2D(DEBUG_VIEW_BINDING_ACCUMULATED_DEBUG_VIEW_INPUT_OUTPUT)
 
@@ -1224,6 +1197,10 @@ namespace dxvk {
     // Accumulation per-frame setup
     {
       RtxContext& rtxCtx = dynamic_cast<RtxContext&>(*ctx.ptr());
+      // Accumulated radiance is at the previous pre-exposure after a step (rtx_pre_exposure.h).
+      if (PreExposure::stepped()) {
+        m_accumulation.resetNumAccumulatedFrames();
+      }
       m_accumulation.onFrameBegin(
         rtxCtx, Accumulation::enable(), Accumulation::numberOfFramesToAccumulate(),
         Accumulation::resetOnCameraTransformChange());
@@ -1288,14 +1265,8 @@ namespace dxvk {
     debugViewArgs.debugKnob = m_debugKnob;
     debugViewArgs.camera = rtOutput.m_raytraceArgs.camera;
     debugViewArgs.volumeArgs = rtOutput.m_raytraceArgs.volumeArgs;
-    // Fork: mirror atmosphere + isZUp from RaytraceArgs so cloud
-    // diagnostic debug views (DEBUG_VIEW_CLOUD_GROUND_SHADOW_PRODSHAPE)
-    // can call production atmosphere helpers with the production
-    // call shape. These fields are populated unconditionally - debug
-    // views that don't need them simply ignore the values.
-    debugViewArgs.atmosphereArgs = rtOutput.m_raytraceArgs.atmosphereArgs;
+    // Mirrors isZUp from RaytraceArgs for debug views that need the world up axis.
     debugViewArgs.isZUp = rtOutput.m_raytraceArgs.isZUp;
-
     if (displayType() == DebugViewDisplayType::Standard) {
       debugViewArgs.pseudoColorMode = pseudoColorMode();
       debugViewArgs.enableAlphaChannelFlag = m_enableAlphaChannel;
@@ -1326,7 +1297,8 @@ namespace dxvk {
 
     debugViewArgs.samplerType = samplerType();
 
-    debugViewArgs.isRTXDIConfidenceValid = rtOutput.getCurrentRtxdiConfidence().matchesWriteFrameIdx(frameIdx);
+    debugViewArgs.isRTXDIConfidenceValid = ctx.getResourceManager().areRtxdiGradientResourcesAllocated() &&
+                                           rtOutput.getCurrentRtxdiConfidence().matchesWriteFrameIdx(frameIdx);
 
     RayPortalManager::SceneData portalData = common.getSceneManager().getRayPortalManager().getRayPortalInfoSceneData();
     debugViewArgs.numActiveRayPortals = portalData.numActiveRayPortals;
@@ -1427,7 +1399,10 @@ namespace dxvk {
     ctx->bindResourceView(DEBUG_VIEW_BINDING_PRIMARY_LINEAR_VIEW_Z_INPUT, rtOutput.m_primaryLinearViewZ.view, nullptr);
     ctx->bindResourceView(DEBUG_VIEW_BINDING_PRIMARY_VIRTUAL_WORLD_SHADING_NORMAL_PERCEPTUAL_ROUGHNESS_INPUT, rtOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughness.view, nullptr);
     ctx->bindResourceView(DEBUG_VIEW_BINDING_PRIMARY_SCREEN_SPACE_MOTION_VECTOR_INPUT, rtOutput.m_primaryScreenSpaceMotionVector.view, nullptr);
-    ctx->bindResourceView(DEBUG_VIEW_BINDING_RTXDI_CONFIDENCE_INPUT, rtOutput.getCurrentRtxdiConfidence().view(Resources::AccessType::Read, debugViewArgs.isRTXDIConfidenceValid), nullptr);
+    ctx->bindResourceView(DEBUG_VIEW_BINDING_RTXDI_CONFIDENCE_INPUT,
+      ctx->getResourceManager().areRtxdiGradientResourcesAllocated()
+        ? rtOutput.getCurrentRtxdiConfidence().view(Resources::AccessType::Read, debugViewArgs.isRTXDIConfidenceValid)
+        : nullptr, nullptr);
     Rc<DxvkImageView> renderOutput =
       shouldRunDispatchPostCompositePass()
       ? rtOutput.m_compositeOutput.view(Resources::AccessType::Read)
@@ -1441,49 +1416,6 @@ namespace dxvk {
                       ReplacementMaterialTextureType::Count - 1));
     Resources::Resource terrain = common.getSceneManager().getTerrainBaker().getTerrainTexture(terrainTextureType);
     ctx->bindResourceView(DEBUG_VIEW_BINDING_TERRAIN_INPUT, terrain.view, nullptr);
-
-    // Numos atmosphere diagnostics. Initialize once so all lazily-created
-    // resources are valid before exposing them to the debug view.
-    RtxAtmosphere& atmosphere = common.metaAtmosphere();
-    atmosphere.initialize(ctx);
-
-    Resources::Resource cloudSkyTransLut = atmosphere.getCloudSkyTransmittanceLut();
-    if (cloudSkyTransLut.isValid()) {
-      ctx->bindResourceView(
-        DEBUG_VIEW_BINDING_CLOUD_SKY_TRANSMITTANCE_LUT_INPUT,
-        cloudSkyTransLut.view,
-        nullptr);
-    }
-
-    {
-      const Resources::Resource& cloudDSun = atmosphere.getCloudDSun();
-      if (cloudDSun.isValid()) {
-        ctx->bindResourceView(DEBUG_VIEW_BINDING_CLOUD_D_SUN_INPUT, cloudDSun.view, nullptr);
-      }
-    }
-    {
-      const Resources::Resource& cloudDAmbient = atmosphere.getCloudDAmbient();
-      if (cloudDAmbient.isValid()) {
-        ctx->bindResourceView(DEBUG_VIEW_BINDING_CLOUD_D_AMBIENT_INPUT, cloudDAmbient.view, nullptr);
-      }
-    }
-    {
-      const Resources::Resource& cloudNvdfSdf = atmosphere.getCloudNvdfSdf();
-      if (cloudNvdfSdf.isValid()) {
-        ctx->bindResourceView(DEBUG_VIEW_BINDING_CLOUD_NVDF_SDF_INPUT, cloudNvdfSdf.view, nullptr);
-      }
-    }
-    {
-      const Resources::Resource& cloudRenderRT = atmosphere.getCloudRenderRT();
-      if (cloudRenderRT.isValid()) {
-        ctx->bindResourceView(DEBUG_VIEW_BINDING_CLOUD_RENDER_RT_INPUT, cloudRenderRT.view, nullptr);
-      }
-    }
-
-    // Fork: the post-denoise cumulus shadow factor texture (debug view 878) was
-    // removed 2026-06-19 along with the screen-space cloud-shadow system. The
-    // cloud shadow now folds onto the sun radiance in the NEE; use enum 875/877
-    // (which read the D_sun grid directly) to diagnose cloud-on-terrain shadows.
 
     ctx->bindResourceView(DEBUG_VIEW_BINDING_VOLUME_RESERVOIRS_INPUT, globalVolumetrics.getPreviousVolumeReservoirs().view, nullptr);
     ctx->bindResourceView(DEBUG_VIEW_BINDING_VOLUME_AGE_INPUT, globalVolumetrics.getCurrentVolumeAccumulatedRadianceAge().view, nullptr);

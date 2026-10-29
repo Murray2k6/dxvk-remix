@@ -21,15 +21,13 @@
 */
 
 #include "rtx_fork_fsr_framegen.h"
+#include "rtx_fork_fsr.h"
 #include "rtx_fork_hooks.h"
 #include "rtx_context.h"
-#include "rtx_scene_manager.h"
 #include "rtx_camera.h"
 #include "../util/util_once.h"
-#include "../util/util_global_time.h"
 #include "../dxvk_device.h"
 #include "../dxvk_context.h"
-#include "../dxvk_cmdlist.h"
 
 // FFX SDK includes - only in cpp file
 #undef FFX_API_ENTRY
@@ -47,161 +45,108 @@
 #undef FFX_API_ENTRY
 #define FFX_API_ENTRY
 
+#include <algorithm>
+#include <initializer_list>
 #include <vector>
-#include <mutex>
-#include <map>
-#include <unordered_map>
 
 namespace dxvk {
 
   namespace {
-    struct FsrPresentColorOverrideEntry {
-      Rc<DxvkImage> image;
-      FfxApiResource resource = FfxApiResource({});
-    };
+    // Presents without frame generation inputs before frame generation is configured off.
+    constexpr uint32_t kMaxConsecutiveSkips = 4;
+    constexpr uint64_t kLogIntervalPresents = 600;
 
-    std::mutex g_fsrFrameGenCallbackStateMutex;
-    std::unordered_map<ffxContext, std::map<uint64_t, FsrPresentColorOverrideEntry>> g_fsrFrameGenPresentColorOverride;
+    // The FFX state of an image in this layout. FFX transitions registered resources from it and back.
+    uint32_t ffxStateForLayout(VkImageLayout layout) {
+      return layout == VK_IMAGE_LAYOUT_GENERAL
+        ? FFX_API_RESOURCE_STATE_UNORDERED_ACCESS
+        : FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ;
+    }
 
-    FfxApiResource createFfxResourceFromImage(const Rc<DxvkImage>& image, uint32_t state, uint32_t additionalUsages = FFX_API_RESOURCE_USAGE_READ_ONLY) {
-      if (image == nullptr)
+    FfxApiResource createFfxResource(const Rc<DxvkImage>& image, VkFormat viewFormat, uint32_t state) {
+      if (image == nullptr) {
         return FfxApiResource({});
+      }
 
       VkImageCreateInfo createInfo = {};
       createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
       createInfo.imageType = VK_IMAGE_TYPE_2D;
-      createInfo.format = image->info().format;
+      createInfo.format = viewFormat;
       createInfo.extent = image->info().extent;
-      createInfo.mipLevels = image->info().mipLevels;
-      createInfo.arrayLayers = image->info().numLayers;
-      createInfo.samples = image->info().sampleCount;
+      createInfo.extent.depth = 1;
+      createInfo.mipLevels = 1;
+      createInfo.arrayLayers = 1;
+      createInfo.samples = VK_SAMPLE_COUNT_1_BIT;
       createInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
       createInfo.usage = image->info().usage;
       createInfo.flags = image->info().flags;
 
-      FfxApiResourceDescription desc = ffxApiGetImageResourceDescriptionVK(
-        image->handle(),
-        createInfo,
-        additionalUsages);
-
-      return ffxApiGetResourceVK(
-        reinterpret_cast<void*>(image->handle()),
-        desc,
-        state);
+      // Read-only usage only: the depth input is an R32_SFLOAT color image, and FFX's depth-target
+      // usage would make it create a D32_SFLOAT view with the depth aspect.
+      const FfxApiResourceDescription desc =
+        ffxApiGetImageResourceDescriptionVK(image->handle(), createInfo, FFX_API_RESOURCE_USAGE_READ_ONLY);
+      return ffxApiGetResourceVK(reinterpret_cast<void*>(image->handle()), desc, state);
     }
-  }
 
-  // Helper to access config
-  static ffx::ConfigureDescFrameGeneration& asFrameGenConfig(void* cfg) {
-    return *reinterpret_cast<ffx::ConfigureDescFrameGeneration*>(cfg);
-  }
+    FfxApiResource createFfxResource(const Rc<DxvkImageView>& view, VkImageLayout layout) {
+      if (view == nullptr) {
+        return FfxApiResource({});
+      }
+      return createFfxResource(view->image(), view->info().format, ffxStateForLayout(layout));
+    }
 
-  static VkSwapchainCreateInfoKHR buildSwapchainCreateInfoFromPresenter(
-    const vk::PresenterInfo& info,
-    VkSurfaceKHR surface,
-    VkSwapchainKHR oldSwapchain)
-  {
-    VkSwapchainCreateInfoKHR swapInfo = {};
-    swapInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
-    swapInfo.pNext = nullptr;
-    swapInfo.flags = 0;
-    swapInfo.surface = surface;
-    swapInfo.minImageCount = info.imageCount;
-    swapInfo.imageFormat = info.format.format;
-    swapInfo.imageColorSpace = info.format.colorSpace;
-    swapInfo.imageExtent = info.imageExtent;
-    swapInfo.imageArrayLayers = 1;
-    swapInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-                        | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                        | VK_IMAGE_USAGE_STORAGE_BIT;
-    swapInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    swapInfo.queueFamilyIndexCount = 0;
-    swapInfo.pQueueFamilyIndices = nullptr;
-    swapInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-    swapInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    swapInfo.presentMode = info.presentMode;
-    swapInfo.clipped = VK_TRUE;
-    swapInfo.oldSwapchain = oldSwapchain;
-    return swapInfo;
-  }
+    ffx::ConfigureDescFrameGeneration& asFrameGenConfig(void* cfg) {
+      return *reinterpret_cast<ffx::ConfigureDescFrameGeneration*>(cfg);
+    }
 
-  // Static callback for frame generation dispatch  
-  // pUserCtx is the ffx::Context value (void*) for the frame gen context
-  static ffxReturnCode_t frameGenCallback(ffxDispatchDescFrameGeneration* params, void* pUserCtx) {
-    // pUserCtx IS the context (void*), pass its address as required by ffxDispatch
-    ffxContext ctx = static_cast<ffxContext>(pUserCtx);
+    ffx::Context& asContext(void*& ctx) {
+      return *reinterpret_cast<ffx::Context*>(&ctx);
+    }
 
-    bool hasPathTracedOverride = false;
-    uint64_t selectedFrameId = 0;
-
-    {
-      std::lock_guard<std::mutex> lock(g_fsrFrameGenCallbackStateMutex);
-      auto ctxIt = g_fsrFrameGenPresentColorOverride.find(ctx);
-      if (ctxIt != g_fsrFrameGenPresentColorOverride.end()) {
-        auto& perFrame = ctxIt->second;
-        auto frameIt = perFrame.find(params->frameID);
-
-        // If exact match is unavailable, prefer the newest prepared frame that is
-        // not newer than the callback frame ID.
-        if (frameIt == perFrame.end() && !perFrame.empty()) {
-          auto upper = perFrame.upper_bound(params->frameID);
-          if (upper != perFrame.begin())
-            frameIt = std::prev(upper);
-        }
-
-        if (frameIt != perFrame.end()) {
-          selectedFrameId = frameIt->first;
-
-          // Refuse large frame deltas since they produce severe FG artifacts.
-          const uint64_t maxAcceptedDelta = 2;
-          if (params->frameID >= selectedFrameId && (params->frameID - selectedFrameId) > maxAcceptedDelta) {
-            Logger::warn(str::format(
-              "FSR FG: Rejecting stale presentColor override. callbackFrame=", params->frameID,
-              " selectedFrame=", selectedFrameId,
-              " delta=", (params->frameID - selectedFrameId)));
-            return FFX_API_RETURN_ERROR_PARAMETER;
-          }
-
-          const auto& entry = frameIt->second;
-          if (entry.image != nullptr && entry.resource.resource != nullptr) {
-            params->presentColor = entry.resource;
-            hasPathTracedOverride = true;
-          }
-
-          // Consume up to and including the used frame to avoid stale buildup.
-          perFrame.erase(perFrame.begin(), std::next(frameIt));
-        }
+    uint32_t toFfxSurfaceFormat(VkFormat format) {
+      switch (format) {
+      case VK_FORMAT_R8G8B8A8_UNORM:           return FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
+      case VK_FORMAT_R8G8B8A8_SRGB:            return FFX_API_SURFACE_FORMAT_R8G8B8A8_SRGB;
+      case VK_FORMAT_B8G8R8A8_UNORM:           return FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM;
+      case VK_FORMAT_B8G8R8A8_SRGB:            return FFX_API_SURFACE_FORMAT_B8G8R8A8_SRGB;
+      case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM;
+      case VK_FORMAT_R16G16B16A16_SFLOAT:      return FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT;
+      default:                                 return FFX_API_SURFACE_FORMAT_UNKNOWN;
       }
     }
 
-    // If no explicit override is bound for this frame, allow the SDK-provided
-    // presentColor path (proxy swapchain path) to proceed so frame generation
-    // does not stall.
-    if (!hasPathTracedOverride) {
-      if (params->presentColor.resource == nullptr) {
-        Logger::warn(str::format("FSR FG: Missing presentColor for frame ", params->frameID, ", skipping generation dispatch"));
-        return FFX_API_RETURN_ERROR_PARAMETER;
+    // The HUD-less image is a blit of the Remix output into the back buffer format, so it matches the
+    // presented image bit for bit wherever the game draws nothing on top.
+    // An sRGB back buffer would encode the already display-encoded output a second time.
+    bool supportsHudLessCopy(VkFormat format) {
+      switch (format) {
+      case VK_FORMAT_R8G8B8A8_UNORM:
+      case VK_FORMAT_B8G8R8A8_UNORM:
+      case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+      case VK_FORMAT_R16G16B16A16_SFLOAT:
+        return true;
+      default:
+        return false;
       }
     }
 
-    return ffxDispatch(&ctx, &params->header);
+    uint32_t debugFlags() {
+      return DxvkFSRFrameGen::debugOverlay()
+        ? (FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_RESET_INDICATORS | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES)
+        : 0;
+    }
   }
 
   DxvkFSRFrameGen::DxvkFSRFrameGen(DxvkDevice* device)
-    : CommonDeviceObject(device) {
-    // Allocate frame gen config
+    : CommonDeviceObject(device)
+    , m_prepareCommandLists(device, 1, /* graphicsQueue */ true) {
     m_frameGenConfig = new ffx::ConfigureDescFrameGeneration{};
-    Logger::info("FSR FG: DxvkFSRFrameGen created");
   }
 
   void DxvkFSRFrameGen::onDestroy() {
-    Logger::info("FSR FG: onDestroy called");
     destroyContexts();
-    
-    if (m_frameGenConfig) {
-      delete reinterpret_cast<ffx::ConfigureDescFrameGeneration*>(m_frameGenConfig);
-      m_frameGenConfig = nullptr;
-    }
+    delete reinterpret_cast<ffx::ConfigureDescFrameGeneration*>(m_frameGenConfig);
+    m_frameGenConfig = nullptr;
   }
 
   bool DxvkFSRFrameGen::supportsFSRFrameGen() const {
@@ -212,11 +157,7 @@ namespace dxvk {
       return false;
     }
 
-    // FFX frame interpolation presents from a queue that is not the graphics
-    // queue and acquires swapchain images on a separate one. DxvkAdapter only
-    // populates these when the physical device actually exposes suitable
-    // families (see findQueues), so a null handle here means this GPU/driver
-    // combination cannot drive the interpolated present path.
+    // DxvkAdapter only creates these queues when the device has suitable families (see findQueues).
     const DxvkDeviceQueueSet& queues = m_device->queues();
     if (queues.fsrPresent.queueHandle == VK_NULL_HANDLE ||
         queues.imageAcquire.queueHandle == VK_NULL_HANDLE) {
@@ -228,652 +169,498 @@ namespace dxvk {
     return true;
   }
 
-
-  void DxvkFSRFrameGen::setDisplaySize(uint2 displaySize) {
-    if (m_displaySize.x != displaySize.x || m_displaySize.y != displaySize.y) {
-      m_displaySize = displaySize;
-      // Proxy swapchain path is optional; keep swapchain size in sync with presenter size
-      // so generationRect remains valid when proxy hooks are bypassed.
-      m_swapchainSize = displaySize;
-      Logger::info(str::format("FSR FG: Display size set to ", displaySize.x, "x", displaySize.y));
-      
-      // If contexts already exist, we need to recreate them for the new size
-      if (m_frameGenContextCreated) {
-        // Mark for recreation on next frame
-        // The actual recreation happens in prepareFrameGeneration
-      }
-    }
-  }
-
-  void DxvkFSRFrameGen::createSwapchainProxy(
-    VkPhysicalDevice physicalDevice,
-    VkDevice device,
-    VkSwapchainKHR* pSwapchain,
-    const VkSwapchainCreateInfoKHR* pCreateInfo)
-  {
-    if (m_swapchainContextCreated) {
-      Logger::warn("FSR FG: Swapchain proxy already created");
-      return;
-    }
-
-    Logger::info("FSR FG: Creating swapchain proxy...");
-      m_asyncWorkloadsSupported = false;
-    const VkSwapchainKHR originalSwapchain = pSwapchain ? *pSwapchain : VK_NULL_HANDLE;
-
-    // Store the swapchain size for use in generationRect
-    m_swapchainSize = { pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height };
-
-    // Get queues from device
+  bool DxvkFSRFrameGen::createContexts(VkSwapchainKHR* pSwapchain, const vk::PresenterInfo& info, VkSurfaceKHR surface) {
+    VkPhysicalDevice physicalDevice = m_device->adapter()->handle();
     const DxvkDeviceQueueSet& queues = m_device->queues();
 
-    // Debug: Log all input parameters
-    Logger::info(str::format("FSR FG: physicalDevice=", reinterpret_cast<uintptr_t>(physicalDevice)));
-    Logger::info(str::format("FSR FG: device=", reinterpret_cast<uintptr_t>(device)));
-    Logger::info(str::format("FSR FG: pSwapchain=", reinterpret_cast<uintptr_t>(pSwapchain), 
-      ", *pSwapchain=", reinterpret_cast<uintptr_t>(pSwapchain ? *pSwapchain : VK_NULL_HANDLE)));
-    Logger::info(str::format("FSR FG: createInfo surface=", reinterpret_cast<uintptr_t>(pCreateInfo->surface),
-      ", imageExtent=", pCreateInfo->imageExtent.width, "x", pCreateInfo->imageExtent.height,
-      ", format=", static_cast<int>(pCreateInfo->imageFormat)));
-    // AMD FidelityFX SDK 1.1.4 requires ALL 4 QUEUES TO BE SEPARATE (different VkQueue handles)
-    // If any queues are the same, init() returns VK_ERROR_INITIALIZATION_FAILED (error code 3)
-    // Log available queues for debugging
-    Logger::info(str::format("FSR FG: Available queues:"));
-    Logger::info(str::format("  graphics: queue=", reinterpret_cast<uintptr_t>(queues.graphics.queueHandle), ", family=", queues.graphics.queueFamily));
-    Logger::info(str::format("  asyncCompute: queue=", reinterpret_cast<uintptr_t>(queues.asyncCompute.queueHandle), ", family=", queues.asyncCompute.queueFamily));
-    Logger::info(str::format("  present: queue=", reinterpret_cast<uintptr_t>(queues.present.queueHandle), ", family=", queues.present.queueFamily));
-    Logger::info(str::format("  fsrPresent: queue=", reinterpret_cast<uintptr_t>(queues.fsrPresent.queueHandle), ", family=", queues.fsrPresent.queueFamily));
-    Logger::info(str::format("  imageAcquire: queue=", reinterpret_cast<uintptr_t>(queues.imageAcquire.queueHandle), ", family=", queues.imageAcquire.queueFamily));
-    Logger::info(str::format("  transfer: queue=", reinterpret_cast<uintptr_t>(queues.transfer.queueHandle), ", family=", queues.transfer.queueFamily));
+    std::vector<VkQueueFamilyProperties> families;
+    uint32_t familyCount = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &familyCount, nullptr);
+    families.resize(familyCount);
+    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &familyCount, families.data());
 
-    auto queueCollides = [](VkQueue a, VkQueue b) {
-      return a != VK_NULL_HANDLE && b != VK_NULL_HANDLE && a == b;
+    // FFX needs four distinct queues: the game's, one that presents to the surface, one for image acquisition and
+    // optionally one for async compute. Each is the first candidate not taken by the ones picked before it.
+    std::vector<VkQueue> taken = { queues.graphics.queueHandle };
+    auto pick = [&](std::initializer_list<const DxvkDeviceQueue*> candidates, bool needsPresent, bool needsCompute) {
+      for (const DxvkDeviceQueue* candidate : candidates) {
+        if (candidate->queueHandle == VK_NULL_HANDLE ||
+            std::find(taken.begin(), taken.end(), candidate->queueHandle) != taken.end()) {
+          continue;
+        }
+        VkBool32 presents = VK_FALSE;
+        if (needsPresent &&
+            (vkGetPhysicalDeviceSurfaceSupportKHR(physicalDevice, candidate->queueFamily, surface, &presents) != VK_SUCCESS || !presents)) {
+          continue;
+        }
+        if (needsCompute &&
+            (candidate->queueFamily >= families.size() || !(families[candidate->queueFamily].queueFlags & VK_QUEUE_COMPUTE_BIT))) {
+          continue;
+        }
+        taken.push_back(candidate->queueHandle);
+        return *candidate;
+      }
+      return DxvkDeviceQueue();
     };
 
-    auto queueSupportsPresent = [&](const DxvkDeviceQueue& queueInfo) {
-      if (queueInfo.queueHandle == VK_NULL_HANDLE)
-        return false;
+    const DxvkDeviceQueue presentQueue = pick({ &queues.fsrPresent, &queues.present, &queues.transfer, &queues.asyncCompute }, true, false);
+    const DxvkDeviceQueue acquireQueue = pick({ &queues.imageAcquire, &queues.transfer, &queues.present, &queues.asyncCompute }, false, false);
+    const DxvkDeviceQueue asyncQueue = pick({ &queues.asyncCompute, &queues.transfer, &queues.present, &queues.imageAcquire }, false, true);
 
-      VkBool32 supportsPresent = VK_FALSE;
-      VkResult result = vkGetPhysicalDeviceSurfaceSupportKHR(
-        physicalDevice,
-        queueInfo.queueFamily,
-        pCreateInfo->surface,
-        &supportsPresent);
+    Logger::info(str::format("FSR FG: queues game=", queues.graphics.queueFamily,
+      " present=", presentQueue.queueFamily, " imageAcquire=", acquireQueue.queueFamily,
+      " async=", asyncQueue.queueFamily, " asyncEnabled=", asyncQueue.queueHandle != VK_NULL_HANDLE));
 
-      if (result != VK_SUCCESS)
-        return false;
-
-      return supportsPresent == VK_TRUE;
-    };
-
-    uint32_t queueFamilyCount = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, nullptr);
-
-    std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
-    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, queueFamilies.data());
-
-    auto queueFamilyHasFlags = [&](uint32_t familyIndex, VkQueueFlags requiredFlags) {
-      if (familyIndex >= queueFamilies.size())
-        return false;
-
-      return (queueFamilies[familyIndex].queueFlags & requiredFlags) == requiredFlags;
-    };
-
-    const DxvkDeviceQueue gameQueueInfo = queues.graphics;
-    DxvkDeviceQueue presentQueueInfo;
-    DxvkDeviceQueue imageAcquireQueueInfo;
-    DxvkDeviceQueue asyncQueueInfo;
-
-    const DxvkDeviceQueue* presentCandidates[] = {
-      &queues.fsrPresent,
-      &queues.present,
-      &queues.transfer,
-      &queues.asyncCompute,
-    };
-
-    for (const DxvkDeviceQueue* candidate : presentCandidates) {
-      if (candidate->queueHandle == VK_NULL_HANDLE)
-        continue;
-
-      if (queueCollides(candidate->queueHandle, gameQueueInfo.queueHandle))
-        continue;
-
-      if (!queueSupportsPresent(*candidate))
-        continue;
-
-      presentQueueInfo = *candidate;
-      break;
+    if (presentQueue.queueHandle == VK_NULL_HANDLE || acquireQueue.queueHandle == VK_NULL_HANDLE) {
+      Logger::err("FSR FG: no usable present or image acquire queue for this surface; frame generation is off");
+      return false;
     }
 
-    if (presentQueueInfo.queueHandle == VK_NULL_HANDLE) {
-      Logger::err("FSR FG: Cannot create swapchain proxy - no dedicated present-capable queue available");
-      Logger::err("FSR FG: Falling back to non-frame-generation present path");
-      return;
-    }
-
-    const DxvkDeviceQueue* imageAcquireCandidates[] = {
-      &queues.imageAcquire,
-      &queues.transfer,
-      &queues.present,
-      &queues.asyncCompute,
-    };
-
-    for (const DxvkDeviceQueue* candidate : imageAcquireCandidates) {
-      if (candidate->queueHandle == VK_NULL_HANDLE)
-        continue;
-
-      if (queueCollides(candidate->queueHandle, gameQueueInfo.queueHandle))
-        continue;
-
-      if (queueCollides(candidate->queueHandle, presentQueueInfo.queueHandle))
-        continue;
-
-      imageAcquireQueueInfo = *candidate;
-      break;
-    }
-
-    if (imageAcquireQueueInfo.queueHandle == VK_NULL_HANDLE) {
-      Logger::err("FSR FG: Cannot create swapchain proxy - no dedicated image acquire queue available");
-      Logger::err("FSR FG: Falling back to non-frame-generation present path");
-      return;
-    }
-
-    const DxvkDeviceQueue* asyncCandidates[] = {
-      &queues.asyncCompute,
-      &queues.transfer,
-      &queues.present,
-      &queues.imageAcquire,
-    };
-
-    for (const DxvkDeviceQueue* candidate : asyncCandidates) {
-      if (candidate->queueHandle == VK_NULL_HANDLE)
-        continue;
-
-      if (queueCollides(candidate->queueHandle, gameQueueInfo.queueHandle))
-        continue;
-
-      if (queueCollides(candidate->queueHandle, presentQueueInfo.queueHandle))
-        continue;
-
-      if (queueCollides(candidate->queueHandle, imageAcquireQueueInfo.queueHandle))
-        continue;
-
-      if (!queueFamilyHasFlags(candidate->queueFamily, VK_QUEUE_COMPUTE_BIT))
-        continue;
-
-      asyncQueueInfo = *candidate;
-      break;
-    }
-
-    if (asyncQueueInfo.queueHandle == VK_NULL_HANDLE) {
-      Logger::warn("FSR FG: Dedicated async compute queue unavailable, running without async workloads");
-      asyncQueueInfo.queueFamily = gameQueueInfo.queueFamily;
-    }
-
-    VkQueue gameQueue = gameQueueInfo.queueHandle;
-    VkQueue asyncQueue = asyncQueueInfo.queueHandle;
-    VkQueue presentQueue = presentQueueInfo.queueHandle;
-    VkQueue acquireQueue = imageAcquireQueueInfo.queueHandle;
-
-    if (queueCollides(gameQueue, asyncQueue) ||
-        queueCollides(gameQueue, presentQueue) ||
-        queueCollides(gameQueue, acquireQueue) ||
-        queueCollides(asyncQueue, presentQueue) ||
-        queueCollides(asyncQueue, acquireQueue) ||
-        queueCollides(presentQueue, acquireQueue)) {
-      Logger::err(str::format("FSR FG: Queue collision detected - all 4 queues must be unique!"));
-      Logger::err(str::format("  game=", reinterpret_cast<uintptr_t>(gameQueue),
-        ", async=", reinterpret_cast<uintptr_t>(asyncQueue),
-        ", present=", reinterpret_cast<uintptr_t>(presentQueue),
-        ", acquire=", reinterpret_cast<uintptr_t>(acquireQueue)));
-      return;
-    }
+    VkSwapchainCreateInfoKHR swapInfo = {};
+    swapInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    swapInfo.surface = surface;
+    swapInfo.minImageCount = info.imageCount;
+    swapInfo.imageFormat = info.format.format;
+    swapInfo.imageColorSpace = info.format.colorSpace;
+    swapInfo.imageExtent = info.imageExtent;
+    swapInfo.imageArrayLayers = 1;
+    swapInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    swapInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    swapInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    swapInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    swapInfo.presentMode = info.presentMode;
+    swapInfo.clipped = VK_TRUE;
+    // FFX creates the real swapchain from this one and destroys the old one.
+    swapInfo.oldSwapchain = *pSwapchain;
 
     ffx::CreateContextDescFrameGenerationSwapChainVK createSwapChainDesc{};
     createSwapChainDesc.physicalDevice = physicalDevice;
-    createSwapChainDesc.device = device;
+    createSwapChainDesc.device = m_device->handle();
     createSwapChainDesc.swapchain = pSwapchain;
-    createSwapChainDesc.createInfo = *pCreateInfo;
+    createSwapChainDesc.createInfo = swapInfo;
+    createSwapChainDesc.gameQueue = { queues.graphics.queueHandle, queues.graphics.queueFamily, nullptr };
+    createSwapChainDesc.asyncComputeQueue = { asyncQueue.queueHandle,
+      asyncQueue.queueHandle != VK_NULL_HANDLE ? asyncQueue.queueFamily : queues.graphics.queueFamily, nullptr };
+    createSwapChainDesc.presentQueue = { presentQueue.queueHandle, presentQueue.queueFamily, nullptr };
+    createSwapChainDesc.imageAcquireQueue = { acquireQueue.queueHandle, acquireQueue.queueFamily, nullptr };
 
-    // Game queue - main graphics queue
-    createSwapChainDesc.gameQueue.queue = gameQueueInfo.queueHandle;
-    createSwapChainDesc.gameQueue.familyIndex = gameQueueInfo.queueFamily;
-    createSwapChainDesc.gameQueue.submitFunc = nullptr;
-
-    // Async compute queue can be null if async workloads are disabled.
-    createSwapChainDesc.asyncComputeQueue.queue = asyncQueueInfo.queueHandle;
-    createSwapChainDesc.asyncComputeQueue.familyIndex = asyncQueueInfo.queueFamily;
-    createSwapChainDesc.asyncComputeQueue.submitFunc = nullptr;
-
-    // Present queue must be dedicated and support this swapchain surface.
-    createSwapChainDesc.presentQueue.queue = presentQueueInfo.queueHandle;
-    createSwapChainDesc.presentQueue.familyIndex = presentQueueInfo.queueFamily;
-    createSwapChainDesc.presentQueue.submitFunc = nullptr;
-
-    // Image acquire queue must be dedicated from game and present.
-    createSwapChainDesc.imageAcquireQueue.queue = imageAcquireQueueInfo.queueHandle;
-    createSwapChainDesc.imageAcquireQueue.familyIndex = imageAcquireQueueInfo.queueFamily;
-    createSwapChainDesc.imageAcquireQueue.submitFunc = nullptr;
-
-    Logger::info(str::format("FSR FG: Using queues for FFX SDK: game=", gameQueueInfo.queueFamily,
-      ", present=", presentQueueInfo.queueFamily,
-      ", imageAcquire=", imageAcquireQueueInfo.queueFamily,
-      ", async=", asyncQueueInfo.queueFamily,
-      ", asyncEnabled=", asyncQueueInfo.queueHandle != VK_NULL_HANDLE));
-
-    // m_swapChainContext is void* which IS ffx::Context (typedef void*)
-    // CreateContext takes a reference to fill in the context handle
-    ffx::Context& swapChainCtx = *reinterpret_cast<ffx::Context*>(&m_swapChainContext);
-    
-    ffx::ReturnCode retCode = ffx::CreateContext(swapChainCtx, nullptr, createSwapChainDesc);
+    const VkSwapchainKHR originalSwapchain = *pSwapchain;
+    ffx::ReturnCode retCode = ffx::CreateContext(asContext(m_swapChainContext), nullptr, createSwapChainDesc);
     if (retCode != ffx::ReturnCode::Ok) {
       Logger::err(str::format("FSR FG: Failed to create swapchain context: ", static_cast<int>(retCode)));
-      return;
+      m_swapChainContext = nullptr;
+      return false;
     }
 
-    // Query replacement Vulkan functions
     ffx::QueryDescSwapchainReplacementFunctionsVK replacementFunctions{};
-    retCode = ffx::Query(swapChainCtx, replacementFunctions);
+    retCode = ffx::Query(asContext(m_swapChainContext), replacementFunctions);
     if (retCode != ffx::ReturnCode::Ok) {
       Logger::err(str::format("FSR FG: Failed to query replacement functions: ", static_cast<int>(retCode)));
-
-      // Roll back the swapchain handle before destroying the context.
-      // Without this, the caller may retain a proxy handle that was just destroyed.
-      if (pSwapchain)
-        *pSwapchain = originalSwapchain;
-
-      ffx::DestroyContext(swapChainCtx);
+      *pSwapchain = originalSwapchain;
+      ffx::DestroyContext(asContext(m_swapChainContext));
       m_swapChainContext = nullptr;
-      return;
+      return false;
     }
 
     m_replacedAcquireNextImageKHR = replacementFunctions.pOutAcquireNextImageKHR;
     m_replacedQueuePresentKHR = replacementFunctions.pOutQueuePresentKHR;
     m_replacedGetSwapchainImagesKHR = replacementFunctions.pOutGetSwapchainImagesKHR;
+    m_asyncWorkloadsSupported = asyncQueue.queueHandle != VK_NULL_HANDLE;
+    m_swapchainSize = info.imageExtent;
 
-    m_asyncWorkloadsSupported = asyncQueueInfo.queueHandle != VK_NULL_HANDLE;
-    m_swapchainContextCreated = true;
-    Logger::info("FSR FG: Swapchain proxy created successfully");
-  }
-
-  void DxvkFSRFrameGen::createFrameGenContext(
-    VkPhysicalDevice physicalDevice,
-    VkDevice device,
-    uint32_t displayWidth,
-    uint32_t displayHeight,
-    VkFormat backBufferFormat)
-  {
-    if (m_frameGenContextCreated) {
-      Logger::warn("FSR FG: Frame gen context already created");
-      return;
-    }
-
-    Logger::info(str::format("FSR FG: Creating frame gen context ", displayWidth, "x", displayHeight));
-
-    // Create backend for Vulkan
-    ffx::CreateBackendVKDesc backendDesc{};
-    backendDesc.vkDevice = device;
-    backendDesc.vkPhysicalDevice = physicalDevice;
-    backendDesc.vkDeviceProcAddr = vkGetDeviceProcAddr;
-
-    // Create frame generation context
-    ffx::CreateContextDescFrameGeneration createFg{};
-    createFg.displaySize = { displayWidth, displayHeight };
-    createFg.maxRenderSize = { displayWidth, displayHeight };
-
-    // Flags: HDR, inverted depth (common in Remix)
-    createFg.flags = 0;
-    createFg.flags |= FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED | FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE;
-    createFg.flags |= FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE;
-    // Primary screen-space motion vectors are generated from jittered projections, so let FG cancel jitter internally.
-    createFg.flags |= FFX_FRAMEGENERATION_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
-    if (m_asyncWorkloadsSupported)
-      createFg.flags |= FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT;
-
-    // Map VkFormat to FfxSurfaceFormat
-    createFg.backBufferFormat = FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
-    switch (backBufferFormat) {
-      case VK_FORMAT_R8G8B8A8_UNORM:
-      case VK_FORMAT_R8G8B8A8_SRGB:
-        createFg.backBufferFormat = FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
-        break;
-      case VK_FORMAT_B8G8R8A8_UNORM:
-      case VK_FORMAT_B8G8R8A8_SRGB:
-        createFg.backBufferFormat = FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM;
-        break;
-      case VK_FORMAT_R16G16B16A16_SFLOAT:
-        createFg.backBufferFormat = FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT;
-        break;
-      case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
-        createFg.backBufferFormat = FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM;
-        break;
-      default:
-        Logger::warn(str::format("FSR FG: Unknown VkFormat ", static_cast<int>(backBufferFormat)));
-        break;
-    }
-
-    // m_frameGenContext is void* which IS ffx::Context (typedef void*)
-    ffx::Context& frameGenCtx = *reinterpret_cast<ffx::Context*>(&m_frameGenContext);
-    
-    ffx::ReturnCode retCode = ffx::CreateContext(frameGenCtx, nullptr, createFg, backendDesc);
-    if (retCode != ffx::ReturnCode::Ok) {
-      Logger::err(str::format("FSR FG: Failed to create frame gen context: ", static_cast<int>(retCode)));
-      return;
-    }
-
-    m_frameGenContextCreated = true;
-    m_initialized = true;
-    Logger::info("FSR FG: Frame gen context created successfully");
-  }
-
-  void DxvkFSRFrameGen::destroyContexts() {
-    if (m_frameGenContextCreated && m_frameGenContext) {
-      ffx::Context& frameGenCtx = *reinterpret_cast<ffx::Context*>(&m_frameGenContext);
-      ffx::ConfigureDescFrameGeneration& config = asFrameGenConfig(m_frameGenConfig);
-
-      {
-        std::lock_guard<std::mutex> lock(g_fsrFrameGenCallbackStateMutex);
-        g_fsrFrameGenPresentColorOverride.erase(static_cast<ffxContext>(m_frameGenContext));
-      }
-      
-      // Disable frame gen before destroying
-      config.frameGenerationEnabled = false;
-      config.presentCallback = nullptr;
-      config.HUDLessColor = FfxApiResource({});
-      ffx::Configure(frameGenCtx, config);
-
-      ffx::DestroyContext(frameGenCtx);
-      m_frameGenContext = nullptr;
-      m_frameGenContextCreated = false;
-      Logger::info("FSR FG: Frame gen context destroyed");
-    }
-
-    if (m_swapchainContextCreated && m_swapChainContext) {
-      ffx::Context& swapChainCtx = *reinterpret_cast<ffx::Context*>(&m_swapChainContext);
-      ffx::DestroyContext(swapChainCtx);
-      m_swapChainContext = nullptr;
-      m_swapchainContextCreated = false;
-      m_asyncWorkloadsSupported = false;
-      
-      m_replacedAcquireNextImageKHR = nullptr;
-      m_replacedQueuePresentKHR = nullptr;
-      m_replacedGetSwapchainImagesKHR = nullptr;
-      m_swapchainSize = { 0, 0 };
-      
-      Logger::info("FSR FG: Swapchain context destroyed");
-    }
-
-    m_initialized = false;
-    m_presentColorSource = nullptr;
-    m_preparedForPresent.store(false, std::memory_order_release);
-  }
-
-  void DxvkFSRFrameGen::setFrameGenerationPresentColorSource(const Rc<DxvkImage>& presentColorSource) {
-    m_presentColorSource = presentColorSource;
-  }
-
-  bool DxvkFSRFrameGen::registerPresentColorOverrideForFrame(const Rc<DxvkImage>& presentColorImage, uint64_t frameId) {
-    if (!m_frameGenContextCreated || !m_frameGenContext || presentColorImage == nullptr)
-      return false;
-
-    const ffxContext ctx = static_cast<ffxContext>(m_frameGenContext);
-    const FfxApiResource resource = createFfxResourceFromImage(
-      presentColorImage,
-      FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ,
-      FFX_API_RESOURCE_USAGE_READ_ONLY);
-
-    if (resource.resource == nullptr)
-      return false;
-
-    std::lock_guard<std::mutex> lock(g_fsrFrameGenCallbackStateMutex);
-    FsrPresentColorOverrideEntry entry;
-    entry.image = presentColorImage;
-    entry.resource = resource;
-    auto& perFrame = g_fsrFrameGenPresentColorOverride[ctx];
-    perFrame[frameId] = std::move(entry);
-
-    // Keep only a small recent window to avoid unbounded growth.
-    if (perFrame.size() > 8) {
-      const uint64_t minFrameToKeep = frameId > 4 ? frameId - 4 : 0;
-      for (auto it = perFrame.begin(); it != perFrame.end(); ) {
-        if (it->first < minFrameToKeep)
-          it = perFrame.erase(it);
-        else
-          ++it;
-      }
-    }
-
+    // Without a frame generation context the proxy still presents, with generation off.
+    createFrameGenContext(info);
     return true;
   }
 
-  void DxvkFSRFrameGen::configureFrameGeneration(
-    VkSwapchainKHR swapchain,
-    uint64_t frameId,
-    bool enabled)
-  {
-    if (!m_frameGenContextCreated) {
-      return;
+  bool DxvkFSRFrameGen::createFrameGenContext(const vk::PresenterInfo& info) {
+    const VkFormat backBufferFormat = info.format.format;
+    const uint32_t ffxBackBufferFormat = toFfxSurfaceFormat(backBufferFormat);
+    if (ffxBackBufferFormat == FFX_API_SURFACE_FORMAT_UNKNOWN) {
+      Logger::err(str::format("FSR FG: Unsupported back buffer format ", static_cast<int>(backBufferFormat)));
+      return false;
     }
 
-    m_frameId = frameId;
-    m_frameGenEnabled = enabled;
+    ffx::CreateBackendVKDesc backendDesc{};
+    backendDesc.vkDevice = m_device->handle();
+    backendDesc.vkPhysicalDevice = m_device->adapter()->handle();
+    backendDesc.vkDeviceProcAddr = vkGetDeviceProcAddr;
 
-    ffx::Context& frameGenCtx = *reinterpret_cast<ffx::Context*>(&m_frameGenContext);
-    ffx::ConfigureDescFrameGeneration& config = asFrameGenConfig(m_frameGenConfig);
+    ffx::CreateContextDescFrameGeneration createFg{};
+    createFg.displaySize = { info.imageExtent.width, info.imageExtent.height };
+    createFg.maxRenderSize = { info.imageExtent.width, info.imageExtent.height };
 
-    config.frameGenerationEnabled = enabled;
-    config.swapChain = swapchain;
-    config.frameID = frameId;
-
-    // Keep callback path active whenever frame generation is enabled.
-    // The callback may use explicit path-traced overrides or fall back to
-    // proxy-provided presentColor depending on availability.
-    if (enabled) {
-      config.frameGenerationCallback = frameGenCallback;
-      config.frameGenerationCallbackUserContext = m_frameGenContext;
-    } else {
-      config.frameGenerationCallback = nullptr;
-      config.frameGenerationCallbackUserContext = nullptr;
+    // The motion vectors are unjittered (the same convention DLSS gets), so no jitter cancellation.
+    createFg.flags = 0;
+    if (m_depthInverted) {
+      createFg.flags |= FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED;
+    }
+    if (m_depthInfinite) {
+      createFg.flags |= FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE;
     }
 
-    // Let FFX handle presentation internally
-    // When presentCallback is nullptr, FFX VK swapchain proxy handles the copy internally
-    config.presentCallback = nullptr;
-    config.presentCallbackUserContext = nullptr;
-    
-    // Keep FFX color path pinned to Remix-provided path-traced output.
-    // This avoids SDK-side fallback to proxy swapchain color when HUDLessColor is unset.
-    config.HUDLessColor = createFfxResourceFromImage(
-      m_presentColorSource,
-      FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ,
-      FFX_API_RESOURCE_USAGE_READ_ONLY);
+    // The back buffer holds the tonemapped, display-encoded image. Only an HDR swapchain carries HDR values.
+    m_hdr = info.format.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    if (m_hdr) {
+      createFg.flags |= FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE;
+    }
+    if (m_asyncWorkloadsSupported) {
+      createFg.flags |= FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT;
+    }
 
-    config.flags = m_swapchainContextCreated
-      ? 0
-      : FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
-    config.allowAsyncWorkloads = m_asyncWorkloadsSupported;
-    config.onlyPresentGenerated = false;
+    // The HUD-less copies are made in the back buffer format, so no separate HUD-less format is declared.
+    createFg.backBufferFormat = ffxBackBufferFormat;
+    const bool hudLessCopy = supportsHudLessCopy(backBufferFormat);
+    if (!hudLessCopy) {
+      Logger::warn(str::format("FSR FG: back buffer format ", static_cast<int>(backBufferFormat),
+        " cannot hold a HUD-less copy; the HUD is interpolated with the scene."));
+    }
 
-    // Set generation rect to full swapchain/output size (not render size)
-    const uint32_t outputWidth = m_swapchainSize.x != 0 ? m_swapchainSize.x : m_displaySize.x;
-    const uint32_t outputHeight = m_swapchainSize.y != 0 ? m_swapchainSize.y : m_displaySize.y;
-
-    config.generationRect.left = 0;
-    config.generationRect.top = 0;
-    config.generationRect.width = outputWidth;
-    config.generationRect.height = outputHeight;
-
-    ffx::ReturnCode retCode = ffx::Configure(frameGenCtx, config);
+    const ffx::ReturnCode retCode = ffx::CreateContext(asContext(m_frameGenContext), nullptr, createFg, backendDesc);
     if (retCode != ffx::ReturnCode::Ok) {
-      Logger::err(str::format("FSR FG: Failed to configure frame gen: ", static_cast<int>(retCode)));
+      Logger::err(str::format("FSR FG: Failed to create frame gen context: ", static_cast<int>(retCode)));
+      m_frameGenContext = nullptr;
+      return false;
     }
+
+    m_configuredEnabled = false;
+    m_resetNext = true;
+
+    {
+      std::lock_guard<std::mutex> lock(m_hudLessMutex);
+      m_hudLessFormat = hudLessCopy ? backBufferFormat : VK_FORMAT_UNDEFINED;
+      m_hudLessExtent = info.imageExtent;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(m_statsMutex);
+      m_stats.displayWidth = info.imageExtent.width;
+      m_stats.displayHeight = info.imageExtent.height;
+      m_stats.depthInverted = m_depthInverted;
+      m_stats.depthInfinite = m_depthInfinite;
+      m_stats.asyncWorkloads = m_asyncWorkloadsSupported;
+      m_stats.hdr = m_hdr;
+      m_stats.backBufferFormat = backBufferFormat;
+    }
+
+    Logger::info(str::format("[FSRFG] context created: display=", info.imageExtent.width, "x", info.imageExtent.height,
+      " backBufferFormat=", static_cast<int>(backBufferFormat), " colorSpace=", static_cast<int>(info.format.colorSpace),
+      " hdr=", m_hdr, " depthInverted=", m_depthInverted, " depthInfinite=", m_depthInfinite,
+      " async=", m_asyncWorkloadsSupported, " hudLessCopy=", hudLessCopy));
+    return true;
   }
 
-  void DxvkFSRFrameGen::prepareFrameGeneration(
-    Rc<DxvkContext> ctx,
-    DxvkBarrierSet& barriers,
-    const RtCamera& camera,
-    Rc<DxvkImageView> motionVectors,
-    Rc<DxvkImageView> depth,
-    bool viewModelActive,
-    bool resetHistory,
-    uint64_t frameId,
-    float deltaTimeMs)
-  {
-    if (!m_frameGenContextCreated) {
+  void DxvkFSRFrameGen::destroyFrameGenContext() {
+    if (m_frameGenContext == nullptr) {
       return;
     }
 
-    m_preparedForPresent.store(false, std::memory_order_release);
+    ffx::ConfigureDescFrameGeneration& config = asFrameGenConfig(m_frameGenConfig);
+    config.frameGenerationEnabled = false;
+    config.frameGenerationCallback = nullptr;
+    config.frameGenerationCallbackUserContext = nullptr;
+    config.presentCallback = nullptr;
+    config.HUDLessColor = FfxApiResource({});
+    ffx::Configure(asContext(m_frameGenContext), config);
+    ffx::DestroyContext(asContext(m_frameGenContext));
+    m_frameGenContext = nullptr;
 
-    if (motionVectors == nullptr || depth == nullptr) {
-      Logger::warn("FSR FG: Skipping prepare pass - motion vectors or depth is missing");
-      if (m_swapchain != VK_NULL_HANDLE)
-        configureFrameGeneration(m_swapchain, m_frameId, false);
-      return;
-    }
+    std::lock_guard<std::mutex> lock(m_hudLessMutex);
+    m_hudLessFormat = VK_FORMAT_UNDEFINED;
+    m_hudLessRing = {};
+  }
 
-    // Get command buffer from context
-    VkCommandBuffer cmdBuffer = ctx->getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
-    if (cmdBuffer == VK_NULL_HANDLE) {
-      Logger::warn("FSR FG: No command buffer available for prepareFrameGeneration");
-      if (m_swapchain != VK_NULL_HANDLE)
-        configureFrameGeneration(m_swapchain, m_frameId, false);
-      return;
-    }
-    
-    // Configure frame generation each frame (enables it and sets frame ID)
-    // This must be called before the prepare dispatch
-    const uint64_t fgFrameId = frameId != 0 ? frameId : (m_frameId + 1);
-    m_frameId = fgFrameId;
+  void DxvkFSRFrameGen::destroyContexts() {
+    destroyFrameGenContext();
 
-    if (m_swapchain != VK_NULL_HANDLE) {
-      if (!m_swapchainContextCreated) {
-        const bool hasPathTracedPresentColor = registerPresentColorOverrideForFrame(m_presentColorSource, fgFrameId);
-        if (!hasPathTracedPresentColor) {
-          Logger::warn("FSR FG: Skipping prepare pass - path-traced present color source is missing");
-          configureFrameGeneration(m_swapchain, fgFrameId, false);
-          return;
-        }
-      }
+    if (m_swapChainContext != nullptr) {
+      // This destroys the proxy and the real swapchain behind it.
+      ffx::DestroyContext(asContext(m_swapChainContext));
+      m_swapChainContext = nullptr;
+      m_replacedAcquireNextImageKHR = nullptr;
+      m_replacedQueuePresentKHR = nullptr;
+      m_replacedGetSwapchainImagesKHR = nullptr;
+      m_asyncWorkloadsSupported = false;
 
-      configureFrameGeneration(m_swapchain, fgFrameId, true);
-    }
-    
-    if (!m_frameGenEnabled) {
-      return;
-    }
-
-    // Helper function to create FFX resource from Vulkan image using SDK helper
-    auto createFfxResource = [](Rc<DxvkImageView> view, uint32_t state, uint32_t additionalUsages = FFX_API_RESOURCE_USAGE_READ_ONLY) -> FfxApiResource {
-      if (view == nullptr) {
-        return FfxApiResource({});
-      }
-      
-      // Build a VkImageCreateInfo from the image info for the SDK helper
-      VkImageCreateInfo createInfo = {};
-      createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-      createInfo.imageType = VK_IMAGE_TYPE_2D;
-      createInfo.format = view->info().format;
-      createInfo.extent.width = view->imageInfo().extent.width;
-      createInfo.extent.height = view->imageInfo().extent.height;
-      createInfo.extent.depth = 1;
-      createInfo.mipLevels = 1;
-      createInfo.arrayLayers = 1;
-      createInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-      createInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-      createInfo.usage = view->image()->info().usage;
-      createInfo.flags = view->image()->info().flags;
-      
-      FfxApiResourceDescription desc = ffxApiGetImageResourceDescriptionVK(view->image()->handle(), createInfo, additionalUsages);
-      return ffxApiGetResourceVK(reinterpret_cast<void*>(view->image()->handle()), desc, state);
-    };
-
-    // Get camera info
-    float cameraNear = camera.getNearPlane();
-    float cameraFar = camera.getFarPlane();
-    float fovY = camera.getFov();
-    
-    // Get jitter - FSR expects negative jitter offset
-    float jitter[2];
-    camera.getJittering(jitter);
-    
-    // Get render size from motion vectors
-    uint32_t renderWidth = motionVectors->imageInfo().extent.width;
-    uint32_t renderHeight = motionVectors->imageInfo().extent.height;
-
-    // Dispatch the prepare pass
-    ffx::Context& frameGenCtx = *reinterpret_cast<ffx::Context*>(&m_frameGenContext);
-    
-    ffx::DispatchDescFrameGenerationPrepare prepareDesc{};
-    prepareDesc.commandList = cmdBuffer;
-    prepareDesc.frameID = fgFrameId;
-    prepareDesc.flags = 0;
-    prepareDesc.renderSize = { renderWidth, renderHeight };
-    prepareDesc.jitterOffset = viewModelActive
-      ? decltype(prepareDesc.jitterOffset){ 0.0f, 0.0f }
-      : decltype(prepareDesc.jitterOffset){ jitter[0], jitter[1] };  // Same jitter as FSR upscaler
-    // View-model motion is often from a different camera and can cause severe FG reprojection trails.
-    // On those frames, suppress MV contribution so FG relies on non-MV cues instead of mixed-camera vectors.
-    prepareDesc.motionVectorScale = viewModelActive
-      ? decltype(prepareDesc.motionVectorScale){ 0.0f, 0.0f }
-      : decltype(prepareDesc.motionVectorScale){ 1.0f, 1.0f }; // Motion vectors already in pixel units (like DLSS)
-    prepareDesc.frameTimeDelta = deltaTimeMs;
-    prepareDesc.cameraNear = cameraNear;
-    prepareDesc.cameraFar = cameraFar;
-    prepareDesc.cameraFovAngleVertical = fovY;
-    prepareDesc.viewSpaceToMetersFactor = 1.0f;
-    prepareDesc.depth = createFfxResource(depth, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ, FFX_API_RESOURCE_USAGE_DEPTHTARGET);
-    prepareDesc.motionVectors = createFfxResource(motionVectors, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY);
-    // View-model animation frequently violates the single-camera assumption used by FG reprojection.
-    // Reset FG history on those frames to reduce persistent first-person trails.
-    prepareDesc.unused_reset = resetHistory || viewModelActive;
-    
-    // Add camera info for better quality (FSR 3.1.4+)
-    ffx::DispatchDescFrameGenerationPrepareCameraInfo cameraInfo{};
-    Vector3 cameraPos = camera.getPosition(false);
-    Vector3 cameraUp = camera.getUp(false);
-    Vector3 cameraRight = camera.getRight(false);
-    Vector3 cameraForward = camera.getDirection(false);
-    cameraInfo.cameraPosition[0] = cameraPos.x;
-    cameraInfo.cameraPosition[1] = cameraPos.y;
-    cameraInfo.cameraPosition[2] = cameraPos.z;
-    cameraInfo.cameraUp[0] = cameraUp.x;
-    cameraInfo.cameraUp[1] = cameraUp.y;
-    cameraInfo.cameraUp[2] = cameraUp.z;
-    cameraInfo.cameraRight[0] = cameraRight.x;
-    cameraInfo.cameraRight[1] = cameraRight.y;
-    cameraInfo.cameraRight[2] = cameraRight.z;
-    cameraInfo.cameraForward[0] = cameraForward.x;
-    cameraInfo.cameraForward[1] = cameraForward.y;
-    cameraInfo.cameraForward[2] = cameraForward.z;
-
-    // Link camera info to prepare descriptor
-    prepareDesc.header.pNext = &cameraInfo.header;
-
-    Logger::debug(str::format("FSR FG: Dispatching prepare pass for frame ", fgFrameId));
-    ffx::ReturnCode retCode = ffx::Dispatch(frameGenCtx, prepareDesc);
-    if (retCode != ffx::ReturnCode::Ok) {
-      Logger::err(str::format("FSR FG: Failed to dispatch prepare pass: ", static_cast<int>(retCode)));
-      if (m_swapchain != VK_NULL_HANDLE)
-        configureFrameGeneration(m_swapchain, m_frameId, false);
-    } else {
-      Logger::debug("FSR FG: Prepare dispatch successful");
-      m_preparedForPresent.store(true, std::memory_order_release);
+      // FFX reads the configured swapchain handle as a pointer to its proxy, so a destroyed proxy must not stay configured.
+      asFrameGenConfig(m_frameGenConfig).swapChain = VK_NULL_HANDLE;
     }
   }
 
   void DxvkFSRFrameGen::waitForPresents() {
-    if (!m_swapchainContextCreated || !m_swapChainContext) {
+    if (m_swapChainContext == nullptr) {
       return;
     }
 
-    ffx::Context& swapChainCtx = *reinterpret_cast<ffx::Context*>(&m_swapChainContext);
     ffx::DispatchDescFrameGenerationSwapChainWaitForPresentsVK waitDesc{};
-    ffx::ReturnCode retCode = ffx::Dispatch(swapChainCtx, waitDesc);
+    const ffx::ReturnCode retCode = ffx::Dispatch(asContext(m_swapChainContext), waitDesc);
     if (retCode != ffx::ReturnCode::Ok) {
       Logger::warn(str::format("FSR FG: Wait for presents failed: ", static_cast<int>(retCode)));
     }
+  }
+
+  Rc<DxvkImage> DxvkFSRFrameGen::copyHudLessColor(Rc<DxvkContext> ctx, const Rc<DxvkImage>& source) {
+    std::lock_guard<std::mutex> lock(m_hudLessMutex);
+    if (m_hudLessFormat == VK_FORMAT_UNDEFINED || interpolateHud() || source == nullptr) {
+      return nullptr;
+    }
+
+    Rc<DxvkImage>& slot = m_hudLessRing[m_hudLessIndex];
+    m_hudLessIndex = (m_hudLessIndex + 1) % kHudLessRingSize;
+    const VkExtent3D extent = { m_hudLessExtent.width, m_hudLessExtent.height, 1 };
+
+    if (slot == nullptr || slot->info().extent != extent || slot->info().format != m_hudLessFormat) {
+      DxvkImageCreateInfo desc;
+      desc.type = VK_IMAGE_TYPE_2D;
+      desc.format = m_hudLessFormat;
+      desc.flags = 0;
+      desc.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+      desc.extent = extent;
+      desc.numLayers = 1;
+      desc.mipLevels = 1;
+      // FFX copies the HUD-less image into its previous-frame source, so it is also a transfer source.
+      desc.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      desc.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+      desc.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+      desc.tiling = VK_IMAGE_TILING_OPTIMAL;
+      desc.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+      slot = m_device->createImage(desc, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXRenderTarget, "fsr fg hud-less color");
+      ctx->changeImageLayout(slot, VK_IMAGE_LAYOUT_GENERAL);
+    }
+
+    // The present blit draws the game's back buffer 1:1 in the common case, so a nearest blit reproduces it exactly.
+    const VkExtent3D sourceExtent = source->info().extent;
+    const bool sameSize = sourceExtent.width == extent.width && sourceExtent.height == extent.height;
+    RtxContext::blitImageHelper(ctx, source, slot, sameSize ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    return slot;
+  }
+
+  bool DxvkFSRFrameGen::prepare(const DxvkFrameInterpolationInfo& frame, uint64_t frameId) {
+    ScopedCpuProfileZone();
+    const Rc<vk::DeviceFn>& vkd = m_device->vkd();
+
+    // Submitted on the graphics queue after the frame's own command lists, and before the proxy present that
+    // waits on that queue.
+    DxvkDLFGCommandList* commandList = m_prepareCommandLists.nextCmdList();
+    VkCommandBuffer cmdBuffer = commandList->getCmdBuffer();
+
+    VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkd->vkCmdPipelineBarrier(cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+    float jitter[2];
+    frame.camera.getJittering(jitter);
+    const FfxDepthConvention depthConvention = getFfxDepthConvention(frame.camera);
+    const uint32_t renderWidth = frame.motionVectors->imageInfo().extent.width;
+    const uint32_t renderHeight = frame.motionVectors->imageInfo().extent.height;
+
+    ffx::DispatchDescFrameGenerationPrepare prepareDesc{};
+    prepareDesc.commandList = cmdBuffer;
+    prepareDesc.frameID = frameId;
+    prepareDesc.flags = debugFlags();
+    prepareDesc.renderSize = { renderWidth, renderHeight };
+    // The same pixel jitter the upscalers get.
+    prepareDesc.jitterOffset = { jitter[0], jitter[1] };
+    // The motion vectors are in render-resolution pixels, from the current to the previous frame.
+    prepareDesc.motionVectorScale = { 1.0f, 1.0f };
+    prepareDesc.frameTimeDelta = frame.frameTimeMs;
+    prepareDesc.cameraNear = depthConvention.cameraNear;
+    prepareDesc.cameraFar = depthConvention.cameraFar;
+    prepareDesc.cameraFovAngleVertical = frame.camera.getFov();
+    prepareDesc.viewSpaceToMetersFactor = depthConvention.viewSpaceToMeters;
+    prepareDesc.depth = createFfxResource(frame.depth, frame.depthLayout);
+    prepareDesc.motionVectors = createFfxResource(frame.motionVectors, frame.motionVectorsLayout);
+    // FFX ignores the prepare reset. The reset reaches the interpolation dispatch through the callback.
+    prepareDesc.unused_reset = false;
+
+    ffx::DispatchDescFrameGenerationPrepareCameraInfo cameraInfo{};
+    const Vector3 cameraPos = frame.camera.getPosition(false);
+    const Vector3 cameraUp = frame.camera.getUp(false);
+    const Vector3 cameraRight = frame.camera.getRight(false);
+    const Vector3 cameraForward = frame.camera.getDirection(false);
+    for (uint32_t i = 0; i < 3; ++i) {
+      cameraInfo.cameraPosition[i] = cameraPos[i];
+      cameraInfo.cameraUp[i] = cameraUp[i];
+      cameraInfo.cameraRight[i] = cameraRight[i];
+      cameraInfo.cameraForward[i] = cameraForward[i];
+    }
+    prepareDesc.header.pNext = &cameraInfo.header;
+
+    const ffx::ReturnCode retCode = ffx::Dispatch(asContext(m_frameGenContext), prepareDesc);
+
+    // The renderer's next writes to these images come in later submissions on this queue.
+    vkd->vkCmdPipelineBarrier(cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+      0, 0, nullptr, 0, nullptr, 0, nullptr);
+    commandList->trackResource<DxvkAccess::Read>(frame.motionVectors->image());
+    commandList->trackResource<DxvkAccess::Read>(frame.depth->image());
+    commandList->endRecording();
+    commandList->submit();
+
+    if (retCode != ffx::ReturnCode::Ok) {
+      Logger::err(str::format("[FSRFG] prepare dispatch failed: ", static_cast<int>(retCode)));
+      return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_statsMutex);
+    m_stats.frameTimeMs = frame.frameTimeMs;
+    m_stats.jitter[0] = jitter[0];
+    m_stats.jitter[1] = jitter[1];
+    m_stats.renderWidth = renderWidth;
+    m_stats.renderHeight = renderHeight;
+    return true;
+  }
+
+  uint32_t DxvkFSRFrameGen::dispatchFrameGeneration(void* params, void* pUserCtx) {
+    ffxDispatchDescFrameGeneration* desc = static_cast<ffxDispatchDescFrameGeneration*>(params);
+    DxvkFSRFrameGen* self = static_cast<DxvkFSRFrameGen*>(pUserCtx);
+
+    // A reset makes FFX output the current frame unchanged, so a frame without valid inputs is shown twice
+    // instead of being interpolated from stale data.
+    desc->reset = desc->reset || self->m_presentingReset;
+
+    ffxContext ctx = static_cast<ffxContext>(self->m_frameGenContext);
+    const ffxReturnCode_t result = ffxDispatch(&ctx, &desc->header);
+
+    std::lock_guard<std::mutex> lock(self->m_statsMutex);
+    if (result == FFX_API_RETURN_OK) {
+      if (desc->reset) {
+        ++self->m_stats.held;
+      } else {
+        ++self->m_stats.interpolated;
+      }
+    } else {
+      // The proxy then presents its previous generated frame, so log it.
+      ONCE(Logger::err(str::format("[FSRFG] interpolation dispatch failed: ", result)));
+    }
+    return result;
+  }
+
+  void DxvkFSRFrameGen::beginPresent(VkSwapchainKHR swapchain, const DxvkFrameInterpolationInfo& frame, bool enabled,
+                                     const vk::PresenterInfo& info) {
+    // Every configure, including the one that switches generation off before a context is destroyed, targets
+    // the current proxy.
+    ffx::ConfigureDescFrameGeneration& config = asFrameGenConfig(m_frameGenConfig);
+    config.swapChain = swapchain;
+
+    // The depth convention is fixed at context creation, so a change recreates the context before this prepare.
+    if (enabled && frame.valid()) {
+      const FfxDepthConvention depthConvention = getFfxDepthConvention(frame.camera);
+      if (depthConvention.inverted != m_depthInverted || depthConvention.infinite != m_depthInfinite) {
+        Logger::info(str::format("[FSRFG] depth convention changed: inverted=", depthConvention.inverted,
+          " infinite=", depthConvention.infinite, "; recreating the frame generation context"));
+        waitForPresents();
+        destroyFrameGenContext();
+        m_depthInverted = depthConvention.inverted;
+        m_depthInfinite = depthConvention.infinite;
+        createFrameGenContext(info);
+      }
+    }
+    if (m_frameGenContext == nullptr) {
+      return;
+    }
+
+    const uint64_t frameId = m_lastFrameId + 1;
+    m_lastFrameId = frameId;
+
+    const bool prepared = enabled && frame.valid() && prepare(frame, frameId);
+    bool reset = true;
+
+    std::unique_lock<std::mutex> lock(m_statsMutex);
+    if (prepared) {
+      reset = frame.resetHistory || m_resetNext;
+      if (frame.resetHistory) {
+        ++m_stats.resetsHistory;
+      } else if (m_resetNext) {
+        ++m_stats.resetsGap;
+      }
+      m_resetNext = false;
+      m_consecutiveSkips = 0;
+    } else {
+      // No inputs for this present: a frame without ray tracing (a menu or a loading screen), a second present
+      // of the same frame, or a failed prepare.
+      m_resetNext = true;
+      ++m_consecutiveSkips;
+      ++m_stats.skipped;
+    }
+
+    // Frame generation stays configured on through short gaps, since every enable change makes the proxy wait
+    // for its presents and restart its pacing thread.
+    const bool generate = enabled && (prepared || m_consecutiveSkips <= kMaxConsecutiveSkips);
+    if (!generate) {
+      ++m_stats.disabled;
+    }
+    ++m_stats.presents;
+    m_stats.hudLess = prepared && frame.hudLessColor != nullptr;
+    const bool logNow = m_stats.presents % kLogIntervalPresents == 0;
+    lock.unlock();
+
+    config.frameGenerationEnabled = generate;
+    config.frameID = frameId;
+    config.frameGenerationCallback = [](ffxDispatchDescFrameGeneration* params, void* pUserCtx) -> ffxReturnCode_t {
+      return DxvkFSRFrameGen::dispatchFrameGeneration(params, pUserCtx);
+    };
+    config.frameGenerationCallbackUserContext = this;
+    config.presentCallback = nullptr;
+    config.presentCallbackUserContext = nullptr;
+    config.HUDLessColor = prepared && frame.hudLessColor != nullptr
+      ? createFfxResource(frame.hudLessColor, frame.hudLessColor->info().format, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS)
+      : FfxApiResource({});
+    config.flags = debugFlags();
+    config.allowAsyncWorkloads = m_asyncWorkloadsSupported;
+    config.onlyPresentGenerated = false;
+    config.generationRect.left = 0;
+    config.generationRect.top = 0;
+    config.generationRect.width = static_cast<int32_t>(m_swapchainSize.width);
+    config.generationRect.height = static_cast<int32_t>(m_swapchainSize.height);
+
+    if (generate != m_configuredEnabled) {
+      const std::string reason = generate ? std::string() : str::format(" after ", m_consecutiveSkips, " presents without a prepared frame");
+      Logger::info(str::format("[FSRFG] frame generation ", generate ? "on" : "off", " at frame ", frameId, reason));
+      m_configuredEnabled = generate;
+    }
+
+    const ffx::ReturnCode retCode = ffx::Configure(asContext(m_frameGenContext), config);
+    if (retCode != ffx::ReturnCode::Ok) {
+      Logger::err(str::format("[FSRFG] configure failed: ", static_cast<int>(retCode)));
+    }
+
+    m_presentingReset = reset;
+
+    if (logNow) {
+      logStats();
+    }
+  }
+
+  void DxvkFSRFrameGen::logStats() {
+    std::lock_guard<std::mutex> lock(m_statsMutex);
+    const Stats& s = m_stats;
+    const Stats& p = m_statsAtLastLog;
+    Logger::info(str::format("[FSRFG] presents=", s.presents - p.presents,
+      " interpolated=", s.interpolated - p.interpolated,
+      " held=", s.held - p.held,
+      " skipped=", s.skipped - p.skipped,
+      " disabled=", s.disabled - p.disabled,
+      " resetHistory=", s.resetsHistory - p.resetsHistory,
+      " resetGap=", s.resetsGap - p.resetsGap,
+      " frameTimeMs=", s.frameTimeMs,
+      " render=", s.renderWidth, "x", s.renderHeight,
+      " display=", s.displayWidth, "x", s.displayHeight,
+      " jitter=", s.jitter[0], ",", s.jitter[1],
+      " mvScale=1,1 depthInverted=", s.depthInverted,
+      " depthInfinite=", s.depthInfinite,
+      " hudLess=", s.hudLess,
+      " async=", s.asyncWorkloads,
+      " hdr=", s.hdr,
+      " format=", static_cast<int>(s.backBufferFormat)));
+    m_statsAtLastLog = s;
+  }
+
+  DxvkFSRFrameGen::Stats DxvkFSRFrameGen::getStats() const {
+    std::lock_guard<std::mutex> lock(m_statsMutex);
+    return m_stats;
   }
 
   // ============================================================================
@@ -893,204 +680,112 @@ namespace dxvk {
     : vk::Presenter(window, vki, vkd, presenterDevice, existingSurface)
     // NV-DXVK end
     , m_device(device.ptr())
-    , m_ctx(ctx)
   {
-    Logger::info("FSR FG: Creating FSR FG Presenter");
-
-    // If no surface was provided, create one
-    if (m_surface == VK_NULL_HANDLE) {
-      Logger::info("FSR FG: Creating new surface (first time initialization)");
-      if (createSurface() != VK_SUCCESS) {
-        throw DxvkError("FSR FG: Failed to create surface");
-      }
-    } else {
-      Logger::info("FSR FG: Reusing existing surface from previous presenter");
+    if (m_surface == VK_NULL_HANDLE && createSurface() != VK_SUCCESS) {
+      throw DxvkError("FSR FG: Failed to create surface");
     }
 
-    // Get access to the FSR Frame Gen component
-    auto& fsrFrameGen = m_device->getCommon()->metaFSRFrameGen();
-    
-    // Set display size for later use
-    fsrFrameGen.setDisplaySize({ desc.imageExtent.width, desc.imageExtent.height });
-    
-    // Store desc for lazy context creation
-    m_cachedDesc = desc;
-
-    // Create the initial swapchain using our own recreateSwapChain
-    // (The protected constructor only sets the surface, doesn't create swapchain)
-    if (recreateSwapChain(desc) != VK_SUCCESS)
+    // The protected constructor only sets the surface, so the swapchain and the proxy are created here.
+    if (recreateSwapChain(desc) != VK_SUCCESS) {
       throw DxvkError("FSR FG: Failed to create initial swap chain");
+    }
 
-    // DON'T create FFX contexts here - defer until FSR FG is actually enabled
-    // This prevents the FFX swapchain proxy from interfering when FSR FG is disabled
-    Logger::info(str::format("FSR FG Presenter: Created (contexts deferred until enabled) for ", 
-      desc.imageExtent.width, "x", desc.imageExtent.height));
+    Logger::info(str::format("FSR FG Presenter: Created for ", desc.imageExtent.width, "x", desc.imageExtent.height));
   }
 
   DxvkFSRFGPresenter::~DxvkFSRFGPresenter() {
-    Logger::info("FSR FG: Destroying FSR FG Presenter");
-    
-    auto& fsrFrameGen = m_device->getCommon()->metaFSRFrameGen();
+    releaseProxy();
+  }
+
+  void DxvkFSRFGPresenter::createProxy() {
+    if (::GetModuleHandleA("winevulkan.dll") != nullptr) {
+      Logger::warn("FSR FG Presenter: winevulkan detected, disabling FSR FG for this session to avoid present deadlocks");
+      m_disableForSession = true;
+      return;
+    }
+
+    DxvkFSRFrameGen& fsrFrameGen = m_device->getCommon()->metaFSRFrameGen();
+    if (!fsrFrameGen.createContexts(&m_swapchain, m_info, m_surface)) {
+      m_disableForSession = true;
+      return;
+    }
+    m_proxyActive = true;
+
+    // The views of the real swapchain images are replaced by views of the proxy's images. The D3D9 swapchain
+    // wraps them right after the presenter is created or recreated.
+    for (auto& img : m_images) {
+      m_vkd->vkDestroyImageView(m_vkd->device(), img.view, nullptr);
+    }
+
+    uint32_t imageCount = 0;
+    fsrFrameGen.m_replacedGetSwapchainImagesKHR(m_vkd->device(), m_swapchain, &imageCount, nullptr);
+    std::vector<VkImage> proxyImages(imageCount);
+    fsrFrameGen.m_replacedGetSwapchainImagesKHR(m_vkd->device(), m_swapchain, &imageCount, proxyImages.data());
+
+    m_images.resize(imageCount);
+    m_info.imageCount = imageCount;
+
+    // Present semaphores are per swap image, so they follow the proxy's image count. Nothing has been acquired yet.
+    destroySemaphores();
+    if (createSemaphores() != VK_SUCCESS) {
+      Logger::err("FSR FG: Failed to create presenter semaphores for the proxy images");
+    }
+
+    for (uint32_t i = 0; i < imageCount; i++) {
+      VkImageViewCreateInfo viewInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+      viewInfo.image = proxyImages[i];
+      viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+      viewInfo.format = m_info.format.format;
+      viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+      m_images[i].image = proxyImages[i];
+      if (m_vkd->vkCreateImageView(m_vkd->device(), &viewInfo, nullptr, &m_images[i].view) != VK_SUCCESS) {
+        Logger::err(str::format("FSR FG: Failed to create image view for proxy image ", i));
+      }
+    }
+
+    // FFX does not attach present IDs, so ids from the real swapchain must not be waited on through the proxy handle.
+    std::lock_guard<dxvk::mutex> presentWaitLock(m_presentWaitMutex);
+    m_nextPresentId = 0;
+    m_lastAttachedPresentId = 0;
+    m_lastPresentId.store(0, std::memory_order_release);
+    m_swapchainGeneration.fetch_add(1, std::memory_order_acq_rel);
+  }
+
+  void DxvkFSRFGPresenter::releaseProxy() {
+    DxvkFSRFrameGen& fsrFrameGen = m_device->getCommon()->metaFSRFrameGen();
     fsrFrameGen.waitForPresents();
     fsrFrameGen.destroyContexts();
 
-    // The proxy swapchain is owned by FFX contexts; clear handle so base presenter
-    // teardown does not try to destroy an already-destroyed swapchain.
+    if (!m_proxyActive) {
+      return;
+    }
+    m_proxyActive = false;
+
+    // Destroying the swapchain context destroyed the proxy and the real swapchain behind it, so the base presenter
+    // must not destroy the handle again. The views and semaphores are still the presenter's.
+    for (const auto& img : m_images) {
+      m_vkd->vkDestroyImageView(m_vkd->device(), img.view, nullptr);
+    }
+    destroySemaphores();
+    m_images.clear();
     m_swapchain = VK_NULL_HANDLE;
-    m_contextCreated = false;
+    m_acquireStatus = VK_NOT_READY;
   }
 
-  void DxvkFSRFGPresenter::updateSwapchainImagesToProxy(DxvkFSRFrameGen& fsrFrameGen, VkFormat format) {
-    // Get the FFX replacement function to retrieve PROXY images
-    PFN_vkGetSwapchainImagesKHR replacedGetSwapchainImages = fsrFrameGen.getReplacedGetSwapchainImagesKHR();
-    if (!replacedGetSwapchainImages) {
-      Logger::err("FSR FG: No replacement vkGetSwapchainImagesKHR available");
-      return;
-    }
-    
-    // Destroy old image views (they point to REAL swapchain images, not PROXY images)
-    for (auto& img : m_images) {
-      if (img.view != VK_NULL_HANDLE) {
-        m_vkd->vkDestroyImageView(m_vkd->device(), img.view, nullptr);
-        img.view = VK_NULL_HANDLE;
-      }
-    }
-    
-    // Get PROXY images from FFX SDK
-    std::vector<VkImage> proxyImages;
-    uint32_t imageCount = 0;
-    VkResult status = replacedGetSwapchainImages(m_vkd->device(), m_swapchain, &imageCount, nullptr);
-    if (status != VK_SUCCESS) {
-      Logger::err(str::format("FSR FG: Failed to get proxy image count: ", static_cast<int>(status)));
-      return;
-    }
-    
-    proxyImages.resize(imageCount);
-    status = replacedGetSwapchainImages(m_vkd->device(), m_swapchain, &imageCount, proxyImages.data());
-    if (status != VK_SUCCESS) {
-      Logger::err(str::format("FSR FG: Failed to get proxy images: ", static_cast<int>(status)));
-      return;
-    }
-    
-    // Resize m_images to match proxy image count
-    m_images.resize(imageCount);
-    m_info.imageCount = imageCount;
-    
-    // Create new image views for PROXY images
-    for (uint32_t i = 0; i < imageCount; i++) {
-      m_images[i].image = proxyImages[i];
-      
-      VkImageViewCreateInfo viewInfo = {};
-      viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-      viewInfo.pNext = nullptr;
-      viewInfo.flags = 0;
-      viewInfo.image = proxyImages[i];
-      viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-      viewInfo.format = format;
-      viewInfo.components = VkComponentMapping {
-        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
-      viewInfo.subresourceRange = {
-        VK_IMAGE_ASPECT_COLOR_BIT,
-        0, 1, 0, 1 };
-      
-      VkResult viewResult = m_vkd->vkCreateImageView(m_vkd->device(), &viewInfo, nullptr, &m_images[i].view);
-      if (viewResult != VK_SUCCESS) {
-        Logger::err(str::format("FSR FG: Failed to create image view for proxy image ", i, ": ", static_cast<int>(viewResult)));
-      }
-    }
-    
-    Logger::info(str::format("FSR FG: Updated ", imageCount, " image views to use PROXY images"));
-  }
-
-  void DxvkFSRFGPresenter::createFFXContexts() {
-    Logger::info("FSR FG Presenter: Creating FFX contexts (lazy initialization)");
-
-    if (::GetModuleHandleA("winevulkan.dll") != nullptr) {
-      Logger::warn("FSR FG Presenter: winevulkan detected, disabling FSR FG for this session to avoid present deadlocks");
-      m_disableFsrFgForSession = true;
-      m_contextCreated = false;
-      return;
-    }
-    
-    auto& fsrFrameGen = m_device->getCommon()->metaFSRFrameGen();
-    
-    VkPhysicalDevice physDevice = m_device->adapter()->handle();
-    VkDevice vkDevice = m_device->handle();
-    // Frame generation source is Remix path-traced final output, which is
-    // allocated as R16G16B16A16_SFLOAT in resource setup.
-    VkFormat backBufferFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
-
-    VkSwapchainCreateInfoKHR swapInfo = buildSwapchainCreateInfoFromPresenter(
-      m_info,
-      m_surface,
-      m_swapchain);
-
-    // Wrap swapchain with FFX replacement functions so generated frames can be presented.
-    fsrFrameGen.createSwapchainProxy(
-      physDevice,
-      vkDevice,
-      &m_swapchain,
-      &swapInfo);
-
-    if (fsrFrameGen.isSwapchainContextCreated()) {
-      updateSwapchainImagesToProxy(fsrFrameGen, m_info.format.format);
-    } else {
-      Logger::warn("FSR FG Presenter: Swapchain proxy unavailable, FG presentation may be disabled");
-    }
-    
-    // Create the frame generation context
-    fsrFrameGen.createFrameGenContext(
-      physDevice,
-      vkDevice,
-      m_cachedDesc.imageExtent.width,
-      m_cachedDesc.imageExtent.height,
-      backBufferFormat);
-    
-    if (fsrFrameGen.isInitialized()) {
-      m_contextCreated = true;
-      fsrFrameGen.setSwapchain(m_swapchain);
-      Logger::info(str::format("FSR FG Presenter: FFX contexts created successfully for ",
-        m_cachedDesc.imageExtent.width, "x", m_cachedDesc.imageExtent.height,
-        " format=", static_cast<int>(backBufferFormat)));
-    } else {
-      Logger::err("FSR FG Presenter: Failed to create FFX contexts");
-      m_disableFsrFgForSession = true;
-      m_contextCreated = false;
-    }
-  }
-
-  VkResult DxvkFSRFGPresenter::acquireNextImage(
-    vk::PresenterSync& sync, 
-    uint32_t& index, 
-    bool isDlfgPresenting) 
-  {
-    auto& fsrFrameGen = m_device->getCommon()->metaFSRFrameGen();
-
-    if (m_contextCreated) {
-      PFN_vkAcquireNextImageKHR replacedAcquire = fsrFrameGen.getReplacedAcquireNextImageKHR();
-      if (replacedAcquire != nullptr) {
-        sync = m_semaphores.at(m_frameIndex);
-
-        if (m_acquireStatus == VK_NOT_READY) {
-          m_acquireStatus = replacedAcquire(
-            m_vkd->device(),
-            m_swapchain,
-            std::numeric_limits<uint64_t>::max(),
-            sync.acquire,
-            VK_NULL_HANDLE,
-            &m_imageIndex);
-        }
-
-        if (m_acquireStatus != VK_SUCCESS && m_acquireStatus != VK_SUBOPTIMAL_KHR)
-          return m_acquireStatus;
-
-        index = m_imageIndex;
-        return m_acquireStatus;
-      }
+  VkResult DxvkFSRFGPresenter::acquireNextImage(vk::PresenterSync& sync, uint32_t& index, bool isDlfgPresenting) {
+    if (!m_proxyActive) {
+      return vk::Presenter::acquireNextImage(sync, index, isDlfgPresenting);
     }
 
-    return vk::Presenter::acquireNextImage(sync, index, isDlfgPresenting);
+    if (m_acquireStatus == VK_NOT_READY) {
+      m_acquireStatus = m_device->getCommon()->metaFSRFrameGen().m_replacedAcquireNextImageKHR(
+        m_vkd->device(), m_swapchain, std::numeric_limits<uint64_t>::max(), nextAcquireSemaphore(), VK_NULL_HANDLE, &m_imageIndex);
+    }
+
+    index = m_imageIndex;
+    sync = getSync(m_imageIndex);
+    return m_acquireStatus;
   }
 
   VkResult DxvkFSRFGPresenter::presentImage(
@@ -1099,171 +794,74 @@ namespace dxvk {
     const DxvkFrameInterpolationInfo& frameInterpolationInfo,
     std::uint32_t acquiredImageIndex,
     bool isDlfgPresenting,
-    VkSetPresentConfigNV* presentMetering) 
-  {
-    auto& fsrFrameGen = m_device->getCommon()->metaFSRFrameGen();
-    const bool fgEnabled = DxvkFSRFrameGen::enable() && !m_disableFsrFgForSession;
-    
-    // Lazily create FFX contexts when first enabled.
-    if (fgEnabled) {
-      if (!m_contextCreated) {
-        createFFXContexts();
-      }
+    VkSetPresentConfigNV* presentMetering) {
+    if (!m_proxyActive) {
+      return vk::Presenter::presentImage(status, presentInfo, frameInterpolationInfo,
+        acquiredImageIndex, isDlfgPresenting, presentMetering);
     }
 
-    if (m_contextCreated) {
-      const bool preparedForPresent = fsrFrameGen.consumePreparedFrameForPresent();
+    DxvkFSRFrameGen& fsrFrameGen = m_device->getCommon()->metaFSRFrameGen();
+    fsrFrameGen.beginPresent(m_swapchain, frameInterpolationInfo, DxvkFSRFrameGen::enable() && !m_disableForSession, m_info);
 
-      // Only disable from presenter path. Enable/configure happens in prepare with FG-local frame ID.
-      if (fsrFrameGen.isInitialized() && (!fgEnabled || !preparedForPresent)) {
-        fsrFrameGen.configureFrameGeneration(m_swapchain, fsrFrameGen.getFrameGenFrameId(), false);
-      }
-    }
-    
-    if (m_contextCreated) {
-      PFN_vkQueuePresentKHR replacedPresent = fsrFrameGen.getReplacedQueuePresentKHR();
-      if (replacedPresent != nullptr) {
-        vk::PresenterSync sync = m_semaphores.at(m_frameIndex);
+    // The proxy does not accept a pNext chain on the present info.
+    const VkSemaphore presentSemaphore = m_presentSemaphores.at(m_imageIndex);
+    VkPresentInfoKHR info = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+    info.waitSemaphoreCount = 1;
+    info.pWaitSemaphores = &presentSemaphore;
+    info.swapchainCount = 1;
+    info.pSwapchains = &m_swapchain;
+    info.pImageIndices = &m_imageIndex;
 
-        VkPresentInfoKHR info = {};
-        info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-        info.pNext = presentMetering;
-        info.waitSemaphoreCount = 1;
-        info.pWaitSemaphores = &sync.present;
-        info.swapchainCount = 1;
-        info.pSwapchains = &m_swapchain;
-        info.pImageIndices = &m_imageIndex;
-        info.pResults = nullptr;
-
-        VkResult presentResult = replacedPresent(m_device->queues().present.queueHandle, &info);
-        if (presentResult != VK_SUCCESS && presentResult != VK_SUBOPTIMAL_KHR)
-          return presentResult;
-
-        m_frameIndex = (m_frameIndex + 1) % m_semaphores.size();
-        vk::PresenterSync nextSync = m_semaphores.at(m_frameIndex);
-
-        PFN_vkAcquireNextImageKHR replacedAcquire = fsrFrameGen.getReplacedAcquireNextImageKHR();
-        if (replacedAcquire != nullptr) {
-          m_acquireStatus = replacedAcquire(
-            m_vkd->device(),
-            m_swapchain,
-            std::numeric_limits<uint64_t>::max(),
-            nextSync.acquire,
-            VK_NULL_HANDLE,
-            &m_imageIndex);
-        } else {
-          m_acquireStatus = VK_NOT_READY;
-        }
-
-        return presentResult;
-      }
+    const VkResult presentResult = fsrFrameGen.m_replacedQueuePresentKHR(m_device->queues().present.queueHandle, &info);
+    if (presentResult != VK_SUCCESS && presentResult != VK_SUBOPTIMAL_KHR) {
+      return presentResult;
     }
 
-    return vk::Presenter::presentImage(status, presentInfo, frameInterpolationInfo,
-      acquiredImageIndex, isDlfgPresenting, presentMetering);
-  }
-
-  VkResult DxvkFSRFGPresenter::getSwapImages(std::vector<VkImage>& images) {
-    auto& fsrFrameGen = m_device->getCommon()->metaFSRFrameGen();
-
-    if (m_contextCreated) {
-      PFN_vkGetSwapchainImagesKHR replacedGetSwapchainImages = fsrFrameGen.getReplacedGetSwapchainImagesKHR();
-      if (replacedGetSwapchainImages != nullptr) {
-        uint32_t imageCount = 0;
-        VkResult status = replacedGetSwapchainImages(m_vkd->device(), m_swapchain, &imageCount, nullptr);
-        if (status != VK_SUCCESS)
-          return status;
-
-        images.resize(imageCount);
-        return replacedGetSwapchainImages(m_vkd->device(), m_swapchain, &imageCount, images.data());
-      }
-    }
-
-    return vk::Presenter::getSwapImages(images);
+    // The next image is acquired right away, as the base presenter does.
+    m_acquireStatus = fsrFrameGen.m_replacedAcquireNextImageKHR(m_vkd->device(), m_swapchain,
+      std::numeric_limits<uint64_t>::max(), nextAcquireSemaphore(), VK_NULL_HANDLE, &m_imageIndex);
+    return presentResult;
   }
 
   VkResult DxvkFSRFGPresenter::recreateSwapChain(const vk::PresenterDesc& desc) {
-    // Guard against re-entrant calls during recreation
-    if (m_recreatingSwapchain) {
-      Logger::warn("FSR FG Presenter: Skipping re-entrant recreateSwapChain call");
+    // A format, color space or present mode change with the same size still needs a new proxy.
+    auto sameDesc = [](const vk::PresenterDesc& a, const vk::PresenterDesc& b) {
+      if (a.imageExtent.width != b.imageExtent.width || a.imageExtent.height != b.imageExtent.height ||
+          a.imageCount != b.imageCount || a.numFormats != b.numFormats || a.numPresentModes != b.numPresentModes ||
+          a.fullScreenExclusive != b.fullScreenExclusive) {
+        return false;
+      }
+      for (uint32_t i = 0; i < a.numFormats; ++i) {
+        if (a.formats[i].format != b.formats[i].format || a.formats[i].colorSpace != b.formats[i].colorSpace) {
+          return false;
+        }
+      }
+      for (uint32_t i = 0; i < a.numPresentModes; ++i) {
+        if (a.presentModes[i] != b.presentModes[i]) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    if (m_proxyActive && sameDesc(desc, m_cachedDesc)) {
       return VK_SUCCESS;
     }
-    
-    // Skip if size hasn't changed and we already have valid contexts
-    if (m_currentExtent.width == desc.imageExtent.width && 
-        m_currentExtent.height == desc.imageExtent.height &&
-        m_contextCreated && m_swapchain != VK_NULL_HANDLE) {
-      Logger::info(str::format("FSR FG Presenter: Skipping redundant recreation for ",
-        desc.imageExtent.width, "x", desc.imageExtent.height));
-      return VK_SUCCESS;
-    }
-    
-    m_recreatingSwapchain = true;
-    Logger::info(str::format("FSR FG Presenter: Recreating swapchain ", 
-      desc.imageExtent.width, "x", desc.imageExtent.height));
-    
-    auto& fsrFrameGen = m_device->getCommon()->metaFSRFrameGen();
-    
-    // Wait for any pending presents
-    fsrFrameGen.waitForPresents();
-    
-    // Destroy old FFX contexts - this releases the swapchain proxy
-    fsrFrameGen.destroyContexts();
-    m_contextCreated = false;
-    
-    // Now call base implementation to create a new normal swapchain
-    VkResult result = vk::Presenter::recreateSwapChain(desc);
+
+    Logger::info(str::format("FSR FG Presenter: Recreating swapchain ", desc.imageExtent.width, "x", desc.imageExtent.height));
+    releaseProxy();
+
+    const VkResult result = vk::Presenter::recreateSwapChain(desc);
     if (result != VK_SUCCESS) {
       Logger::err(str::format("FSR FG Presenter: Base swapchain recreation failed: ", static_cast<int>(result)));
-      m_recreatingSwapchain = false;
       return result;
     }
-    
-    // Update display size
-    fsrFrameGen.setDisplaySize({ desc.imageExtent.width, desc.imageExtent.height });
-    
-    // Re-wrap swapchain and re-create frame generation context with new display params.
-    VkPhysicalDevice physDevice = m_device->adapter()->handle();
-    VkDevice vkDevice = m_device->handle();
-    // Keep frame generation context format aligned with path-traced source.
-    VkFormat backBufferFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    m_cachedDesc = desc;
 
-    VkSwapchainCreateInfoKHR swapInfo = buildSwapchainCreateInfoFromPresenter(
-      m_info,
-      m_surface,
-      m_swapchain);
-
-    fsrFrameGen.createSwapchainProxy(
-      physDevice,
-      vkDevice,
-      &m_swapchain,
-      &swapInfo);
-
-    if (fsrFrameGen.isSwapchainContextCreated()) {
-      updateSwapchainImagesToProxy(fsrFrameGen, m_info.format.format);
+    // The D3D9 swapchain wraps the presenter's images right after this call, so the proxy has to exist by then.
+    if (!m_disableForSession) {
+      createProxy();
     }
-    
-    // Create the frame generation context
-    fsrFrameGen.createFrameGenContext(
-      physDevice,
-      vkDevice,
-      desc.imageExtent.width,
-      desc.imageExtent.height,
-      backBufferFormat);
-    
-    if (fsrFrameGen.isInitialized()) {
-      m_contextCreated = true;
-      fsrFrameGen.setSwapchain(m_swapchain);
-      m_currentExtent = desc.imageExtent;
-      Logger::info(str::format("FSR FG Presenter: Recreated successfully for ",
-        desc.imageExtent.width, "x", desc.imageExtent.height));
-    } else {
-      Logger::err("FSR FG Presenter: Failed to recreate FSR FG contexts");
-      m_disableFsrFgForSession = true;
-      m_contextCreated = false;
-    }
-    
-    m_recreatingSwapchain = false;
     return result;
   }
 
@@ -1277,46 +875,6 @@ namespace dxvk {
         return false;
       }
       return device->getCommon()->metaFSRFrameGen().supportsFSRFrameGen();
-    }
-
-    void dispatchFsrFrameGeneration(RtxContext& ctx, const Rc<DxvkImage>& hudLessBackBuffer) {
-      DxvkDevice* device = ctx.getDevice().ptr();
-      if (!isFsrFrameGenEnabled(device)) {
-        return;
-      }
-
-      DxvkFSRFrameGen& fsrFrameGen = device->getCommon()->metaFSRFrameGen();
-
-      // Frame generation and V-Sync are not supported together; latch V-Sync off
-      // once rather than every frame.
-      if (RtxOptions::enableVsyncState != EnableVsync::Off) {
-        RtxOptions::enableVsync.setDeferred(EnableVsync::Off);
-        RtxOptions::enableVsyncState = EnableVsync::Off;
-      }
-
-      Resources::RaytracingOutput& rtOutput = ctx.getResourceManager().getRaytracingOutput();
-      RtCamera& camera = ctx.getSceneManager().getCamera();
-      const bool viewModelActive = ctx.getSceneManager().getCameraManager().isCameraValid(CameraType::ViewModel);
-
-      // Note: display size is set by the presenter during swapchain
-      // creation/recreation. It must not be derived from the composite output
-      // size here, since the two differ while upscaling.
-      fsrFrameGen.setFrameGenerationPresentColorSource(hudLessBackBuffer);
-
-      // prepareFrameGeneration() calls configureFrameGeneration() internally;
-      // AMD's docs require configure before the prepare dispatch. The
-      // interpolation input is supplied through the present-color override
-      // above and consumed via the frame generation callback.
-      fsrFrameGen.prepareFrameGeneration(
-        &ctx,
-        ctx.m_execBarriers,
-        camera,
-        rtOutput.m_primaryScreenSpaceMotionVector.view,
-        rtOutput.m_primaryDepth.view,
-        viewModelActive,
-        ctx.m_resetHistory,
-        device->getCurrentFrameId(),
-        GlobalTime::get().deltaTimeMs());
     }
 
   } // namespace fork_hooks

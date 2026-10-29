@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023-2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -34,7 +34,7 @@
 #include "rtx/concept/volume_material/volume_material.slangh"
 #include "rtx/concept/ray_portal/ray_portal.slangh"
 #include "rtx/algorithm/view_distance.slangh"
-#include "rtx/algorithm/volume_lighting.slangh"
+#include "rtx/algorithm/volume_lighting_consumer.slangh"
 
 #ifndef GBUFFER_FEATURE_OBJECT_PICKING
 #define GBUFFER_FEATURE_OBJECT_PICKING 1
@@ -141,9 +141,8 @@ bool evaluateOpaqueApproximations(
   // Note: Radiance attenuation split into incoming/outgoing rather than having the function accumulate into it
   // to accomodate some processes optimize around the fact that opaque approximations only result in monochromatic attenuation.
   vec3 incomingRadianceAttenuation, inout float outgoingRadianceAttenuation, inout vec3 emissiveRadiance,
-  // Fork (2026-07-26): true when the surface's material carries
-  // OPAQUE_SURFACE_MATERIAL_FLAG_SKY_LIT_PARTICLE (weather precipitation) - the
-  // opacity lighting approximation then adds a sky-ambient term. See below.
+  // True when the surface's material carries OPAQUE_SURFACE_MATERIAL_FLAG_SKY_LIT_PARTICLE (particles known to
+  // see open sky). The opacity lighting approximation then adds a sky-ambient term (see below).
   bool skyLitParticle = false)
 {
   const Camera camera = cb.camera;
@@ -165,7 +164,7 @@ bool evaluateOpaqueApproximations(
   {
     const uint froxelVolumeHint = portalSpaceToVolumeHint(portalSpace);
 
-    const vec3 accumulatedOutgoingRadiance = evalVolumetricNEE(VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg, volumeArgs,
+    const vec3 accumulatedOutgoingRadiance = evalVolumetricConsumerNEE(VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg, volumeArgs,
       surfaceInteraction, opaqueSurfaceMaterialInteraction.shadingNormal, froxelVolumeHint);
 
     // Note: Volume radiance cache assumes isotropic scattering (no directionality), but we want something closer to a "diffuse" distribution for
@@ -176,37 +175,21 @@ bool evaluateOpaqueApproximations(
     emissiveRadiance += opaqueSurfaceMaterialInteraction.albedo * accumulatedOutgoingRadiance * incomingRadianceAttenuation;
 
 #ifdef RESOLVE_SKY_LIT_PARTICLES
-    // Fork (2026-07-26): skylight for sky-lit particle materials (weather
-    // precipitation). The froxel radiance cache sampled above is filled purely
-    // by NEE over the analytic light pool - its integrator has NO sky term, so
-    // in open air under an overcast (sun-killed) sky it is nearly black and
-    // particles shaded only by it render as dark silhouettes against a bright
-    // sky, which was the reported rain bug. Real drops transmit the sky around
-    // them; this adds that term from the atmosphere's own sky-view LUT via
-    // sampleSkyAmbientForVolume (includes the cloud-transmittance LUT, so
-    // storm decks genuinely dim it; warm at sunset; zero at night below the
-    // horizon). Two taps: the view direction (forward transmission - the sky
-    // behind the drop, lifted slightly above the horizon so looking down does
-    // not zero it) and the zenith (ambient), averaged. Gated to materials that
-    // explicitly opt in: precipitation qualifies because its spawn-time
-    // shelter probe guarantees every living drop saw open sky - the same
-    // guarantee cannot be made for generic game particles (indoor smoke must
-    // not glow sky-blue), hence the material flag rather than isParticle.
-    // Numos-only: the LUTs exist only in that sky mode.
-    if (skyLitParticle && cb.skyMode == 1 && cb.particleSkyAmbientScale > 0.0f)
+    // Skylight for sky-lit particle materials. The froxel radiance cache sampled above holds NEE over the analytic
+    // lights only, with no sky term, so particles shaded only by it render dark against a bright overcast sky.
+    // This adds the sky provider's sky light (clouds included) as the average of two taps: the view direction,
+    // lifted slightly above the horizon so looking down does not zero it, and the zenith.
+    // Only materials with OPAQUE_SURFACE_MATERIAL_FLAG_SKY_LIT_PARTICLE opt in, because generic game particles
+    // cannot be assumed to see open sky (indoor smoke must not glow sky-blue).
+    if (skyLitParticle && skyProviderActive() && cb.particleSkyAmbientScale > 0.0f)
     {
       vec3 viewDir = normalize(surfaceInteraction.position - cameraGetWorldPosition(camera));
-      vec3 viewDirYUp = worldToAtmosphereYUp(viewDir, cb.isZUp != 0, cb.atmosphereArgs.flipUpAxis != 0);
-      viewDirYUp.y = max(viewDirYUp.y, 0.05f);
-      viewDirYUp = normalize(viewDirYUp);
+      const vec3 up = cb.isZUp != 0 ? vec3(0.0f, 0.0f, 1.0f) : vec3(0.0f, 1.0f, 0.0f);
+      viewDir = normalize(viewDir + up * max(0.05f - dot(viewDir, up), 0.0f));
 
-      const vec3 skyForward = sampleSkyAmbientForVolume(viewDirYUp, cb.atmosphereArgs,
-        AtmosphereSkyViewLut, AtmosphereCloudSkyTransmittanceLut, AtmosphereSkyViewSampler);
-      const vec3 skyZenith = sampleSkyAmbientForVolume(vec3(0.0f, 1.0f, 0.0f), cb.atmosphereArgs,
-        AtmosphereSkyViewLut, AtmosphereCloudSkyTransmittanceLut, AtmosphereSkyViewSampler);
-      const vec3 skyAmbient = (skyForward + skyZenith) * 0.5f;
+      const vec3 skyAmbient = (skyProviderAmbient(viewDir) + skyProviderAmbient(up)) * 0.5f;
 
-      // Same albedo convention as the froxel term above (opacity pre-baked).
+      // The albedo convention matches the froxel term above, with opacity pre-baked.
       emissiveRadiance += opaqueSurfaceMaterialInteraction.albedo * skyAmbient
         * cb.particleSkyAmbientScale * incomingRadianceAttenuation;
     }
@@ -355,11 +338,6 @@ void resolveVertex<T: IBasePayloadState>(
   inout Surface surface, inout SurfaceInteraction surfaceInteraction,
   inout PolymorphicSurfaceMaterialInteraction polymorphicSurfaceMaterialInteraction,
   inout vec3 radianceAttenuation, inout vec3 emissiveRadiance,
-  // Emissive radiance produced by surfaces that should be composited as a separate
-  // transparency layer overlay (e.g. RayPortal ring), pre-multiplied by the local
-  // radianceAttenuation at the point of emission. The caller decides where this goes
-  // (particle buffer for primary/PSR, or merged back into emissiveRadiance for indirect).
-  inout vec3 transparencyLayerEmissive,
   uint4 decalMemory,
   vec3 decalEmissiveRadiance,
   float coneSpreadAngle,
@@ -451,6 +429,16 @@ void resolveVertex<T: IBasePayloadState>(
       polymorphicType == surfaceMaterialTypeOpaque)
   {
     const OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
+
+#if defined(RAY_TRACING_PRIMARY_RAY) && defined(OPAQUE_MATERIAL_USE_POM)
+    // The SCCR shell march of displaced primary and PSR hits (sccr_shell_march.slangh). It re-frames the surface
+    // interaction to the triangle the march ends in and marks it, so the material interaction below skips its own POM
+    // march. The hand-off distance is measured from the camera along the resolved ray.
+    sccrShellResolve(
+      opaqueSurfaceMaterial, surface, rayInteraction,
+      length(ray.origin - cameraGetWorldPosition(camera)) + rayInteraction.hitDistance,
+      surfaceInteraction);
+#endif
 
     OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
       opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
@@ -636,16 +624,11 @@ void resolveVertex<T: IBasePayloadState>(
       const float ringTransparency =
         saturate(1.0f - rayPortalSurfaceMaterialInteraction.mask.a) *
         (rayPortalSurfaceMaterialInteraction.isInsidePortal ? saturate(1.0f - tFactor) : 1.0f);
-      // Hack: Lingering 0.5 from earlier in the project to make the Portal less bright before it had its own material, too late to remove this now for
-      // Portal RTX, but this should be removed some day.
+      // Hack: A fixed 0.5 scale dims the portal emission. Existing content is tuned to it, so it stays for now,
+      // but it should be removed some day.
       const float hackPortalEmissiveIntensity = 0.5f;
 
-      // Route the ring contribution to the transparency layer so it is composited as a stable additive overlay by DLSS-RR, 
-      // rather than being mixed into the per-frame composited primary radiance (which causes silhouette shimmer
-      // when sparse direct/indirect sampling is enabled). Mathematically equivalent to
-      // an alpha-blended overlay: through-portal scaled by ringTransparency stays in the
-      // primary path; ring contribution scaled by (1 - ringTransparency) goes here.
-      transparencyLayerEmissive +=
+      emissiveRadiance +=
         (rayPortalSurfaceMaterialInteraction.mask.rgb * (1.0f - ringTransparency) * hackPortalEmissiveIntensity) * radianceAttenuation;
       radianceAttenuation *= ringTransparency;
     }
@@ -841,7 +824,7 @@ float oitDepthWeight(float hitT, float tMax)
 }
 
 void resolveVertexUnorderedParticles<
-  let RAY_FLAGS : uint8_t>(
+  let RAY_FLAGS : uint>(
   uint8_t resolveMode, Ray ray, uint rayMask,
   PortalSpace2BitsType portalSpace,
   bool useIntersectionBillboards,
@@ -853,9 +836,11 @@ void resolveVertexUnorderedParticles<
   float pathSelectionProbability,
   inout vec3 radianceAttenuation, inout vec3 emissiveRadiance,
   out uint numInteractions,
-  out int surfaceIndex)
+  out int surfaceIndex,
+  out float nearestContributorDistance)
 {
   surfaceIndex = -1;
+  nearestContributorDistance = floatMax;
 
   const bool separateUnorderedApproximations = packedFlagGet(resolveMode, resolveModeSeparateUnorderedApproximations);
 
@@ -1086,6 +1071,10 @@ void resolveVertexUnorderedParticles<
     currentRadianceAttenuation = mix(1.0f, currentRadianceAttenuation, blendFactor);
     currentEmissiveRadiance = mix(vec3(0.0f), currentEmissiveRadiance, blendFactor);
 
+    if (currentRadianceAttenuation < 1.0f || any(currentEmissiveRadiance > 0.0f)) {
+      nearestContributorDistance = min(nearestContributorDistance, accumulatedHitDistance + rayInteraction.hitDistance);
+    }
+
     if (any(currentEmissiveRadiance > 0.0f))
     {
       surfaceIndex = rayInteraction.surfaceIndex;
@@ -1124,13 +1113,15 @@ void resolveVertexUnorderedParticles<
 
 #ifdef RAY_TRACING_PRIMARY_RAY
 #ifndef GBUFFER_PSR
-    if (GBUFFER_FEATURE_OBJECT_PICKING && numInteractions == 0 && cb.enableObjectPicking != 0)
+#if GBUFFER_FEATURE_OBJECT_PICKING
+    if (numInteractions == 0 && cb.enableObjectPicking)
     {
       InterlockedCompareStore(
         PrimaryObjectPicking[pixelCoordinate],
         OBJECT_PICKING_INVALID,
         surface.objectPickingValue);
     }
+#endif
 #endif
 #endif
 
@@ -1178,7 +1169,7 @@ void resolveVertexUnorderedParticles<
 // Handles unordered Resolve operations within the resolve loop which do not depend on the typical ordered execution
 // for the resolve logic.
 void resolveVertexUnordered<
-  let RAY_FLAGS : uint8_t,
+  let RAY_FLAGS : uint,
   let ENABLE_DECALS : bool,
   let ENABLE_PARTICLES : bool>(
   uint8_t resolveMode, Ray ray, uint rayMask,
@@ -1576,7 +1567,8 @@ void resolveVertexUnordered<
 
 #ifdef RAY_TRACING_PRIMARY_RAY
 #ifndef GBUFFER_PSR
-    if (GBUFFER_FEATURE_OBJECT_PICKING && numInteractions == 0 && cb.enableObjectPicking != 0)
+#if GBUFFER_FEATURE_OBJECT_PICKING
+    if (numInteractions == 0 && cb.enableObjectPicking)
     {
       // Write only if was OBJECT_PICKING_INVALID, i.e. write the very first resolveVertexUnordered
       // Object picking for alpha blended
@@ -1586,6 +1578,7 @@ void resolveVertexUnordered<
         surface.objectPickingValue // value to write, if equal
       );
     }
+#endif
 #endif
 #endif
 

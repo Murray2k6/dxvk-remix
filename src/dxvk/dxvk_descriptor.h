@@ -76,9 +76,10 @@ namespace dxvk {
      * \brief Allocates a descriptor set
      * 
      * \param [in] layout Descriptor set layout
-     * \returns The descriptor set
+     * \param [out] result The driver's result, when not null
+     * \returns The descriptor set, or VK_NULL_HANDLE when the driver refused it
      */
-    VkDescriptorSet alloc(VkDescriptorSetLayout layout, const char *name);
+    VkDescriptorSet alloc(VkDescriptorSetLayout layout, const char *name, VkResult* result = nullptr);
     // NV-DXVK end
 
     /**

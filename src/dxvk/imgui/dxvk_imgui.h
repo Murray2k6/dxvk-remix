@@ -25,7 +25,8 @@
 #include "imgui.h"
 
 #include <chrono>
-#define WIN32_LEAN_AND_MEAN 
+#include <iterator>
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
 #include "../util/rc/util_rc.h"
@@ -38,6 +39,7 @@
 #include "../dxvk_graphics_state.h"
 #include "../dxvk_constant_state.h"
 #include "../rtx_render/rtx_options.h"
+#include "dxvk_imgui_option_search.h"
 
 struct ImPlotContext;
 
@@ -48,6 +50,7 @@ namespace dxvk {
   class ImGuiCapture;
   class DxvkDevice;
   class DxvkContext;
+  class DxvkObjects;
   class RtxGraphGUI;
 
   /**
@@ -68,7 +71,8 @@ namespace dxvk {
     enum class Theme {
       Toolkit,
       Legacy,
-      Nvidia
+      Nvidia,
+      RemixPlus
     };
 
     ImGUI(DxvkDevice* device);
@@ -97,12 +101,16 @@ namespace dxvk {
     static void AddTexture(const XXH64_hash_t hash, const Rc<DxvkImageView>& imageView, uint32_t textureFeatureFlags);
     static void ReleaseTexture(const XXH64_hash_t hash);
     static bool checkHotkeyState(const VirtualKeys& virtKeys, const bool allowContinuousPress = false);
+    // Draws the Open Log Folder button and the folder that really holds the logs.
+    // With withReportHelp, it also draws rtx.gui.logHelpText above them and the rtx.gui.reportFile buttons below.
+    static void showLogFolder(bool withReportHelp = true);
     static void SetFogStates(const fast_unordered_cache<FogState>& fogStates, XXH64_hash_t usedFogHash);
 
     void switchMenu(UIType type, bool force = false);
     
     enum Tabs {
       kTab_Rendering = 0,
+      kTab_HostSettings,
       kTab_Setup,
       kTab_Enhancements,
       kTab_About,
@@ -142,6 +150,7 @@ namespace dxvk {
     Rc<ImGuiFirstUseGuide> m_firstUseGuide;
     Rc<ImGuiSplash>       m_splash;
     Rc<ImGuiCapture>      m_capture;
+    ImGuiOptionSearch     m_optionSearch;
     Rc<class GameOverlay>  m_overlayWin;
 
     // Note: May be NULL until the font loads, needs to be checked before use.
@@ -149,6 +158,10 @@ namespace dxvk {
     ImFont*               m_boldFont = nullptr;
     // Note: May be NULL until the font loads, needs to be checked before use.
     ImFont*               m_largeFont = nullptr;
+    // Medium-weight fonts the user menu picks from to scale its text with the output height, smallest first.
+    // Note: May be NULL until the fonts load.
+    static constexpr float kUserMenuFontSizes[] = { 20.0f, 24.0f, 28.0f, 32.0f, 40.0f, 48.0f };
+    ImFont*               m_userMenuFonts[std::size(kUserMenuFontSizes)] = {};
 
     ImGuiContext*         m_context;
     ImPlotContext*        m_plotContext;
@@ -170,27 +183,17 @@ namespace dxvk {
     // Width of item+label widgets in large mode (developer menu)
     float                 m_largeWindowWidgetWidth = 364.0f;
 
-    float                 m_regularUserWindowWidth = 600.f;
-    float                 m_regularUserWindowHeight = 720.f;
-    // Width of item+label widgets in regular mode (user menu)
-    float                 m_regularUserWindowWidgetWidth = 140.f;
-
-    float                 m_largeUserWindowWidth = 776.0f;
-    float                 m_largeUserWindowHeight = 926.0f;
-    // Width of item+label widgets in large mode
-    float                 m_largeUserWindowWidgeWidth = 252.f;
-
     bool                  m_windowOnRight = true;
     bool                  m_pendingUIOptionsScroll = false;
 
 
     float                 m_windowWidth = m_regularWindowWidth;
-    float                 m_userWindowWidth = m_regularUserWindowWidth;
-    float                 m_userWindowHeight = m_regularUserWindowHeight;
 
     const char*           m_userGraphicsWindowTitle = "User Graphics Settings";
     bool m_hudMessageTimeReset = false;
     std::chrono::time_point<std::chrono::steady_clock> m_hudMessageStartTime;
+    // The shader prewarm wait screen (rtx.shader.blockUntilPrewarmed) is up, and the game's input is held back.
+    bool m_prewarmScreenActive = false;
     bool m_reflexRangesInitialized = false;
     float m_currentGameToRenderDurationMin;
     float m_currentGameToRenderDurationMax;
@@ -202,7 +205,7 @@ namespace dxvk {
     bool m_lastRenderVsyncStatus = false;
     std::unique_ptr<RtxGraphGUI> m_graphGUI;
 
-    static constexpr const char* tabNames[] = { "Rendering", "Game Setup", "Enhancements", "About" , "Dev Settings", "Plugin"};
+    static constexpr const char* tabNames[] = { "Rendering", "Host Settings", "Game Setup", "Enhancements", "About" , "Dev Settings", "Plugin"};
     Tabs m_curTab = kTab_Count;
     Tabs m_triggerTab = kTab_Count;
     void triggerTab(const Tabs tab) {
@@ -218,22 +221,28 @@ namespace dxvk {
     void showMainMenu(const Rc<DxvkContext>& ctx);
 
     void showUserMenu(const Rc<DxvkContext>& ctx);
-    void showUserGeneralSettings(
-      const Rc<DxvkContext>& ctx,
-      const int subItemWidth,
-      const int subItemIndent);
-    void showUserRenderingSettings(
-      const Rc<DxvkContext>& ctx,
-      const int subItemWidth,
-      const int subItemIndent);
-    void showUserContentSettings(
-      const Rc<DxvkContext>& ctx,
-      const int subItemWidth,
-      const int subItemIndent);
+    // Returns the user menu font closest to targetSize pixels.
+    // Returns null while the fonts are not loaded.
+    ImFont* getUserMenuFont(float targetSize) const;
+    // Draws the fixed area at the top of the user menu: the frame rate limit, the video memory use and the Donate button.
+    void showUserMenuHeader() const;
+    // Draws the user menu's bottom row of buttons.
+    void showUserMenuFooter();
+    void showUserGeneralSettings(const Rc<DxvkContext>& ctx);
+    void showUserRenderingSettings(const Rc<DxvkContext>& ctx);
+    void showUserContentSettings();
+    void showUserDeveloperMenuGuide();
 
     void showHudMessages(const Rc<DxvkContext>& ctx);
 
+    // Draws the full-screen wait screen while the startup shader prewarm compiles (rtx.shader.blockUntilPrewarmed).
+    void showShaderPrewarmScreen(const Rc<DxvkContext>& ctx);
+    void setPrewarmScreenActive(bool active);
+
     void showRenderingSettings(const Rc<DxvkContext>& ctx);
+    // The SCCR block of the Displacement settings, shown in SCCR mode.
+    void showSccrSettings(DxvkObjects* common);
+    void showDeveloperSection(const Rc<DxvkContext>& ctx);
 
     void showDLFGOptions(const Rc<DxvkContext>& ctx);
     void showReflexOptions(const Rc<DxvkContext>& ctx, bool displayStatsWindowToggle);
@@ -262,13 +271,24 @@ namespace dxvk {
     void setToolkitStyle(ImGuiStyle* dst);
     // Sets Nvidia inspired UI theme
     void setNvidiaStyle(ImGuiStyle* dst);
+    void setRemixPlusStyle(ImGuiStyle* dst);
     // Custom style
     void setupStyle(ImGuiStyle* dst = NULL);
 
     void showVsyncOptions(bool enableDLFGGuard);
     void processHotkeys();
 
+    struct VideoMemoryUsage {
+      float usedMiB = 0.0f;
+      float totalMiB = 0.0f;
+      float freeMiB = 0.0f;
+      // Goes from green to red as the free memory runs out.
+      ImVec4 barColor;
+    };
+    VideoMemoryUsage getVideoMemoryUsage() const;
     void showMemoryStats() const;
+    // Draws the video memory use as one labeled bar that starts controlOffsetX from the start of the line.
+    void showCompactMemoryStats(float controlOffsetX) const;
     bool showRayReconstructionEnable(bool supportsRR);
 
     RTX_OPTION_ARGS("rtx.gui", bool, showLegacyTextureGui, false, "A setting to toggle the old texture selection GUI, where each texture category is represented as its own list.", args.flags = RtxOptionFlags::UserSetting);
@@ -280,6 +300,29 @@ namespace dxvk {
                     args.minValue = 0.0f);
     RTX_OPTION("rtx.gui", bool, enableExternalPresenter, false, "Enables GUI rendering for external presenters.");
     RTX_OPTION("rtx.gui", Vector4, subRect, Vector4(0.f, 0.f, 0.f, 0.f), "Used for toolkit.");
+    RTX_OPTION("rtx.gui", std::string, logHelpText, std::string(""),
+               "The instructions the log section of the menus shows above the log folder, such as which file to send with a bug report and where to send it.\n"
+               "Empty shows a short generic instruction.");
+    RTX_OPTION_FLAG("rtx.gui", std::string, reportFile, std::string(""), RtxOptionFlags::NoSave,
+                    "Set by the game integration (remix API SetConfigVariable): the full path of the newest report file, such as a zip of a session's logs. "
+                    "When set, the log section of the menus names the file and gets buttons that show it in Explorer and copy its path.");
+    RTX_OPTION("rtx.gui", std::string, productName, std::string("Remix Plus"),
+               "The product name the menus show to the player: in the startup message, the welcome window, the developer menu title and the About tab.\n"
+               "A game's rtx.conf can set it to the name of its RTX release. The license text keeps the name RTX Remix.");
+    RTX_OPTION("rtx.gui", std::string, donateUrl, std::string(""),
+               "A link the welcome window, the About tab and the top of the user graphics menu show as a Donate button. Empty hides the button. Only https links are opened.");
+
+    // The release version: the last word of the build ID when it starts with a digit ("1.0.4" from
+    // "Game Release 1.0.4"), else empty.
+    public: static std::string productVersion();
+    // The product name followed by the release version when there is one.
+    public: static std::string productNameWithVersion();
+
+    // Returns true when rtx.gui.donateUrl holds an https link.
+    public: static bool hasDonateLink();
+    // Draws the Donate line: the text and a small button on one line by default.
+    // With a buttonSize width above 0, the text is centered above a button of that size.
+    public: static void showDonateButton(const ImVec2& buttonSize = ImVec2(0.0f, 0.0f));
     
     public: static void onThemeChange(DxvkDevice* device);
     public: static void onBackgroundAlphaChange(DxvkDevice* device);
@@ -287,7 +330,7 @@ namespace dxvk {
                     args.onChangeCallback = &onThemeChange, args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.gui", float, backgroundAlpha, 1.f, "A value controlling the alpha of the GUI background.",
                     args.onChangeCallback = &onBackgroundAlphaChange, args.minValue = 0.0f, args.maxValue = 1.0f, args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.gui", Theme, themeGui, Theme::Toolkit, "A setting controlling the active GUI theme.",
+    RTX_OPTION_ARGS("rtx.gui", Theme, themeGui, Theme::RemixPlus, "A setting controlling the active GUI theme.",
                     args.onChangeCallback = &onThemeChange, args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.gui", bool, largeUiMode, false, "Toggles between Large and Regular GUI Scale Modes.",
                     args.onChangeCallback = &onThemeChange, args.flags = RtxOptionFlags::UserSetting);

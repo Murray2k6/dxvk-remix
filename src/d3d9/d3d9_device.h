@@ -892,6 +892,30 @@ namespace dxvk {
       return m_multithread.AcquireLock();
     }
 
+    // The Remix API calls the device from the host's threads, so its calls and the device's own take the device lock
+    // even without D3DCREATE_MULTITHREADED.
+    void EnableRemixApiProtection() {
+      m_multithread.EnableProtection();
+    }
+
+    // True when a Present of swapchain ends the scene frame and shows the ray traced image. That is the implicit
+    // swapchain, or, while it has never presented, the first other swapchain that presents. Another output's Present
+    // only shows its own back buffer.
+    bool IsSceneOutput(const D3D9SwapChainEx* swapchain);
+
+    // True when swapchain is the scene output or can still become it, so its back buffer may hold the scene.
+    bool CanBeSceneOutput(const D3D9SwapChainEx* swapchain) const {
+      return swapchain == m_implicitSwapchain.ptr() ||
+        (!m_implicitSwapchainPresented && (m_fallbackSceneOutput == nullptr || m_fallbackSceneOutput == swapchain));
+    }
+
+    // Called by a swapchain's destructor, so the next swapchain to present can become the scene output.
+    void ForgetSceneOutput(const D3D9SwapChainEx* swapchain) {
+      if (m_fallbackSceneOutput == swapchain) {
+        m_fallbackSceneOutput = nullptr;
+      }
+    }
+
     const D3D9Options* GetOptions() const {
       return &m_d3d9Options;
     }
@@ -971,6 +995,21 @@ namespace dxvk {
           ConsiderFlush(GpuFlushType::ImplicitWeakHint);
 
         m_csChunk->push(command);
+      }
+    }
+
+    // Emits a command whose type the caller does not know. push moves it into the chunk and returns false when the
+    // chunk is full.
+    template<bool AllowFlush = true, typename Push>
+    void EmitCsWith(Push&& push) {
+      if (unlikely(!push(m_csChunk))) {
+        EmitCsChunk(std::move(m_csChunk));
+        m_csChunk = AllocCsChunk();
+
+        if constexpr (AllowFlush)
+          ConsiderFlush(GpuFlushType::ImplicitWeakHint);
+
+        push(m_csChunk);
       }
     }
 // NV-DXVK start: external API
@@ -1152,6 +1191,12 @@ namespace dxvk {
 
     bool UseProgrammablePS();
 
+    // D3D9 v2: bumped on every write of the vertex shader constants, and of any state the
+    // ray-traced material reads (render / texture stage / sampler states, textures, material, pixel shader, texture
+    // transforms). Equal values between two draws mean nothing in that group was written in between.
+    uint64_t GetRemixVsConstantsVersion() const { return m_remixVsConstantsVersion; }
+    uint64_t GetRemixMaterialStateVersion() const { return m_remixMaterialStateVersion; }
+
     void UpdateBoolSpecConstantVertex(uint32_t value);
 
     void UpdateBoolSpecConstantPixel(uint32_t value);
@@ -1212,6 +1257,10 @@ namespace dxvk {
 
     Com<D3D9Surface, false>         m_autoDepthStencil;
 
+    // IsSceneOutput. The fallback output is only compared, never dereferenced. Both are declared before
+    // m_implicitSwapchain, so they outlive it for its destructor's ForgetSceneOutput.
+    bool                            m_implicitSwapchainPresented = false;
+    const D3D9SwapChainEx*          m_fallbackSceneOutput = nullptr;
     Com<D3D9SwapChainEx, false>     m_implicitSwapchain;
 
     const D3D9Options               m_d3d9Options;
@@ -1280,6 +1329,9 @@ namespace dxvk {
 
     uint32_t                        m_robustSSBOAlignment     = 1;
     uint32_t                        m_robustUBOAlignment      = 1;
+
+    uint64_t                        m_remixVsConstantsVersion = 1;
+    uint64_t                        m_remixMaterialStateVersion = 1;
 
     uint32_t                        m_vsFloatConstsCount = 0;
     uint32_t                        m_vsIntConstsCount   = 0;

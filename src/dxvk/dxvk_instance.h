@@ -33,6 +33,9 @@
 
 namespace dxvk {
 
+  // The build ID set at configure time (meson build_tag), or an empty string.
+  const char* remixBuildTag();
+
   struct DxvkDebugUtilsContext;
   
   /**
@@ -46,6 +49,10 @@ namespace dxvk {
     
   public:
     
+    // NV-DXVK start: Share the Vulkan instance across unified frontends
+    static Rc<DxvkInstance> getSharedInstance();
+    // NV-DXVK end
+
     DxvkInstance();
     ~DxvkInstance();
     

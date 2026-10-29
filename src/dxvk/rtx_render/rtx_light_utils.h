@@ -21,21 +21,25 @@
 */
 #pragma once
 
-#include <d3d9types.h>
+#include "../util/util_matrix.h"
 #include "../util/util_vector.h"
 
 namespace dxvk {
+  namespace frontend {
+    struct FixedFunctionLight;
+  }
+
   struct LightUtils {
     // Function to calculate a radiance value from a light.
     // This function will determine the distance from `light` that the brightness would fall below kLegacyLightEndValue, based on the attenuation function.
-    // If the light would never attenuate to less than kLegacyLightEndValue, light.Range will be used instead.
+    // If the light would never attenuate to less than kLegacyLightEndValue, light.range will be used instead.
     // It will then determine how bright the replacement light needs to be to have a brightness of kNewLightEndValue at the same distance.
-    static float calculateIntensity(const D3DLIGHT9& light, const float radius);
+    static float calculateIntensity(const frontend::FixedFunctionLight& light, const float radius);
 
     // Variant of calculateIntensity but also combine that intensity with the original light's diffuse color to determine the radiance.
-    static Vector3 calculateRadiance(const D3DLIGHT9& light, const float radius);
+    static Vector3 calculateRadiance(const frontend::FixedFunctionLight& light, const float radius);
 
     // Best fit light transform for a given legacy light
-    static Matrix4 getLightTransform(const D3DLIGHT9& light);
+    static Matrix4 getLightTransform(const frontend::FixedFunctionLight& light);
   };
 } // namespace dxvk

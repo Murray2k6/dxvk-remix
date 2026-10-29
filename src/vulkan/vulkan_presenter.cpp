@@ -23,6 +23,9 @@
 #include "../dxvk/dxvk_scoped_annotation.h"
 
 #include "../dxvk/dxvk_format.h"
+// NV-DXVK start: present pacing diagnostics
+#include "../dxvk/dxvk_perf_counters.h"
+// NV-DXVK end
 #include "../util/util_monitor.h"
 #include "../util/util_sentry.h"
 #include "../util/util_string.h"
@@ -98,15 +101,13 @@ namespace dxvk::vk {
                                        ) {
     ScopedCpuProfileZone();
 
-    sync = m_semaphores.at(m_frameIndex);
-
     // NV-DXVK start: DLFG integration
     if (isDlfgPresenting) {
       // DLFG manages swapchain images directly and can have more than one acquire outstanding at a time
       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
                                                      m_swapchain,
                                                      std::numeric_limits<uint64_t>::max(),
-                                                     sync.acquire,
+                                                     nextAcquireSemaphore(),
                                                      VK_NULL_HANDLE,
                                                      &index);
       assert(m_acquireStatus != VK_NOT_READY);
@@ -115,7 +116,7 @@ namespace dxvk::vk {
       if (m_acquireStatus == VK_NOT_READY) {
         m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
           m_swapchain, std::numeric_limits<uint64_t>::max(),
-          sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+          nextAcquireSemaphore(), VK_NULL_HANDLE, &m_imageIndex);
       }
     }
 
@@ -129,7 +130,22 @@ namespace dxvk::vk {
       index = m_imageIndex;
     }
 
+    sync = getSync(index);
     return m_acquireStatus;
+  }
+
+
+  VkSemaphore Presenter::nextAcquireSemaphore() {
+    m_acquireIndex = (m_acquireIndex + 1) % m_acquireSemaphores.size();
+    return m_acquireSemaphores[m_acquireIndex];
+  }
+
+
+  PresenterSync Presenter::getSync(uint32_t imageIndex) const {
+    PresenterSync sync;
+    sync.acquire = m_acquireSemaphores.at(m_acquireIndex);
+    sync.present = m_presentSemaphores.at(imageIndex);
+    return sync;
   }
 
   VkResult Presenter::presentImage(
@@ -143,17 +159,13 @@ namespace dxvk::vk {
     // NV-DXVK end
   ) {
     ScopedCpuProfileZone();
-    // NV-DXVK start: DLFG integration
-    PresenterSync sync;
-    
-    sync = m_semaphores.at(m_frameIndex);
-    // NV-DXVK end
+    const VkSemaphore presentSemaphore = m_presentSemaphores.at(isDlfgPresenting ? imageIndex : m_imageIndex);
 
     VkPresentInfoKHR info;
     info.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     info.pNext              = presentMetering;
     info.waitSemaphoreCount = 1;
-    info.pWaitSemaphores    = &sync.present;
+    info.pWaitSemaphores    = &presentSemaphore;
     info.swapchainCount     = 1;
     info.pSwapchains        = &m_swapchain;
     // NV-DXVK start: DLFG integration
@@ -165,7 +177,32 @@ namespace dxvk::vk {
     // NV-DXVK end
     info.pResults           = nullptr;
 
+    // A present id is attached only while rtx.present.presentWaitPacing is on.
+    // Ids are strictly increasing per swapchain, as the spec requires.
+    VkPresentIdKHR presentIdInfo = { VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
+    uint64_t presentId = 0;
+    if (!isDlfgPresenting && presentWaitSupported()
+     && perf::g_presentWaitPacing.load(std::memory_order_relaxed) != 0) {
+      presentId = ++m_nextPresentId;
+      presentIdInfo.pNext = info.pNext;
+      presentIdInfo.swapchainCount = 1;
+      presentIdInfo.pPresentIds = &presentId;
+      info.pNext = &presentIdInfo;
+    }
+    m_lastAttachedPresentId = presentId;
+
+    // NV-DXVK start: present pacing diagnostics
+    const uint64_t presentStartNs = perf::nowNs();
     VkResult status = m_vkd->vkQueuePresentKHR(m_device.queue, &info);
+    const uint64_t presentEndNs = perf::nowNs();
+    m_lastQueuePresentNs = presentEndNs - presentStartNs;
+    m_lastPostPresentAcquireNs = 0;
+    // NV-DXVK end
+
+    // A failed present's id is never waited on.
+    if (presentId != 0 && (status == VK_SUCCESS || status == VK_SUBOPTIMAL_KHR)) {
+      m_lastPresentId.store(presentId, std::memory_order_release);
+    }
 
     if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR)
       return status;
@@ -180,14 +217,12 @@ namespace dxvk::vk {
     // NV-DXVK end
       // Try to acquire next image already, in order to hide
       // potential delays from the application thread.
-      m_frameIndex += 1;
-      m_frameIndex %= m_semaphores.size();
-
-      sync = m_semaphores.at(m_frameIndex);
-
       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
         m_swapchain, std::numeric_limits<uint64_t>::max(),
-        sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+        nextAcquireSemaphore(), VK_NULL_HANDLE, &m_imageIndex);
+      // NV-DXVK start: present pacing diagnostics
+      m_lastPostPresentAcquireNs = perf::nowNs() - presentEndNs;
+      // NV-DXVK end
     }
 
     bool vsync = m_info.presentMode == VK_PRESENT_MODE_FIFO_KHR
@@ -198,7 +233,27 @@ namespace dxvk::vk {
   }
 
   
+  VkResult Presenter::waitForPresent(uint64_t presentId, uint64_t timeoutNs) {
+    if (presentId == 0 || !presentWaitSupported()) {
+      return VK_NOT_READY;
+    }
+    std::lock_guard<dxvk::mutex> lock(m_presentWaitMutex);
+    // After a recreate the ids restart; an id from the old swapchain is no longer waitable.
+    if (!m_swapchain || presentId > m_lastPresentId.load(std::memory_order_acquire)) {
+      return VK_NOT_READY;
+    }
+    return m_vkd->vkWaitForPresentKHR(m_vkd->device(), m_swapchain, presentId, timeoutNs);
+  }
+
+
   VkResult Presenter::recreateSwapChain(const PresenterDesc& desc) {
+    // No wait may use the swapchain while it is replaced; the new one starts at id 1.
+    std::lock_guard<dxvk::mutex> presentWaitLock(m_presentWaitMutex);
+    m_nextPresentId = 0;
+    m_lastAttachedPresentId = 0;
+    m_lastPresentId.store(0, std::memory_order_release);
+    m_swapchainGeneration.fetch_add(1, std::memory_order_acq_rel);
+
     if (m_swapchain)
       destroySwapchain();
 
@@ -217,20 +272,28 @@ namespace dxvk::vk {
         // Recreate the surface and try again.
         if (m_surface)
           destroySurface();
-        if ((status = createSurface()) != VK_SUCCESS)
+        if ((status = createSurface()) != VK_SUCCESS) {
+          Logger::err(str::format("Presenter: the surface was lost and creating a new one failed, error code: ", status));
           return status;
+        }
         status = m_vki->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
             m_device.adapter, m_surface, &caps);
       }
-      if (status != VK_SUCCESS)
+      if (status != VK_SUCCESS) {
+        Logger::err(str::format("Presenter: vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed, error code: ", status));
         return status;
+      }
     }
 
-    if ((status = getSupportedFormats(formats, desc)) != VK_SUCCESS)
+    if ((status = getSupportedFormats(formats, desc)) != VK_SUCCESS) {
+      Logger::err(str::format("Presenter: querying the surface formats failed, error code: ", status));
       return status;
+    }
 
-    if ((status = getSupportedPresentModes(modes, desc)) != VK_SUCCESS)
+    if ((status = getSupportedPresentModes(modes, desc)) != VK_SUCCESS) {
+      Logger::err(str::format("Presenter: querying the present modes failed, error code: ", status));
       return status;
+    }
 
     // Select actual swap chain properties and create swap chain
     m_info.format       = pickFormat(formats.size(), formats.data(), desc.numFormats, desc.formats);
@@ -361,45 +424,74 @@ namespace dxvk::vk {
         return status;
     }
 
-    // Create one set of semaphores per swap image
-    m_semaphores.resize(m_info.imageCount);
+    if ((status = createSemaphores()) != VK_SUCCESS)
+      return status;
 
-    for (uint32_t i = 0; i < m_semaphores.size(); i++) {
-      VkSemaphoreCreateInfo semInfo;
-      semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-      semInfo.pNext = nullptr;
-      semInfo.flags = 0;
+    // Invalidate indices
+    m_imageIndex = 0;
+    m_acquireStatus = VK_NOT_READY;
+    return VK_SUCCESS;
+  }
 
-      if ((status = m_vkd->vkCreateSemaphore(m_vkd->device(),
-          &semInfo, nullptr, &m_semaphores[i].acquire)) != VK_SUCCESS)
-        return status;
 
-      if ((status = m_vkd->vkCreateSemaphore(m_vkd->device(),
-          &semInfo, nullptr, &m_semaphores[i].present)) != VK_SUCCESS)
-        return status;
+  VkResult Presenter::createSemaphores() {
+    // The submission that renders to an acquired image waits on its acquire semaphore. The swap chain keeps at most
+    // four frames in flight, and a frame acquires up to four images (sync intervals or DLFG frames),
+    // so the pool outlasts every pending wait.
+    constexpr uint32_t kMaxFrameLatency = 4;
+    constexpr uint32_t kMaxAcquiresPerFrame = 4;
+    const uint32_t acquireSemaphoreCount = m_info.imageCount + kMaxFrameLatency * kMaxAcquiresPerFrame;
 
-      // NV-DXVK start: add debug names to VkImage objects
-      if (m_vkd->vkSetDebugUtilsObjectNameEXT) {
+    m_acquireSemaphores.resize(acquireSemaphoreCount, VK_NULL_HANDLE);
+    m_presentSemaphores.resize(m_info.imageCount, VK_NULL_HANDLE);
+
+    VkSemaphoreCreateInfo semInfo;
+    semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    semInfo.pNext = nullptr;
+    semInfo.flags = 0;
+
+    auto createSemaphore = [&](VkSemaphore& semaphore, const char* name) {
+      VkResult status = m_vkd->vkCreateSemaphore(m_vkd->device(), &semInfo, nullptr, &semaphore);
+
+      if (status == VK_SUCCESS && m_vkd->vkSetDebugUtilsObjectNameEXT) {
         VkDebugUtilsObjectNameInfoEXT nameInfo;
         nameInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
         nameInfo.pNext = nullptr;
         nameInfo.objectType = VK_OBJECT_TYPE_SEMAPHORE;
-        nameInfo.objectHandle = (uint64_t) m_semaphores[i].acquire;
-        nameInfo.pObjectName = "Presenter: acquire semaphore";
-        m_vkd->vkSetDebugUtilsObjectNameEXT(m_vkd->device(), &nameInfo);
-        
-        nameInfo.objectHandle = (uint64_t) m_semaphores[i].present;
-        nameInfo.pObjectName = "Presenter: present semaphore";
+        nameInfo.objectHandle = (uint64_t) semaphore;
+        nameInfo.pObjectName = name;
         m_vkd->vkSetDebugUtilsObjectNameEXT(m_vkd->device(), &nameInfo);
       }
-      // NV-DXVK end
+
+      return status;
+    };
+
+    for (VkSemaphore& semaphore : m_acquireSemaphores) {
+      VkResult status = createSemaphore(semaphore, "Presenter: acquire semaphore");
+      if (status != VK_SUCCESS)
+        return status;
     }
-    
-    // Invalidate indices
-    m_imageIndex = 0;
-    m_frameIndex = 0;
-    m_acquireStatus = VK_NOT_READY;
+
+    for (VkSemaphore& semaphore : m_presentSemaphores) {
+      VkResult status = createSemaphore(semaphore, "Presenter: present semaphore");
+      if (status != VK_SUCCESS)
+        return status;
+    }
+
+    m_acquireIndex = 0;
     return VK_SUCCESS;
+  }
+
+
+  void Presenter::destroySemaphores() {
+    for (VkSemaphore semaphore : m_acquireSemaphores)
+      m_vkd->vkDestroySemaphore(m_vkd->device(), semaphore, nullptr);
+
+    for (VkSemaphore semaphore : m_presentSemaphores)
+      m_vkd->vkDestroySemaphore(m_vkd->device(), semaphore, nullptr);
+
+    m_acquireSemaphores.clear();
+    m_presentSemaphores.clear();
   }
 
 
@@ -660,15 +752,11 @@ namespace dxvk::vk {
     for (const auto& img : m_images)
       m_vkd->vkDestroyImageView(m_vkd->device(), img.view, nullptr);
     
-    for (const auto& sem : m_semaphores) {
-      m_vkd->vkDestroySemaphore(m_vkd->device(), sem.acquire, nullptr);
-      m_vkd->vkDestroySemaphore(m_vkd->device(), sem.present, nullptr);
-    }
+    destroySemaphores();
 
     m_vkd->vkDestroySwapchainKHR(m_vkd->device(), m_swapchain, nullptr);
 
     m_images.clear();
-    m_semaphores.clear();
 
     m_swapchain = VK_NULL_HANDLE;
   }

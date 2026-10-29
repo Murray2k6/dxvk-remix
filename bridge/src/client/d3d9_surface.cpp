@@ -135,6 +135,7 @@ HRESULT Direct3DSurface9_LSS::LockRect(D3DLOCKED_RECT* pLockedRect, CONST RECT* 
 
   // We send LockRect() calls to server in cases wherein backbuffer is used to capture the screenshot
   if (m_isBackBuffer && ClientOptions::getEnableBackbufferCapture() && !(Flags & D3DLOCK_DISCARD)) {
+    DeviceBridge::ResponseTransaction responseTransaction;
     UID currentUID;
     {
       ClientMessage c(Commands::IDirect3DSurface9_LockRect, getId());
@@ -263,6 +264,10 @@ void* Direct3DSurface9_LSS::getBufPtr(const int pitch, const RECT& rect) {
 
 void Direct3DSurface9_LSS::sendDataToServer(const LockInfo& lockInfo) const {
   const auto dataFlag = m_bUseSharedHeap ? Commands::FlagBits::DataInSharedHeap : 0;
+  if (bridge_util::perf::enabled()) {
+    const auto [width, height] = getRectDimensions(lockInfo.rect);
+    bridge_util::perf::noteUpload(bridge_util::calcTotalSizeOfRect(width, height, m_desc.Format));
+  }
   {
     ClientMessage c(Commands::IDirect3DSurface9_UnlockRect, getId(), dataFlag);
     c.send_data(sizeof(RECT), &lockInfo.rect);
@@ -273,15 +278,24 @@ void Direct3DSurface9_LSS::sendDataToServer(const LockInfo& lockInfo) const {
       c.send_data(lockInfo.bufId);
     } else {
       const auto [width, height] = getRectDimensions(lockInfo.rect);
-      const size_t totalSize = bridge_util::calcTotalSizeOfRect(width, height, m_desc.Format);
+      const uint32_t numRows = bridge_util::calcStride((uint32_t) height, m_desc.Format);
       const size_t rowSize = bridge_util::calcRowSize(width, m_desc.Format);
       c.send_data(rowSize);
-      if (auto* blobPacketPtr = c.begin_data_blob(totalSize)) {
-        FOR_EACH_RECT_ROW(lockInfo.lockedRect, height, m_desc.Format, {
-          memcpy(blobPacketPtr, ptr, rowSize);
-          blobPacketPtr += rowSize;
-        });
+      // The server reads blobs until it has all rows, and writes them into the surface under one lock.
+      // Blobs of at most one item let the command stream through the data queue (util_bridgecommand.h).
+      const uint32_t rowsPerBlob = (uint32_t) std::max<size_t>(1, DeviceBridge::maxItemBytes() / rowSize);
+      for (uint32_t row = 0; row < numRows;) {
+        const uint32_t blobRows = std::min(rowsPerBlob, numRows - row);
+        uint8_t* blobPacketPtr = c.begin_data_blob(size_t(blobRows) * rowSize);
+        if (blobPacketPtr == nullptr) {
+          break;
+        }
+        for (uint32_t r = 0; r < blobRows; ++r) {
+          memcpy(blobPacketPtr + size_t(r) * rowSize,
+                 (const uint8_t*) lockInfo.lockedRect.pBits + size_t(row + r) * lockInfo.lockedRect.Pitch, rowSize);
+        }
         c.end_data_blob();
+        row += blobRows;
       }
     }
   }

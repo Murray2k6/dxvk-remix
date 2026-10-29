@@ -30,6 +30,7 @@
 #include "rtx/concept/surface_material/surface_material.slangh"
 #include "rtx/algorithm/integrator_direct.slangh"
 #include "rtx/pass/sparse_rendering/sparse_rendering.slangh"
+#include "rtx/pass/sparse_rendering/compact_active_pixels.slangh"
 
 #ifndef SHADOW_TERMINATOR_FIX_ALLOWED
     #error "macro SHADOW_TERMINATOR_FIX_ALLOWED must be defined and set 1 for all direct lighting passes"
@@ -76,26 +77,61 @@ void deserializeInteractions(
   }
 }
 
-void integrate_direct_pass(uvec2 threadIndex)
+#if ENABLE_NRC
+// Resolves the training cell this pixel won, when the GBuffer left the training-path setup to
+// this pass. Returns false when there is nothing to register for this thread.
+bool calculateDeferredNrcTrainingPath(uvec2 pixelCoordinate, out uvec2 trainingPixelCoordinateInTrainingSpace)
 {
-  if (any(threadIndex >= cb.camera.resolution))
+  trainingPixelCoordinateInTrainingSpace = uvec2(0);
+
+  if (!cb.allowNrcTraining || !shouldDeferNrcTrainingSetup(cb.sparseRenderingArgs))
   {
-    return;
+    return false;
   }
 
-  uvec2 pixelCoordinate = threadIndex;
+  // Resampling is on, guaranteed by the deferral check above.
+  const bool hasTrainingPath = Nrc::calculateNrcTrainingPathForQueryPixel(
+    pixelCoordinate, true,
+    NrcTrainingQueryReservoir, cb.nrcArgs, trainingPixelCoordinateInTrainingSpace);
 
-  // Pixels inactive in direct sparse rendering may still need their indirect ray path
-  // sample prepared here (the indirect pass relies on data produced by
-  // sampleAndStoreIndirectRayPathSample). For those, run only the indirect-prep path
-  // and early-exit before performing direct lighting work.
-  const bool isDirectActive = loadPixelCoordinate(
-    threadIndex, DirectActiveLocalPixelCoords,
-    cb.camera.resolution, cb.sparseRenderingArgs, pixelCoordinate);
+  return hasTrainingPath;
+}
 
-  const bool isIndirectActive = isActivePixelFromMask(cb.sparseRenderingArgs, SparseRenderingIndirectActivePixelMask, pixelCoordinate);
+// Registers vertex 0 from the surface this pass has already deserialized for its own work, so the deferral
+// costs no extra loads beyond the hit distance the GBuffer would have had in register.
+void registerDeferredNrcTrainingPath(
+  uvec2 trainingPixelCoordinateInTrainingSpace,
+  uvec2 pixelCoordinate,
+  GeometryFlags geometryFlags,
+  MinimalRayInteraction minimalRayInteraction,
+  MinimalSurfaceInteraction minimalSurfaceInteraction,
+  PolymorphicSurfaceMaterialInteraction polymorphicSurfaceMaterialInteraction)
+{
+  const float primaryPathHitDistance = calculateSelectedIntegrationSurfaceHitDistance(
+    ivec2(pixelCoordinate), geometryFlags, PrimaryHitDistance, SecondaryHitDistance);
 
-  if (!isDirectActive && !isIndirectActive)
+  Nrc::registerNrcTrainingPathPrimaryHit(
+    trainingPixelCoordinateInTrainingSpace,
+    minimalSurfaceInteraction.position, polymorphicSurfaceMaterialInteraction, minimalRayInteraction.viewDirection,
+    primaryPathHitDistance, NrcQueryPathData0, NrcTrainingPathData1);
+}
+#endif
+
+// The compute kernels can be launched over the active-pixel list, which counts groups of the consumer group size.
+#if !defined(RAY_PIPELINE) && (INTEGRATE_DIRECT_THREADS_DISPATCH_WIDTH != COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE_X || \
+                               INTEGRATE_DIRECT_THREADS_DISPATCH_HEIGHT != COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE_Y)
+#error "Integrate Direct's group size must match COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE_X / _Y."
+#endif
+
+void integrate_direct_pass(uvec2 threadIndex)
+{
+  uvec2 pixelCoordinate;
+
+  const bool isPixelActive = loadLaunchPixelCoordinate(
+    threadIndex, ActiveLocalPixelCoords, ActivePixelList,
+    cb.camera.resolution, cb.sparseRenderingArgs, COMPACT_ACTIVE_PIXELS_LAUNCH_INTEGRATE_DIRECT, pixelCoordinate);
+
+  if (!isPixelActive)
   {
     return;
   }
@@ -108,34 +144,49 @@ void integrate_direct_pass(uvec2 threadIndex)
 
   const bool primaryGBufferMiss = isGBufferMiss(pixelCoordinate, PrimaryConeRadius);
   const bool secondaryGBufferMiss = isGBufferMiss(pixelCoordinate, SecondaryConeRadius);
+  const bool missOfSelectedIntegrationSurface =
+    isSelectedIntegrationSurfaceGBufferMiss(geometryFlags, primaryGBufferMiss, secondaryGBufferMiss);
 
   // Write out empty data
   // Note: This should hopefully prevent any weird undefined data from bleeding into pixels actually being denoised, but
   // may not be needed depending on how the denoiser works.
 
-  if (isDirectActive)
+  // Composite sums both surfaces but only the selected one is written below, and not at all if it missed.
+  if (primaryGBufferMiss || !geometryFlags.primarySelectedIntegrationSurface)
   {
-    if (primaryGBufferMiss)
-    {
-      PrimaryDirectDiffuseLobeRadianceHitDistance[pixelCoordinate] = vec4(0);
-      PrimaryDirectSpecularLobeRadianceHitDistance[pixelCoordinate] = vec4(0);
-    }
-
-    if (secondaryGBufferMiss)
-    {
-      SecondaryCombinedDiffuseLobeRadianceHitDistance[pixelCoordinate] = vec4(0);
-      SecondaryCombinedSpecularLobeRadianceHitDistance[pixelCoordinate] = vec4(0);
-    }
+    PrimaryDirectDiffuseLobeRadianceHitDistance[pixelCoordinate] = vec4(0);
+    PrimaryDirectSpecularLobeRadianceHitDistance[pixelCoordinate] = vec4(0);
   }
 
-  // Note: Early out if no more work on the primary surface is needed
-  if (primaryGBufferMiss && geometryFlags.primarySelectedIntegrationSurface)
+  if (secondaryGBufferMiss || geometryFlags.primarySelectedIntegrationSurface)
   {
-    return;
+    SecondaryCombinedDiffuseLobeRadianceHitDistance[pixelCoordinate] = vec4(0);
+    SecondaryCombinedSpecularLobeRadianceHitDistance[pixelCoordinate] = vec4(0);
   }
 
-  // Note: Early out if no more work on the secondary surface is needed
-  if (secondaryGBufferMiss && !geometryFlags.primarySelectedIntegrationSurface)
+#if ENABLE_NRC
+  uvec2 nrcTrainingPixelCoordinate;
+  bool hasDeferredNrcTrainingPath = calculateDeferredNrcTrainingPath(pixelCoordinate, nrcTrainingPixelCoordinate);
+
+  // A resampled pixel whose selected surface missed still has to be registered, and this pass early-outs on that
+  // miss below.
+  if (hasDeferredNrcTrainingPath && missOfSelectedIntegrationSurface)
+  {
+    Nrc::registerNrcTrainingPathPrimaryMiss(nrcTrainingPixelCoordinate);
+
+    hasDeferredNrcTrainingPath = false;
+  }
+
+  // Written after the revocation above, so the view shows the paths that actually got registered. Only on the
+  // deferred path - otherwise the GBuffer knows the cell winner and writes this view itself.
+  if (cb.debugView == DEBUG_VIEW_NRC_UPDATE_PIXEL && shouldDeferNrcTrainingSetup(cb.sparseRenderingArgs))
+  {
+    storeInDebugView(pixelCoordinate, hasDeferredNrcTrainingPath);
+  }
+#endif
+
+  // Note: Early out if no more work on the selected integration surface is needed
+  if (missOfSelectedIntegrationSurface)
   {
     return;
   }
@@ -168,6 +219,31 @@ void integrate_direct_pass(uvec2 threadIndex)
   deserializeInteractions(
     pixelCoordinate, geometryFlags,
     minimalRayInteraction, minimalSurfaceInteraction, polymorphicSurfaceMaterialInteraction);
+
+#if INTEGRATE_DIRECT_SPLIT == 1
+  // The secondary surface's G-buffer origin is aliased with the indirect ray outputs sampleAndStoreIndirectRayPathSample
+  // writes below, so the trace kernel takes it from the record. The position error goes into the radiance plane later.
+  uint directSplitHeader = 0u;
+  float directSplitOriginPositionError = 0.0f;
+  if (!geometryFlags.primarySelectedIntegrationSurface)
+  {
+    DirectSplitRecords[directSplitAddress(pixelCoordinate, INTEGRATE_DIRECT_SPLIT_PLANE_ORIGIN)] =
+      asuint(aliasedData0.SecondaryWorldPositionWorldTriangleNormal[pixelCoordinate]);
+    directSplitOriginPositionError = aliasedData2.SecondaryPositionError[pixelCoordinate];
+    directSplitHeader = INTEGRATE_DIRECT_SPLIT_FLAG_ORIGIN;
+  }
+#endif
+
+#if ENABLE_NRC
+  // Note: must precede the base reflectivity rewrite below, which replaces the value NRC wants with a
+  // denoiser-oriented one.
+  if (hasDeferredNrcTrainingPath)
+  {
+    registerDeferredNrcTrainingPath(
+      nrcTrainingPixelCoordinate, pixelCoordinate, geometryFlags,
+      minimalRayInteraction, minimalSurfaceInteraction, polymorphicSurfaceMaterialInteraction);
+  }
+#endif
 
   // Rewrite Material Data for Denoising
   // Note: This is done to turn the usual material data base reflectivity into something more suitable for
@@ -203,21 +279,10 @@ void integrate_direct_pass(uvec2 threadIndex)
   // Sample an indirect ray path sample in direct integration pass since the material for the primary surface has been loaded.
   // This is faster than reloading all the material data in the indirect pass and computing a ray path sample there
   // Note: this updates geometryFlags
-  // Note: this needs to be done when indirect is active or when we're integrating a secondary surface at full rate
-  if (isIndirectActive || !geometryFlags.primarySelectedIntegrationSurface)
-  {
-    sampleAndStoreIndirectRayPathSample(
-      pixelCoordinate, primaryRay, integrationSurfacePdf,
-      minimalRayInteraction, minimalSurfaceInteraction, polymorphicSurfaceMaterialInteraction,
-      geometryFlags);
-  }
-
-  // Direct-inactive pixels only need the indirect ray path sample prepared above; skip
-  // the rest of the direct lighting work.
-  if (!isDirectActive)
-  {
-    return;
-  }
+  sampleAndStoreIndirectRayPathSample(
+    pixelCoordinate, primaryRay, integrationSurfacePdf,
+    minimalRayInteraction, minimalSurfaceInteraction, polymorphicSurfaceMaterialInteraction,
+    geometryFlags);
 
   // Integrate the Direct portion of the Path
 
@@ -225,13 +290,95 @@ void integrate_direct_pass(uvec2 threadIndex)
     if (cb.shadowTerminatorArgs.enableOffset)
     {
       // NOTE: can't be inside 'deserializeInteractions', as 'sampleAndStoreIndirectRayPathSample' stores data for other passes
-      minimalSurfaceInteraction.shadowTerminatorOffset = SharedTerminatorFix[threadIndex];
+      minimalSurfaceInteraction.shadowTerminatorOffset = SharedTerminatorFix[pixelCoordinate];
     }
 #endif
 
+#if INTEGRATE_DIRECT_SPLIT == 1
+  // The shade half of the split Lean levels. The trace kernel does the rest.
+  integrateDirectShadePath(
+    rng, pixelCoordinate,
+    geometryFlags, integrationSurfacePdf,
+    primaryRay, minimalRayInteraction, minimalSurfaceInteraction,
+    polymorphicSurfaceMaterialInteraction,
+    directSplitHeader, directSplitOriginPositionError);
+#else
   integrateDirectPath(
     rng, pixelCoordinate,
     geometryFlags, integrationSurfacePdf,
     primaryRay, minimalRayInteraction, minimalSurfaceInteraction,
     polymorphicSurfaceMaterialInteraction);
+#endif
 }
+
+#if INTEGRATE_DIRECT_SPLIT == 2
+// The trace half of the split Lean levels, with the same thread -> pixel mapping as the shade kernel.
+// The interactions are read back as deserializeInteractions and integrate_direct_pass build them, minus the material.
+// The secondary surface's origin comes from the record.
+void integrate_direct_trace_pass(uvec2 threadIndex)
+{
+  uvec2 pixelCoordinate;
+
+  const bool isPixelActive = loadLaunchPixelCoordinate(
+    threadIndex, ActiveLocalPixelCoords, ActivePixelList,
+    cb.camera.resolution, cb.sparseRenderingArgs, COMPACT_ACTIVE_PIXELS_LAUNCH_INTEGRATE_DIRECT, pixelCoordinate);
+
+  if (!isPixelActive)
+  {
+    return;
+  }
+
+  // Read after the shade kernel, so it carries the flags sampleAndStoreIndirectRayPathSample updated.
+  const GeometryFlags geometryFlags = geometryFlagsReadFromGBuffer(pixelCoordinate, SharedFlags);
+
+  // The shade kernel wrote no record for a pixel whose selected surface missed, and the pass writes nothing for it.
+  if (isSelectedIntegrationSurfaceGBufferMiss(ivec2(pixelCoordinate), geometryFlags, PrimaryConeRadius, SecondaryConeRadius))
+  {
+    return;
+  }
+
+  const uint4 lightRecord = DirectSplitRecords[directSplitAddress(pixelCoordinate, INTEGRATE_DIRECT_SPLIT_PLANE_LIGHT)];
+
+  GBufferMemoryMinimalRay gBufferMemoryMinimalRay;
+  gBufferMemoryMinimalRay.spreadAngle = float16_t(cb.screenSpacePixelSpreadHalfAngle);
+  const MinimalRay minimalRay = minimalRayCreate(gBufferMemoryMinimalRay);
+
+  Ray primaryRay;
+  primaryRay.spreadAngle = minimalRay.spreadAngle;
+
+  const Ray cameraRay = rayCreatePrimaryFromPixel(cb.camera, ivec2(pixelCoordinate));
+
+  MinimalRayInteraction minimalRayInteraction;
+  MinimalSurfaceInteraction minimalSurfaceInteraction;
+  if (geometryFlags.primarySelectedIntegrationSurface)
+  {
+    minimalRayInteraction = minimalRayInteractionReadFromGBuffer(
+      cameraRay, ivec2(pixelCoordinate), PrimaryViewDirection, PrimaryConeRadius);
+
+    minimalSurfaceInteraction = minimalSurfaceInteractionReadFromGBufferWithError(
+      ivec2(pixelCoordinate), PrimaryWorldPositionWorldTriangleNormal, PrimaryPositionError);
+  }
+  else
+  {
+    minimalRayInteraction = minimalRayInteractionReadFromGBuffer(
+      cameraRay, ivec2(pixelCoordinate), SecondaryViewDirection, SecondaryConeRadius);
+
+    GBufferMemoryMinimalSurfaceInteraction memory;
+    memory.encodedWorldPositionWorldTriangleTBN =
+      asfloat(DirectSplitRecords[directSplitAddress(pixelCoordinate, INTEGRATE_DIRECT_SPLIT_PLANE_ORIGIN)]);
+    memory.positionError = asfloat(DirectSplitRecords[directSplitAddress(pixelCoordinate, INTEGRATE_DIRECT_SPLIT_PLANE_RADIANCE)].w);
+    minimalSurfaceInteraction = minimalSurfaceInteractionCreate(memory);
+  }
+
+#ifdef SHADOW_TERMINATOR_FIX_ALLOWED
+  if (cb.shadowTerminatorArgs.enableOffset)
+  {
+    minimalSurfaceInteraction.shadowTerminatorOffset = SharedTerminatorFix[pixelCoordinate];
+  }
+#endif
+
+  integrateDirectTracePath(
+    pixelCoordinate, lightRecord, geometryFlags,
+    primaryRay, minimalRayInteraction, minimalSurfaceInteraction);
+}
+#endif

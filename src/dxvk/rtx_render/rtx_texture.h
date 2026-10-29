@@ -21,6 +21,8 @@
 */
 #pragma once
 
+#include <array>
+
 #include "rtx_utils.h"
 #include "rtx_asset_data.h"
 #include "rtx_constants.h"
@@ -55,6 +57,16 @@ namespace dxvk {
       kFailed           // Texture image to upload or read, or was dropped.
     };
 
+    // Used only by the texture manager's garbage-collection thread.
+    struct MipSizeCache {
+      VkFormat format = VK_FORMAT_UNDEFINED;
+      VkExtent3D extent {};
+      uint32_t layers = 0;
+      uint32_t mipLevels = 0;
+      uint32_t firstMip = 0;
+      std::array<size_t, MAX_MIPS + 1> suffixSizes {};
+    } m_mipSizeCache;
+
     // Stage 1 - Texture initialized, image asset data discovered.
     Rc<AssetData>       m_assetData     = {};
     ColorSpace          m_colorSpace    = { ColorSpace::AUTO };
@@ -76,10 +88,9 @@ namespace dxvk {
     uint64_t            m_completionSyncpt   = 0; // completion syncpoint value for RTX IO
 
     // Texture streaming
-    uint16_t            m_samplerFeedbackStamp = 0; // unique linear index of this asset; required to keep 
+    uint16_t            m_samplerFeedbackStamp = 0; // unique linear index of this asset; required to keep
                                                     // the data structure access simple (i.e. with a linear index, it's just an offset in array)
-    mutable uint32_t    m_frameLastUsed                   = UINT32_MAX;
-    mutable uint32_t    m_frameLastUsedForSamplerFeedback = UINT32_MAX;
+    int32_t             m_refCount = 0;  // number of live RtInstances whose bound surface material references this texture; negative values indicate a retain/release bug
 
   public:
     bool hasUploadedMips(uint32_t requiredMips, bool exact) const;
@@ -95,6 +106,16 @@ namespace dxvk {
   }
 
 
+  // NV-DXVK start: how a texture imported from a host stores its data, when that
+  // differs from Remix's own conventions. Values match REMIXAPI_TEXTURE_ENCODING_*.
+  enum class HostTextureEncoding : uint8_t {
+    None = 0,
+    NormalTangentXY = 1,        // unsigned tangent-space X/Y, Z rebuilt
+    SmoothnessInRed = 2,        // roughness = 1 - red
+    SmoothnessInGreen = 3,      // roughness = 1 - green
+  };
+  // NV-DXVK end
+
   struct TextureRef {
     friend struct TextureUtils;
 
@@ -102,10 +123,14 @@ namespace dxvk {
 
     // True vidmem texture-ref
     //  uniqueKey can be used to link this TextureRef to another TextureRef (e.g. HOST promoted TextureRef's)
-    explicit TextureRef(Rc<DxvkImageView> image, size_t uniqueKey = kInvalidTextureKey)
+    explicit TextureRef(Rc<DxvkImageView> image, size_t uniqueKey = kInvalidTextureKey,
+                        XXH64_hash_t importedHash = 0,
+                        HostTextureEncoding hostEncoding = HostTextureEncoding::None)
       : m_imageView{ std::move(image) }
       , m_managedTexture{ nullptr }
-      , m_uniqueKey{ handleOrUniqueKey(uniqueKey, m_imageView->handle()) } { }
+      , m_uniqueKey{ handleOrUniqueKey(uniqueKey, m_imageView->handle()) }
+      , m_importedHash{ importedHash }
+      , m_hostEncoding{ hostEncoding } { }
 
     // Promised reference to a future texture
     explicit TextureRef(const Rc<ManagedTexture>& managedTexture)
@@ -128,6 +153,10 @@ namespace dxvk {
     }
 
     XXH64_hash_t getImageHash() const {
+      // Imported aliases must not overwrite the game image's identity.
+      if (m_importedHash != 0) {
+        return m_importedHash;
+      }
       XXH64_hash_t result = 0;
       if (const DxvkImageView* resolvedImageView = getImageView()) {
         result = resolvedImageView->image()->getHash();
@@ -149,6 +178,19 @@ namespace dxvk {
       assert(m_uniqueKey != kInvalidTextureKey);
       return m_uniqueKey;
     }
+
+    HostTextureEncoding getHostEncoding() const {
+      return m_hostEncoding;
+    }
+
+    // NV-DXVK start: an empty ref carrying only a unique key, for looking a
+    // texture up in a cache keyed on it.
+    static TextureRef keyProbe(size_t uniqueKey) {
+      TextureRef probe;
+      probe.m_uniqueKey = uniqueKey;
+      return probe;
+    }
+    // NV-DXVK end
 
     const Rc<ManagedTexture>& getManagedTexture() const {
       return m_managedTexture;
@@ -181,6 +223,8 @@ namespace dxvk {
     Rc<ManagedTexture> m_managedTexture;
 
     size_t m_uniqueKey = kInvalidTextureKey;
+    XXH64_hash_t m_importedHash = 0;
+    HostTextureEncoding m_hostEncoding = HostTextureEncoding::None;
   };
 
   struct TextureUtils {

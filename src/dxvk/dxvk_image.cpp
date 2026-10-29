@@ -189,7 +189,26 @@ namespace dxvk {
   }
   
   
+  DxvkAppImageStats& DxvkAppImageStats::get() {
+    static DxvkAppImageStats stats;
+    return stats;
+  }
+
+
+  void DxvkImage::markHeldAfterAppRelease() {
+    if (!m_heldAfterAppRelease.exchange(true)) {
+      DxvkAppImageStats::get().heldAfterRelease += 1;
+      DxvkAppImageStats::get().heldAfterReleaseBytes += int64_t(memSize());
+    }
+  }
+
+
   DxvkImage::~DxvkImage() {
+    if (m_heldAfterAppRelease.load()) {
+      DxvkAppImageStats::get().heldAfterRelease -= 1;
+      DxvkAppImageStats::get().heldAfterReleaseBytes -= int64_t(memSize());
+    }
+
     // This is a bit of a hack to determine whether
     // the image is implementation-handled or not
     if (m_image.memory.memory() != VK_NULL_HANDLE)
@@ -343,6 +362,11 @@ namespace dxvk {
     viewUsage.sType           = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
     viewUsage.pNext           = nullptr;
     viewUsage.usage           = m_info.usage;
+
+    // A render pass may load or store a color attachment in SHADER_READ_ONLY_OPTIMAL, the default layout of sampled
+    // render targets, which requires the framebuffer's view to have sampled usage.
+    if (m_info.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+      viewUsage.usage |= m_image->info().usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
     
     VkImageViewCreateInfo viewInfo;
     viewInfo.sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;

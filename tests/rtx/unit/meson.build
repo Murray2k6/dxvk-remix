@@ -30,6 +30,13 @@ foreach external_dll : external_dll_paths
 endforeach
 
 tests = []
+exe = executable('test_external_effect_manifest', files('test_external_effect_manifest.cpp'), include_directories : test_include_path, dependencies : [ test_unit_deps, d3d9_dep ], link_with: [ d3d9_dll, dxvk_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+# The sample effects are handed in so they are parsed as part of the test: they
+# are the worked documentation for the format, and one that stopped loading
+# would otherwise only be noticed by whoever copied it.
+test('test_external_effect_manifest', exe, env: test_env, args: [ join_paths(global_src_root_norm, 'examples', 'remixfx') ])
+tests += exe
+
 exe = executable('fastop_minmax',  files('test_fastop_minmax.cpp'),  dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('fastop_minmax', exe, env: test_env)
 tests += exe
@@ -50,6 +57,10 @@ exe = executable('test_intersection_helper_sat',  files('test_intersection_helpe
 test('test_intersection_helper_sat', exe, env: test_env)
 tests += exe
 
+exe = executable('test_color_grade',  files('test_color_grade.cpp'), win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_color_grade', exe, env: test_env)
+tests += exe
+
 exe = executable('test_pnext',  files('test_pnext.cpp'), include_directories : remix_api_include_path,  dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_pnext', exe, env: test_env)
 tests += exe
@@ -66,13 +77,22 @@ exe = executable('test_graph_documentation',  files('test_graph_documentation.cp
 test('test_graph_documentation', exe, env: test_env, priority : -50, args: d3d9_dll.full_path())
 tests += exe
 
-exe = executable('test_remix_categories',  files('test_remix_categories.cpp'), include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll ] , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
-test('test_remix_categories', exe, env: test_env, priority : -50, args: d3d9_dll.full_path())
+exe = executable('test_remix_categories', files('test_remix_categories.cpp'), dependencies : usd_dep, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_remix_categories', exe, env: test_env, priority : -50, args: [ d3d9_dll.full_path(), remix_categories_plugin.full_path() ], depends: [ d3d9_dll, remix_categories_plugin ])
 tests += exe
 
-exe = executable('test_graph_usd_parser',  files('graph/test_component.h', 'graph/test_flexible_component.h', 'graph/test_flexible_component.cpp', 'test_graph_usd_parser.cpp'), 
+exe = executable('test_particle_system_schema', files('test_particle_system_schema.cpp'), dependencies : usd_dep, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_particle_system_schema', exe, env: test_env, args: remix_particle_system_plugin.full_path(), depends: remix_particle_system_plugin)
+tests += exe
+
+exe = executable('test_graph_usd_parser',  files('graph/test_component.h', 'graph/test_flexible_component.h', 'graph/test_flexible_component.cpp', 'test_graph_usd_parser.cpp'),
   include_directories : test_include_path, dependencies : [ test_unit_deps, d3d9_dep ], link_with: [ d3d9_dll, dxvk_lib ] , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_graph_usd_parser', exe, env: test_env)
+tests += exe
+
+exe = executable('test_hot_reload', files('test_hot_reload.cpp'),
+  include_directories : test_include_path, dependencies : [ test_unit_deps, d3d9_dep ], link_with: [ d3d9_dll, dxvk_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_hot_reload', exe, env: test_env)
 tests += exe
 
 exe = executable('test_transform_components',  files('test_transform_components.cpp'), 
@@ -97,6 +117,31 @@ tests += exe
 
 exe = executable('test_f16tof32',  files('test_f16tof32.cpp'),  include_directories : test_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_f16tof32', exe, env: test_env)
+tests += exe
+
+# SCCR: cone generator soundness against a brute-force reference (self-contained, no runtime link).
+exe = executable('test_pom_cone_map',  files('test_pom_cone_map.cpp'),  dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_pom_cone_map', exe, env: test_env, timeout: 120)
+tests += exe
+
+# SCCR shell tracing: the shell adjacency build on small meshes (self-contained, no runtime link).
+exe = executable('test_sccr_shell',  files('test_sccr_shell.cpp', '../../../src/dxvk/rtx_render/rtx_fork_sccr_shell_cpu.cpp'),  dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_sccr_shell', exe, env: test_env)
+tests += exe
+
+# SCCR shell tracing: the prism march against plain POM and a brute-force reference (self-contained).
+exe = executable('test_sccr_shell_march',  files('test_sccr_shell_march.cpp'),  dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_sccr_shell_march', exe, env: test_env, timeout: 120)
+tests += exe
+
+# The input checks of the scene interface boundary (self-contained, no runtime link).
+exe = executable('test_scene_input',  files('test_scene_input.cpp'),  dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_scene_input', exe, env: test_env)
+tests += exe
+
+exe = executable('test_legacy_material_fresnel', files('test_legacy_material_fresnel.cpp'),
+  include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll, dxvk_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_legacy_material_fresnel', exe, env: test_env)
 tests += exe
 
 alias_target('unit_tests', tests)

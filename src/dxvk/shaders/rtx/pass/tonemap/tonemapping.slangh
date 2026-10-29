@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -23,8 +23,11 @@
 
 #include "rtx/pass/tonemap/tonemapping.h"
 #include "rtx/utility/color.slangh"
+#include "rtx/utility/common.slangh"
+#include "rtx/utility/math.slangh"
 
-static const uint kHistogramFixedPointScale = 0x100;
+// The tone curve: the apply pass and the DLSS-NR fast / inverse passes all call tonemap() from here.
+#include "rtx/pass/tonemap/tonemap_operator.slangh"
 
 float getExposure(RWTexture1D<float> ExposureTex, const bool enableAutoExposure, const float exposureFactor)
 {
@@ -36,29 +39,27 @@ float getExposure(RWTexture1D<float> ExposureTex, const bool enableAutoExposure,
   return exposure;
 }
 
-// Log-luminance histogram range used by the auto-exposure pipeline.
-// Values are log2 of linear luminance, so this covers ~0.000244 .. ~64.0
-// in linear units (~18 stops of dynamic range), which comfortably spans
-// typical HDR scene luminance.
-static const float kAutoExposureLogLumMin = -12.0f;
-static const float kAutoExposureLogLumMax =  6.0f;
-
-// Bucket layout: bin 0 is reserved for near-black pixels (excluded from
-// the average); bins 1..(EXPOSURE_HISTOGRAM_SIZE-1) span the log-luminance
-// range above with one bin per (range / (size - 1)) log2 stops.
-uint luminanceToHistogramBin(float luminance)
+float sanitizeExposure(float exposure)
 {
-  const float logLum = log2(max(luminance, 1e-20f));
-  const float range = kAutoExposureLogLumMax - kAutoExposureLogLumMin;
-  const float t = saturate((logLum - kAutoExposureLogLumMin) / range);
-  // Map onto bins [1, EXPOSURE_HISTOGRAM_SIZE - 1].
-  return 1u + uint(t * float(EXPOSURE_HISTOGRAM_SIZE - 2) + 0.5f);
+  if (!isValidValue(exposure) || exposure <= 0.0f)
+  {
+    return 1.0f;
+  }
+
+  return clamp(exposure, 1.0f / float16Max, float16Max);
 }
 
-float histogramBinToLuminance(uint bin)
+float sanitizeRadiance(float radiance)
 {
-  // Inverse of luminanceToHistogramBin for bins >= 1.
-  const float range = kAutoExposureLogLumMax - kAutoExposureLogLumMin;
-  const float t = (float(int(bin) - 1) + 0.5f) / float(EXPOSURE_HISTOGRAM_SIZE - 2);
-  return exp2(kAutoExposureLogLumMin + t * range);
+  return isValidValue(radiance)
+    ? clamp(radiance, 0.0f, float16Max)
+    : 0.0f;
+}
+
+float3 sanitizeRadiance(float3 radiance)
+{
+  return float3(
+    sanitizeRadiance(radiance.x),
+    sanitizeRadiance(radiance.y),
+    sanitizeRadiance(radiance.z));
 }

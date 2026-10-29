@@ -128,6 +128,15 @@ bool gbBridgeRunning = true;
 std::string gRemixFolder = "";
 std::mutex gSwapChainMapMutex;
 SwapChainMap gSwapChainMap;
+const char* gServerExecutable = "NvRemixBridge.exe";
+
+static fspath GetServerExecutablePath() {
+  ONCE(Logger::info(std::string("Native arch: ") + getNativeArchString()));
+
+  auto arch = bridge_util::Config::getOption<bool>("forceX64Server", false) ? nullptr : getNativeArchString();
+  const fspath remixFolder(gRemixFolder);
+  return remixFolder / dxvk::util::RtxFileSys::runtimeDirNameIn(remixFolder, arch) / gServerExecutable;
+}
 
 void PrintRecentCommandHistory() {
   // Log history of recent client side commands sent and received by the server
@@ -149,76 +158,11 @@ void SetupExceptionHandler() {
 }
 
 namespace {
-  // Key must match sentry::kAllowCrashReportingKey in src/util/util_sentry.h.
-  bool userHasCrashReportingPermission() {
-    bridge_util::Config::reloadUserSettings();
-    return bridge_util::Config::getUserSetting<bool>("allowCrashReporting", false);
-  }
-
-  // Delete pending crash data so a declined crash is not uploaded later (e.g. if the user grants
-  // permission after clicking No here). Removes the crashpad reports/attachments, the offline
-  // envelope cache, and per-run session dirs; preserves identity/consent files (settings.dat,
-  // user-consent, installation_id). Mirrors sentry::clearPendingCrashReports() in the runtime.
-  void clearPendingCrashData(const std::filesystem::path& sentryDbDir) {
-    namespace fs = std::filesystem;
-    if (!fs::exists(sentryDbDir)) {
-      return;
-    }
-    std::error_code ec;
-    for (const char* subDir : { "reports", "attachments", "cache" }) {
-      fs::remove_all(sentryDbDir / subDir, ec);
-      if (ec) {
-        Logger::warn(std::string("clearPendingCrashData: failed to remove '") + (sentryDbDir / subDir).string() + "': " + ec.message());
-        ec.clear();
-      }
-    }
-    std::vector<fs::path> runPaths;
-    for (auto it = fs::directory_iterator(sentryDbDir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
-      const auto name = it->path().filename().string();
-      if ((name.size() >= 4 && name.compare(name.size() - 4, 4, ".run") == 0)
-          || (name.size() >= 9 && name.compare(name.size() - 9, 9, ".run.lock") == 0)) {
-        runPaths.push_back(it->path());
-      }
-    }
-    for (const auto& runPath : runPaths) {
-      fs::remove_all(runPath, ec);
-      if (ec) {
-        Logger::warn(std::string("clearPendingCrashData: failed to remove '") + runPath.string() + "': " + ec.message());
-        ec.clear();
-      }
-    }
-  }
-
-  // Sentry only uploads when an application process restarts after a crash, so we just
-  // relaunch the bridge server process with the --sentry-upload-only flag.
-  void triggerSentryUpload(bool isGpuCrash) {
-    if (gRemixFolder.empty()) {
-      return;
-    }
+  // Shows the crash dialog, then exits. The dialog only informs: crash reports stay on disk.
+  [[noreturn]] void showCrashDialogAndExit(bool isGpuCrash) {
     const auto logsDir = dxvk::util::RtxFileSys::path(dxvk::util::RtxFileSys::Logs);
-    const std::wstring exePathW = (std::filesystem::path(gRemixFolder) / L".trex/NvRemixBridge.exe").wstring();
-    const std::wstring crashTypeW = isGpuCrash ? L"GPU" : L"CPU";
-    // logsDir is safe for command line: RtxFileSys::init rejects env paths containing ".
-    const std::wstring cmdLine = L"\"" + exePathW + L"\" --sentry-upload-only \"" + logsDir.wstring() + L"\" " + crashTypeW;
-    std::vector<wchar_t> cmdLineBuf(cmdLine.begin(), cmdLine.end());
-    cmdLineBuf.push_back(L'\0');
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi = {};
-    if (CreateProcessW(exePathW.c_str(), cmdLineBuf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-      CloseHandle(pi.hProcess);
-      CloseHandle(pi.hThread);
-    }
-  }
-
-  // Shows a single crash popup, applies user choice, then exits.
-  [[noreturn]] void promptCrashReportAndApplyChoice(bool isGpuCrash) {
-    namespace fs = std::filesystem;
-    const auto logsDir = dxvk::util::RtxFileSys::path(dxvk::util::RtxFileSys::Logs);
-    const auto sentryDbDir = logsDir / ".sentry-native";
-    const bool alreadyHasConsent = userHasCrashReportingPermission();
-
     const dxvk::CrashPromptKind promptKind = isGpuCrash ? dxvk::CrashPromptKind::GpuImmediate : dxvk::CrashPromptKind::CpuImmediate;
-    const std::wstring message = dxvk::buildCrashReportMessage(promptKind, alreadyHasConsent);
+    const std::wstring message = dxvk::buildCrashReportMessage(promptKind, logsDir);
 
     // Prepare the game window so the dialog is visible on top (demote from topmost + minimize, plus
     // ghost suppression / WndProc fullscreen-restore suppression). This runs on the process-monitor
@@ -228,30 +172,37 @@ namespace {
     // covers CPU crashes (which have no early handler).
     WndProc::prepareForCrashDialog(/*async=*/true);
 
-    if (alreadyHasConsent) {
-      Logger::warn("Crash dialog: showing info dialog (consent already given)");
-      MessageBoxW(nullptr, message.c_str(), dxvk::kCrashReportDialogTitle, MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
-      Logger::err("Crash reporting: user already granted permission. Upload triggered.");
-      triggerSentryUpload(isGpuCrash);
+    Logger::err(isGpuCrash
+        ? std::string("Crash dialog: GPU crash, see the logs in ") + logsDir.string()
+        : std::string("Crash dialog: crash report saved to ") + dxvk::crashReportsDir(logsDir).string());
+    MessageBoxW(nullptr, message.c_str(), dxvk::kCrashReportDialogTitle, MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
 
-    } else {
-      Logger::warn("Crash dialog: showing consent dialog");
-      const int result = MessageBoxW(nullptr, message.c_str(), dxvk::kCrashReportDialogTitle, MB_YESNO | MB_ICONQUESTION | MB_TOPMOST);
-      Logger::warn(format_string("Crash dialog: consent dialog dismissed (result=%d)", result));
-
-      if (result == IDYES) {
-        // Record consent before uploading so the runtime does not prompt again next launch.
-        Logger::err("Crash reporting: user granted permission. Upload triggered.");
-        bridge_util::Config::setUserSetting("allowCrashReporting", "True");
-        triggerSentryUpload(isGpuCrash);
-      } else {
-        Logger::err("Crash reporting: user declined permission.");
-        // Delete the crash data so it is not uploaded later if the user grants permission afterward.
-        clearPendingCrashData(sentryDbDir);
-      }
+    // Not std::exit(): its static destructors race with the game's own threads tearing down D3D9
+    // objects (e.g. D3DBase<T>::~D3DBase touches gShadowMap).
+    TerminateProcess(GetCurrentProcess(), static_cast<DWORD>(-1));
+    // TerminateProcess is asynchronous, so park here rather than returning into those same
+    // destructors. ExitProcess covers termination never landing.
+    for (int i = 0; i < 5; i++) {
+      Sleep(1000);
     }
+    ExitProcess(static_cast<DWORD>(-1));
+  }
 
-    std::exit(-1);
+  // Without a server nothing can render, and the handshake would wait for it forever with no window on screen.
+  [[noreturn]] void showServerLaunchErrorAndExit(const std::string& serverPath, DWORD error) {
+    const std::string message = format_string(
+      "The RTX Remix bridge server could not be started (Windows error %lu).\n\n%s\n\n"
+      "Check that this file exists. If it is missing, your antivirus may have quarantined or blocked it: "
+      "restore it, add the game folder to the antivirus exclusions, and reinstall the mod files.",
+      error, serverPath.c_str());
+    Logger::err(format_string("Bridge server launch failed with error %lu, exiting: %s", error, serverPath.c_str()));
+    MessageBoxA(nullptr, message.c_str(), "RTX Remix", MB_OK | MB_ICONERROR | MB_TOPMOST);
+
+    // Terminates rather than exits, because the DLL detach path would try to talk to the missing server.
+    TerminateProcess(GetCurrentProcess(), static_cast<DWORD>(-1));
+    for (;;) {
+      Sleep(1000);
+    }
   }
 }
 
@@ -281,7 +232,7 @@ void OnServerExited(Process const*, DWORD exitCode) {
     Logger::warn(format_string("Crash handler: server exited (code=0x%08x, type=%s)",
         exitCode, isGpuCrash ? "GPU" : "CPU"));
     PrintRecentCommandHistory();
-    promptCrashReportAndApplyChoice(isGpuCrash);
+    showCrashDialogAndExit(isGpuCrash);
   }
 
   const auto timeServerEnd = std::chrono::high_resolution_clock::now();
@@ -299,14 +250,17 @@ void InitServer() {
     return;
   }
   Logger::info("Launching server with GUID " + gUniqueIdentifier.toString());
+  const std::string serverPath = GetServerExecutablePath().string();
   std::stringstream cmdSS;
-  cmdSS << gRemixFolder;
-  cmdSS << ".trex/NvRemixBridge.exe";
+  cmdSS << serverPath;
   cmdSS << " " << gUniqueIdentifier.toString();
   cmdSS << " " << BRIDGE_VERSION;
   cmdSS << " " << std::string(GetCommandLineA());
   const std::string command = cmdSS.str();
   gpServer = new Process(command.c_str(), OnServerExited);
+  if (!gpServer->isLaunched()) {
+    showServerLaunchErrorAndExit(serverPath, gpServer->getLaunchError());
+  }
 
   if (ClientOptions::getEnableDpiAwareness()) {
     Logger::info("Process set as DPI aware");
@@ -356,7 +310,12 @@ void InitServer() {
 
   BridgeState::setServerState(BridgeState::ProcessState::Handshaking);
   Logger::info("Ack received! Handshake completed! Telling server to continue waiting for commands...");
-  ClientMessage { Commands::Bridge_Continue };
+  {
+    // The server adopts the client's response policy, so the two sides always agree on which calls get answered
+    // (GlobalOptions::applyResponsePolicyFlags).
+    ClientMessage c(Commands::Bridge_Continue);
+    c.send_data(GlobalOptions::getResponsePolicyFlags());
+  }
 
 #ifdef DEBUG
   {
@@ -482,6 +441,16 @@ extern "C" {
   DLLEXPORT int __stdcall Direct3D9EnableMaximizedWindowedModeShim(UINT a) {
     return 0;
   }
+
+  // A proxy d3d9.dll that wraps a device of this client registers its own device and IDirect3D9 here, so that
+  // GetDevice on every object of that device and IDirect3DDevice9::GetDirect3D return the proxy's objects.
+  // The client keeps no references to them, so the proxy clears the registration (null pointers) before its
+  // final release. pOuterDirect3D may be null on its own.
+  // Returns E_INVALIDARG when pInner is not a live device of this client.
+  DLLEXPORT HRESULT __stdcall BridgeClient_SetOuterDevice(IDirect3DDevice9* pInner, IDirect3DDevice9* pOuterDevice,
+                                                          IDirect3D9* pOuterDirect3D) {
+    return BaseDirect3DDevice9Ex_LSS::setOuterObjects(pInner, pOuterDevice, pOuterDirect3D) ? S_OK : E_INVALIDARG;
+  }
 }
 
 bool RemixAttach(HMODULE hModule) {
@@ -534,7 +503,11 @@ bool RemixAttach(HMODULE hModule) {
     initModuleBridge();
     initDeviceBridge();
 
-    gpPresent = new NamedSemaphore("Present", 0, GlobalOptions::getPresentSemaphoreMaxFrames());
+    // The client creates this semaphore before it launches the server, so these counts are the ones that apply (the
+    // server's are ignored when it opens the existing semaphore). Initial count = presentSemaphoreMaxFrames: the
+    // client may run that many frames ahead of the server. 0 = lock-step (each Present waits for the server's).
+    gpPresent = new NamedSemaphore("Present", GlobalOptions::getPresentSemaphoreMaxFrames(),
+                                   std::max<size_t>(GlobalOptions::getPresentSemaphoreMaxFrames(), 1));
 
     BridgeState::setClientState(BridgeState::ProcessState::Init);
 

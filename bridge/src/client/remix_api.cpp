@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -20,6 +20,9 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
+#include <cmath>
+#include <cstring>
+
 #include "log/log.h"
 #include "util_bridgecommand.h"
 #include "util_devicecommand.h"
@@ -28,6 +31,38 @@
 using namespace remixapi::util;
 
 namespace remixapi {
+
+namespace {
+
+uint64_t g_appRemixApiVersion = 0;
+
+bool isRemixApiVersionCompatible(uint64_t appVersion) {
+  constexpr uint64_t kCompiledVersion = REMIXAPI_VERSION_MAKE(
+    REMIXAPI_VERSION_MAJOR,
+    REMIXAPI_VERSION_MINOR,
+    REMIXAPI_VERSION_PATCH);
+
+  // Callers built against the 0.1000.x header of rebased-9-19 and rc1 use the same interface table and structs as
+  // 1.0, so a 1.x client accepts them. Other 0.x lines have other layouts and stay rejected.
+  if (REMIXAPI_VERSION_GET_MAJOR(kCompiledVersion) == 1 &&
+      REMIXAPI_VERSION_GET_MAJOR(appVersion) == 0 &&
+      REMIXAPI_VERSION_GET_MINOR(appVersion) == 1000) {
+    return true;
+  }
+
+  const bool isDevelopment =
+    REMIXAPI_VERSION_GET_MAJOR(appVersion) == 0 &&
+    REMIXAPI_VERSION_GET_MAJOR(kCompiledVersion) == 0;
+
+  if (isDevelopment) {
+    return REMIXAPI_VERSION_GET_MINOR(appVersion) == REMIXAPI_VERSION_GET_MINOR(kCompiledVersion);
+  }
+
+  return REMIXAPI_VERSION_GET_MAJOR(appVersion) == REMIXAPI_VERSION_GET_MAJOR(kCompiledVersion) &&
+         REMIXAPI_VERSION_GET_MINOR(appVersion) <= REMIXAPI_VERSION_GET_MINOR(kCompiledVersion);
+}
+
+}
 
 bool g_bInterfaceInitialized = false;
 PFN_remixapi_BridgeCallback g_beginSceneCallback = nullptr;
@@ -73,11 +108,11 @@ template<typename SerializableT>
 auto serializeAndSend(ClientMessage& msg, const SerializableT& serializable) {
   static_assert(is_serializable_v<SerializableT>, "serializeAndSend(...)  may only be called with defined Serializable<T> types");
   msg.send_data(ToRemixApiStructEnum<SerializableT::BaseT>);
-  const auto serializableSize = serializable.size();
-  auto pSlzd = new uint8_t[serializableSize];
-  serializable.serialize(pSlzd);
-  msg.send_data(serializableSize, pSlzd);
-  delete pSlzd;
+  // Serialized in place in the data ring: the same words as send_data(size, data).
+  if (uint8_t* const pBlob = msg.begin_data_blob(serializable.size())) {
+    serializable.serialize(pBlob);
+    msg.end_data_blob();
+  }
 }
 
 
@@ -106,8 +141,21 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_CreateMaterial(
         case REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT:
         {
           auto* pOpaqueMat = static_cast<const remixapi_MaterialInfoOpaqueEXT* const>(infoItr);
+          remixapi_MaterialInfoOpaqueEXT opaqueMat = { };
+          // Upstream grew the struct at 0.6.5; on the Remix Plus ABI line that is 0.1000.1.
+          // 0.1000.0 shares the 0.6.4 layout, so the same 92-byte (x86) prefix copy applies.
+          if (g_appRemixApiVersion < REMIXAPI_VERSION_MAKE(0, 1000, 1)) {
+            constexpr size_t kOpaqueMaterialInfoSizeAtVersion064 = 92;
+            std::memcpy(&opaqueMat, pOpaqueMat, kOpaqueMaterialInfoSizeAtVersion064);
+            opaqueMat.enableDlssControlMask = true;
+            opaqueMat.dlssControlMaskIntensity = 1.f;
+            opaqueMat.dlssControlMaskToneStrength = 1.f;
+            opaqueMat.dlssControlMaskStructuralStrength = 1.f;
+          } else {
+            opaqueMat = *pOpaqueMat;
+          }
           send(c, Bool::True); 
-          serializeAndSend<serialize::MaterialInfoOpaque>(c, *pOpaqueMat);
+          serializeAndSend<serialize::MaterialInfoOpaque>(c, opaqueMat);
           break;
         }
         case REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_SUBSURFACE_EXT:
@@ -157,6 +205,49 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_DestroyMaterial(remixapi_MaterialHandl
   {
     ClientMessage c(Commands::RemixApi_DestroyMaterial);
     sendHandle(c, materialHandle);
+  }
+  return REMIXAPI_ERROR_CODE_SUCCESS;
+}
+
+// The public API represents uploaded textures as a byte range rather than a
+// path.  Keep the large payload in its own bridge data-queue entry: unlike a
+// DDS filename this reaches the 64-bit runtime before CreateMaterial tries
+// to resolve its 0xHASH pseudo-path.
+remixapi_ErrorCode REMIXAPI_CALL remixapi_CreateTexture(
+  const remixapi_TextureInfo* info,
+  remixapi_TextureHandle*     out_handle) {
+  ASSERT_REMIXAPI_PFN_TYPE(remixapi_CreateTexture);
+  if (!info || !out_handle || info->sType != REMIXAPI_STRUCT_TYPE_TEXTURE_INFO ||
+      !info->data || info->dataSize == 0 || info->dataSize > 0xFFFFFFFFull) {
+    return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+  }
+
+  TextureHandle newHandle;
+  {
+    // Plain words, exactly as the server PULLs them (sv/main.cpp RemixApi_CreateTexture). send(c, x) would write each
+    // scalar as a sized blob (length word + value) and put the server's reads out of step.
+    ClientMessage c(Commands::RemixApi_CreateTexture);
+    c.send_data(static_cast<uint32_t>(info->sType));
+    c.send_many(static_cast<uint32_t>(info->hash & 0xFFFFFFFFull), static_cast<uint32_t>(info->hash >> 32));
+    c.send_many(info->width, info->height, info->depth, info->mipLevels,
+                static_cast<uint32_t>(info->format), static_cast<uint32_t>(info->dataSize));
+    c.send_data(static_cast<uint32_t>(info->dataSize), info->data);
+    sendHandle(c, newHandle);
+  }
+
+  *out_handle = newHandle;
+  return REMIXAPI_ERROR_CODE_SUCCESS;
+}
+
+remixapi_ErrorCode REMIXAPI_CALL remixapi_DestroyTexture(remixapi_TextureHandle handle) {
+  ASSERT_REMIXAPI_PFN_TYPE(remixapi_DestroyTexture);
+  TextureHandle textureHandle(handle);
+  if (!textureHandle.isValid()) {
+    return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+  }
+  {
+    ClientMessage c(Commands::RemixApi_DestroyTexture);
+    sendHandle(c, textureHandle);
   }
   return REMIXAPI_ERROR_CODE_SUCCESS;
 }
@@ -432,6 +523,9 @@ extern "C" {
     if (!out_result) {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
+    if (!isRemixApiVersionCompatible(info->version)) {
+      return REMIXAPI_ERROR_CODE_INCOMPATIBLE_VERSION;
+    }
 
     auto interf = remixapi_Interface {};
     {
@@ -440,6 +534,8 @@ extern "C" {
       // interf.Present = remixapi_Present;
       interf.CreateMaterial = remixapi_CreateMaterial;
       interf.DestroyMaterial = remixapi_DestroyMaterial;
+      interf.CreateTexture = remixapi_CreateTexture;
+      interf.DestroyTexture = remixapi_DestroyTexture;
       interf.CreateMesh = remixapi_CreateMesh;
       interf.DestroyMesh = remixapi_DestroyMesh;
       // interf.SetupCamera = remixapi_SetupCamera;
@@ -450,14 +546,13 @@ extern "C" {
       interf.SetConfigVariable = remixapi_SetConfigVariable;
       interf.dxvk_CreateD3D9 = remixapi_dxvk_CreateD3D9;
       interf.dxvk_RegisterD3D9Device = remixapi_dxvk_RegisterD3D9Device;
-      // Fork-added Remix API entry points. dxvk-remix's d3d9.dll implements
-      // these for real (rtx_remix_api.cpp:2244+ / 2357+ / 2409+ / 2413+), but
-      // they are not yet plumbed through the bridge IPC channel. Without a
+      // Remix Plus API entry points. The runtime's d3d9.dll implements
+      // these (rtx_remix_api.cpp), but they are not forwarded through the
+      // bridge IPC channel. Without a
       // populated function pointer here the slots are NULL and 32-bit clients
       // crash the moment they call interf.GetUIState() / SetUIState() /
       // AutoInstancePersistentLights() / UpdateLightDefinition(). The stubs
-      // below return safe defaults so the bridge stays alive; full IPC
-      // forwarding is a follow-up task tracked separately.
+      // below return safe defaults so the bridge stays alive.
       interf.GetUIState                   = remixapi_GetUIState;
       interf.SetUIState                   = remixapi_SetUIState;
       interf.AutoInstancePersistentLights = remixapi_AutoInstancePersistentLights;
@@ -473,6 +568,7 @@ extern "C" {
     }
 
     *out_result = interf;
+    remixapi::g_appRemixApiVersion = info->version;
     remixapi::g_bInterfaceInitialized = true;
 
     return REMIXAPI_ERROR_CODE_SUCCESS;
@@ -492,11 +588,10 @@ extern "C" {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
-  // ---- Fork-added Remix API entry points (client-side stubs) ----
-  // Mirror the surface dxvk-remix exposes (rtx_remix_api.cpp ~2244, ~2357,
-  // ~2409, ~2413) so the function pointers in remixapi_Interface aren't NULL
-  // for 32-bit clients. These stubs do NOT forward over IPC yet — full
-  // plumbing is a follow-up. Each logs once the first time it's called so
+  // ---- Remix Plus API entry points (client-side stubs) ----
+  // Mirror the surface the runtime exposes (rtx_remix_api.cpp) so the function
+  // pointers in remixapi_Interface aren't NULL for 32-bit clients. These stubs
+  // do not forward over IPC. Each logs once the first time it's called so
   // the user sees that the feature isn't reachable through the bridge.
 
   DLLEXPORT remixapi_UIState __stdcall remixapi_GetUIState(void) {
@@ -556,6 +651,8 @@ extern "C" {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
 
+    DeviceBridge::ResponseTransaction responseTransaction;
+
     UID currentUID = 0;
     {
       ClientMessage c(Commands::RemixApi_SetGameValue);
@@ -585,6 +682,8 @@ extern "C" {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
 
+    DeviceBridge::ResponseTransaction responseTransaction;
+
     UID currentUID = 0;
     {
       ClientMessage c(Commands::RemixApi_GetGameValue);
@@ -596,13 +695,145 @@ extern "C" {
     const remixapi_ErrorCode result = static_cast<remixapi_ErrorCode>(DeviceBridge::get_data());
     const uint32_t actual = DeviceBridge::get_data();
     *out_actual_size = actual;
-    if (actual > 0 && in_buffer_size >= actual) {
-      // Server sent the value bytes when the caller's buffer was large enough.
+    if (result == REMIXAPI_ERROR_CODE_SUCCESS && actual > 0 && in_buffer_size >= actual) {
+      // Server sent the value bytes when the call succeeded and the caller's buffer was large enough (the exact
+      // condition sv/main.cpp RemixApi_GetGameValue uses; any other condition would leave the response data out of step).
       void* value_ptr = nullptr;
       const uint32_t value_size = DeviceBridge::get_data(&value_ptr);
       (void) value_size;
       memcpy(out_buffer, value_ptr, actual);
     }
+    DeviceBridge::pop_front();
+    return result;
+  }
+
+  // ---- Color grading (remix_c.h, "Color grading") ----
+  // The grade fields cross the bridge as 16 floats: the matrix, the balance, saturation, contrast, anchor and shoulder.
+
+  DLLEXPORT remixapi_ErrorCode __stdcall remixapi_SetColorGradePreset(const char* name, float blendSeconds) {
+    ASSERT_REMIXAPI_PFN_TYPE(remixapi_SetColorGradePreset);
+    if (name == nullptr || !(blendSeconds >= 0.0f) || blendSeconds == INFINITY) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    DeviceBridge::ResponseTransaction responseTransaction;
+    UID currentUID = 0;
+    {
+      ClientMessage c(Commands::RemixApi_SetColorGradePreset);
+      currentUID = c.get_uid();
+      send(c, name);
+      send(c, blendSeconds);
+    }
+    WAIT_FOR_SERVER_RESPONSE("remixapi_SetColorGradePreset", REMIXAPI_ERROR_CODE_GENERAL_FAILURE, currentUID);
+    const remixapi_ErrorCode result = static_cast<remixapi_ErrorCode>(DeviceBridge::get_data());
+    DeviceBridge::pop_front();
+    return result;
+  }
+
+  DLLEXPORT remixapi_ErrorCode __stdcall remixapi_SetColorGrade(const remixapi_ColorGradeEXT* grade, float blendSeconds) {
+    ASSERT_REMIXAPI_PFN_TYPE(remixapi_SetColorGrade);
+    if (grade == nullptr || grade->sType != REMIXAPI_STRUCT_TYPE_COLOR_GRADE_EXT) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    if (grade->version != REMIXAPI_COLOR_GRADE_VERSION) {
+      return REMIXAPI_ERROR_CODE_INCOMPATIBLE_VERSION;
+    }
+    if (!(blendSeconds >= 0.0f) || blendSeconds == INFINITY) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    float fields[16];
+    memcpy(fields, grade->matrix, sizeof(float) * 9);
+    memcpy(fields + 9, grade->balance, sizeof(float) * 3);
+    fields[12] = grade->saturation;
+    fields[13] = grade->contrast;
+    fields[14] = grade->anchor;
+    fields[15] = grade->shoulder;
+    {
+      ClientMessage c(Commands::RemixApi_SetColorGrade);
+      c.send_data(sizeof(fields), fields);
+      send(c, blendSeconds);
+    }
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  DLLEXPORT remixapi_ErrorCode __stdcall remixapi_MixColorGradePresets(const char* nameA, const char* nameB, float weight) {
+    ASSERT_REMIXAPI_PFN_TYPE(remixapi_MixColorGradePresets);
+    if (nameA == nullptr || nameB == nullptr || !(weight >= 0.0f && weight <= 1.0f)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    DeviceBridge::ResponseTransaction responseTransaction;
+    UID currentUID = 0;
+    {
+      ClientMessage c(Commands::RemixApi_MixColorGradePresets);
+      currentUID = c.get_uid();
+      send(c, nameA);
+      send(c, nameB);
+      send(c, weight);
+    }
+    WAIT_FOR_SERVER_RESPONSE("remixapi_MixColorGradePresets", REMIXAPI_ERROR_CODE_GENERAL_FAILURE, currentUID);
+    const remixapi_ErrorCode result = static_cast<remixapi_ErrorCode>(DeviceBridge::get_data());
+    DeviceBridge::pop_front();
+    return result;
+  }
+
+  DLLEXPORT remixapi_ErrorCode __stdcall remixapi_GetColorGrade(remixapi_ColorGradeEXT* out) {
+    ASSERT_REMIXAPI_PFN_TYPE(remixapi_GetColorGrade);
+    if (out == nullptr || out->sType != REMIXAPI_STRUCT_TYPE_COLOR_GRADE_EXT) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    if (out->version != REMIXAPI_COLOR_GRADE_VERSION) {
+      return REMIXAPI_ERROR_CODE_INCOMPATIBLE_VERSION;
+    }
+    DeviceBridge::ResponseTransaction responseTransaction;
+    UID currentUID = 0;
+    {
+      ClientMessage c(Commands::RemixApi_GetColorGrade);
+      currentUID = c.get_uid();
+    }
+    WAIT_FOR_SERVER_RESPONSE("remixapi_GetColorGrade", REMIXAPI_ERROR_CODE_GENERAL_FAILURE, currentUID);
+    const remixapi_ErrorCode result = static_cast<remixapi_ErrorCode>(DeviceBridge::get_data());
+    if (result == REMIXAPI_ERROR_CODE_SUCCESS) {
+      // The server sends the 16 floats only on success.
+      void* fields = nullptr;
+      const uint32_t size = DeviceBridge::get_data(&fields);
+      if (size == sizeof(float) * 16) {
+        const float* f = static_cast<const float*>(fields);
+        memcpy(out->matrix, f, sizeof(float) * 9);
+        memcpy(out->balance, f + 9, sizeof(float) * 3);
+        out->saturation = f[12];
+        out->contrast = f[13];
+        out->anchor = f[14];
+        out->shoulder = f[15];
+      }
+    }
+    DeviceBridge::pop_front();
+    return result;
+  }
+
+  DLLEXPORT remixapi_ErrorCode __stdcall remixapi_SaveColorGradePreset(const char* name, const remixapi_ColorGradeEXT* grade) {
+    ASSERT_REMIXAPI_PFN_TYPE(remixapi_SaveColorGradePreset);
+    if (name == nullptr || grade == nullptr || grade->sType != REMIXAPI_STRUCT_TYPE_COLOR_GRADE_EXT) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    if (grade->version != REMIXAPI_COLOR_GRADE_VERSION) {
+      return REMIXAPI_ERROR_CODE_INCOMPATIBLE_VERSION;
+    }
+    float fields[16];
+    memcpy(fields, grade->matrix, sizeof(float) * 9);
+    memcpy(fields + 9, grade->balance, sizeof(float) * 3);
+    fields[12] = grade->saturation;
+    fields[13] = grade->contrast;
+    fields[14] = grade->anchor;
+    fields[15] = grade->shoulder;
+    DeviceBridge::ResponseTransaction responseTransaction;
+    UID currentUID = 0;
+    {
+      ClientMessage c(Commands::RemixApi_SaveColorGradePreset);
+      currentUID = c.get_uid();
+      send(c, name);
+      c.send_data(sizeof(fields), fields);
+    }
+    WAIT_FOR_SERVER_RESPONSE("remixapi_SaveColorGradePreset", REMIXAPI_ERROR_CODE_GENERAL_FAILURE, currentUID);
+    const remixapi_ErrorCode result = static_cast<remixapi_ErrorCode>(DeviceBridge::get_data());
     DeviceBridge::pop_front();
     return result;
   }

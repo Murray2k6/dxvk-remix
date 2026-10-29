@@ -140,28 +140,25 @@ namespace dxvk {
     if (m_format.depth.format == VK_FORMAT_UNDEFINED)
       subpass.pDepthStencilAttachment = nullptr;
     
+    // Render passes of one format are used interchangeably with each other's framebuffers and pipelines, which
+    // Vulkan allows only for compatible render passes, and those need identical subpass dependencies. The
+    // dependencies therefore depend on the format alone and cover the accesses of every set of ops.
     std::array<VkSubpassDependency, 3> subpassDeps;
     uint32_t                           subpassDepCount = 0;
 
     VkPipelineStageFlags renderStages = 0;
     VkAccessFlags        renderAccess = 0;
+    VkAccessFlags        writeAccess  = 0;
 
     if (m_format.depth.format) {
       renderStages |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
                    |  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+      renderAccess |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
 
-      VkImageAspectFlags loadAspects = 0;
-
-      if (ops.depthOps.loadOpD == VK_ATTACHMENT_LOAD_OP_LOAD)
-        loadAspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
-      if (ops.depthOps.loadOpS == VK_ATTACHMENT_LOAD_OP_LOAD)
-        loadAspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
-
-      if (loadAspects & imageFormatInfo(m_format.depth.format)->aspectMask)
-        renderAccess |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-      
-      if (m_format.depth.layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+      if (m_format.depth.layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) {
         renderAccess |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        writeAccess  |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+      }
 
       if (m_format.depth.layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
         renderStages |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
@@ -174,10 +171,9 @@ namespace dxvk {
         continue;
 
       renderStages |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-      renderAccess |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-      if (ops.colorOps[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD)
-        renderAccess |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+      renderAccess |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                   |  VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+      writeAccess  |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     }
 
     if (renderStages) {
@@ -187,26 +183,21 @@ namespace dxvk {
         0, renderAccess };
     }
 
-    if (ops.barrier.srcStages & (
-          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-          VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT |
-          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)) {
-      subpassDeps[subpassDepCount++] = { 0, 0,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        VK_ACCESS_SHADER_READ_BIT,
-        VK_DEPENDENCY_BY_REGION_BIT };
-    }
+    // The self-dependency allows pipeline barriers inside the subpass for attachment feedback loops.
+    subpassDeps[subpassDepCount++] = { 0, 0,
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+      VK_ACCESS_SHADER_READ_BIT,
+      VK_DEPENDENCY_BY_REGION_BIT };
 
-    if (ops.barrier.srcStages && ops.barrier.dstStages) {
-      subpassDeps[subpassDepCount++] = {
-        0, VK_SUBPASS_EXTERNAL,
-        ops.barrier.srcStages,
-        ops.barrier.dstStages,
-        ops.barrier.srcAccess,
-        ops.barrier.dstAccess, 0 };
-    }
+    // Attachment writes are made visible to every later command, whatever reads the images next.
+    subpassDeps[subpassDepCount++] = {
+      0, VK_SUBPASS_EXTERNAL,
+      VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+      writeAccess,
+      VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, 0 };
     
     VkRenderPassCreateInfo info;
     info.sType                        = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -233,17 +224,10 @@ namespace dxvk {
   bool DxvkRenderPass::compareOps(
     const DxvkRenderPassOps& a,
     const DxvkRenderPassOps& b) {
-    bool eq = a.barrier.srcStages == b.barrier.srcStages
-           && a.barrier.srcAccess == b.barrier.srcAccess
-           && a.barrier.dstStages == b.barrier.dstStages
-           && a.barrier.dstAccess == b.barrier.dstAccess;
-    
-    if (eq) {
-      eq &= a.depthOps.loadOpD     == b.depthOps.loadOpD
-         && a.depthOps.loadOpS     == b.depthOps.loadOpS
-         && a.depthOps.loadLayout  == b.depthOps.loadLayout
-         && a.depthOps.storeLayout == b.depthOps.storeLayout;
-    }
+    bool eq = a.depthOps.loadOpD     == b.depthOps.loadOpD
+           && a.depthOps.loadOpS     == b.depthOps.loadOpS
+           && a.depthOps.loadLayout  == b.depthOps.loadLayout
+           && a.depthOps.storeLayout == b.depthOps.storeLayout;
     
     for (uint32_t i = 0; i < MaxNumRenderTargets && eq; i++) {
       eq &= a.colorOps[i].loadOp      == b.colorOps[i].loadOp

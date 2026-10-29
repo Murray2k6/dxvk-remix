@@ -145,9 +145,9 @@ protected:
     } else {
       *ppbData = m_shadow.get() + offset;
 
-      if (m_optimizedLock) {
-        const size_t dataSize = (size == 0) ? m_desc.Size : size;
-
+      const size_t dataSize = (size == 0) ? m_desc.Size : size;
+      // A lock larger than one data queue item uses the shadow, which streams on unlock.
+      if (m_optimizedLock && dataSize + sizeof(kLockCheckValue) + kSIMDAlign <= DeviceBridge::maxItemBytes()) {
         // Send the buffer lock parameters and handle
         ClientMessage c(LockCmd, getId(), 0);
         // Reserve blob in data stream
@@ -195,7 +195,7 @@ protected:
 
         if (m_bUseSharedHeap) {
           cmdFlags = Commands::FlagBits::DataInSharedHeap;
-        } else if (m_optimizedLock) {
+        } else if (lockInfo.checkPtr != nullptr) {
           cmdFlags = Commands::FlagBits::DataIsReserved;
 
           if (kLockCheckValue != *lockInfo.checkPtr) {
@@ -211,7 +211,7 @@ protected:
 
         if (m_bUseSharedHeap) {
           c.send_data(lockInfo.bufferId);
-        } else if (m_optimizedLock) {
+        } else if (lockInfo.checkPtr != nullptr) {
           // Now send data offset in the channel
           const uint32_t dataOffset = static_cast<uint32_t*>(ptr) -
             DeviceBridge::getWriterChannel().get_data_ptr();
@@ -219,6 +219,9 @@ protected:
         } else {
           // Now send the buffer bytes
           c.send_data(size, ptr);
+        }
+        if (bridge_util::perf::enabled()) {
+          bridge_util::perf::noteUpload(size);
         }
       }
       if (lockInfo.discardedBufferId != SharedHeap::kInvalidId) {

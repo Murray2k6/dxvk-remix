@@ -1,5 +1,5 @@
 d3d9_version = vcs_tag(
-  command: [python_interpreter.full_path(), global_src_root_norm + './scripts-common/echo.py', full_version],
+  command: vcs_version_command,
   input:   'version.rc.in',
   output:  'version.rc')
 
@@ -63,6 +63,8 @@ d3d9_src = [
   'd3d9_shader.h',
   'd3d9_shader_permutations.h',
   'd3d9_shader_validator.h',
+  'd3d9_shared_res.cpp',
+  'd3d9_shared_res.h',
   'd3d9_spec_constants.h',
   'd3d9_state.cpp',
   'd3d9_state.h',
@@ -92,17 +94,40 @@ d3d9_src = [
 ]
 
 
-d3d9_dll = shared_library('d3d9', d3d9_src, dxvk_version, glsl_generator.process(d3d9_shaders), d3d9_res,
+# The unified module. D3D9 (which is how Remix gets its device), D3D11, D3D10
+# and DXGI all compile into ONE DLL, because each frontend built separately
+# would statically link its own copy of libdxvk -- its own RtxOptions, its own
+# SceneManager, its own DxvkInstance -- and two such copies can never share a
+# DxvkDevice. d3d11.dll and dxgi.dll ship as export forwarders to this.
+#
+# Note dxgi_src, not dxgi_common_src: the latter is a three-file subset of the
+# former, and including both would duplicate every symbol in it.
+unified_src = d3d9_src + frontend_d3d9_record_src + frontend_api_src
+unified_args = []
+if get_option('enable_d3d9_frontend')
+  unified_src += frontend_d3d9_src
+else
+  unified_args += [ '-DREMIX_D3D9_FRONTEND=0' ]
+endif
+unified_deps = [ dxso_dep, dxvk_dep, util_dep, sentry_dep ]
+unified_shaders = [ glsl_generator.process(d3d9_shaders) ]
+if get_option('enable_d3d11')
+  unified_src += dxgi_src + d3d11_src + d3d10_src + frontend_api_d3d11_src
+  unified_deps += [ lib_dxgi, dxbc_dep ]
+  unified_shaders += [ d3d11_compiled_shaders ]
+endif
+
+d3d9_dll = shared_library('d3d9', unified_src, dxvk_version, unified_shaders, d3d9_res,
   name_prefix         : '',
 
   link_with           : [ util_lib ],
   link_args           : [ usd_plugin_delay_load_args, fsr3_delay_load_args ],
-  dependencies        : [ dxso_dep, dxvk_dep, util_dep, sentry_dep ],
-  include_directories : [ dxvk_include_path, dxvk_shader_include_path, usd_include_paths, remix_api_include_path, include_directories('../dxvk') ],
+  cpp_args            : unified_args,
+  dependencies        : unified_deps,
+  include_directories : [ dxvk_include_path, dxvk_shader_include_path, usd_include_paths, remix_api_include_path, include_directories('../dxvk'), include_directories('../dxgi') ],
   objects             : not dxvk_is_msvc ? 'd3d9' + def_spec_ext : [],
   vs_module_defs      : 'd3d9'+def_spec_ext,
   override_options    : ['cpp_std='+dxvk_cpp_std],
-  cpp_pch             : ['pch/d3d9.pch.h'],
   install: true
   )
 

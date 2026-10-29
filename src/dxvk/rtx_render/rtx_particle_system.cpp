@@ -27,6 +27,7 @@
 #include "dxvk_scoped_annotation.h"
 #include "dxvk_context.h"
 #include "rtx_context.h"
+#include "rtx_fork_hooks.h"
 #include "rtx_imgui.h"
 
 #include "../util/util_global_time.h"
@@ -55,11 +56,12 @@ namespace dxvk {
         SAMPLER2D(PARTICLE_SYSTEM_BINDING_ANIMATION_DATA_INPUT)
 
         RW_STRUCTURED_BUFFER(PARTICLE_SYSTEM_BINDING_PARTICLES_BUFFER_INPUT_OUTPUT)
-        // Fork (2026-07-25): spawn-occlusion diagnostics counters (see
-        // particle_system_spawn.comp.slang for the counter layout).
+        // Spawn-occlusion diagnostics counters (layout in particle_system_spawn.comp.slang).
         RW_STRUCTURED_BUFFER(PARTICLE_SYSTEM_BINDING_SPAWN_TRACE_STATS_OUTPUT)
         END_PARAMETER()
     };
+
+    PREWARM_SHADER_PIPELINE(ParticleSystemSpawn);
 
     class ParticleSystemEvolve : public ManagedShader {
       SHADER_SOURCE(ParticleSystemEvolve, VK_SHADER_STAGE_COMPUTE_BIT, particle_system_evolve)
@@ -80,6 +82,8 @@ namespace dxvk {
         END_PARAMETER()
     };
 
+    PREWARM_SHADER_PIPELINE(ParticleSystemEvolve);
+
     class ParticleSystemGenerateGeometry : public ManagedShader {
       SHADER_SOURCE(ParticleSystemGenerateGeometry, VK_SHADER_STAGE_COMPUTE_BIT, particle_system_generate_geometry)
 
@@ -97,6 +101,8 @@ namespace dxvk {
         RW_STRUCTURED_BUFFER(PARTICLE_SYSTEM_BINDING_VERTEX_BUFFER_OUTPUT)
         END_PARAMETER()
     };
+
+    PREWARM_SHADER_PIPELINE(ParticleSystemGenerateGeometry);
   }
 
 
@@ -180,8 +186,7 @@ namespace dxvk {
   RtxParticleSystemManager::RtxParticleSystemManager(DxvkDevice* device)
     : CommonDeviceObject(device) { }
 
-  // Fork (2026-07-25): spawn-occlusion diagnostics statics (see the header for
-  // why these exist).
+  // Spawn-occlusion diagnostics (see the header).
   std::atomic<uint32_t> RtxParticleSystemManager::s_spawnTraceRays { 0 };
   std::atomic<uint32_t> RtxParticleSystemManager::s_spawnTraceShelterKills { 0 };
   std::atomic<uint32_t> RtxParticleSystemManager::s_spawnTraceLandingHits { 0 };
@@ -380,14 +385,9 @@ namespace dxvk {
     constants.minParticleSize = 2.f; // NOTE: In pixels
     constants.sceneScale = RtxOptions::sceneScale();
 
-    // Fork (2026-07-25): tell the spawn kernel whether the acceleration
-    // structure it can trace against actually exists. Particle simulation runs
-    // from SceneManager::prepareSceneData, BEFORE AccelManager::prepareSceneData
-    // builds/swaps this frame's TLAS, so getTLAS(Opaque).accelStructure is still
-    // last frame's fully-built structure here — exactly what the spawn-time
-    // occlusion trace wants, and one frame of staleness is irrelevant for
-    // "is there a roof over this raindrop". It is null for the first frames of
-    // a scene though, so gate on it.
+    // Whether the spawn kernel has a TLAS to trace. Simulation runs before AccelManager::prepareSceneData builds
+    // this frame's TLAS, so this is last frame's fully built one, which is good enough for the spawn occlusion
+    // test. It is null for the first frames of a scene.
     constants.sceneTlasValid =
       ctx->getResourceManager().getTLAS(Tlas::Opaque).accelStructure.ptr() != nullptr ? 1u : 0u;
   }
@@ -460,7 +460,7 @@ namespace dxvk {
     return desc;
   }
 
-  bool RtxParticleSystemManager::fetchParticleSystem(DxvkContext* ctx, const DrawCallState& drawCallState, RtxParticleSystemDesc desc, const MaterialData& renderMaterialData, ParticleSystem** materialSystem) {
+  bool RtxParticleSystemManager::fetchParticleSystem(DxvkContext* ctx, const SceneDraw& drawCallState, RtxParticleSystemDesc desc, const MaterialData& renderMaterialData, ParticleSystem** materialSystem) {
     ScopedCpuProfileZone();
     if (desc.maxNumParticles == 0) {
       return false;
@@ -499,7 +499,7 @@ namespace dxvk {
     return true;
   }
 
-  uint32_t RtxParticleSystemManager::getNumberOfParticlesToSpawn(ParticleSystem* particleSystem, const DrawCallState& drawCallState) {
+  uint32_t RtxParticleSystemManager::getNumberOfParticlesToSpawn(ParticleSystem* particleSystem, const SceneDraw& drawCallState) {
     ScopedCpuProfileZone();
 
     const auto& desc = particleSystem->context.desc;
@@ -542,7 +542,7 @@ namespace dxvk {
     float lambda = spawnRate * effectiveElapsedSecs;
 
     // Poisson dist won't work well with these values (inf loop)
-    if (isnan(lambda) || lambda < 0.0f) {
+    if (isnan(lambda) || lambda <= 0.0f) {
       return 0;
     }
 
@@ -562,7 +562,7 @@ namespace dxvk {
     return numParticles;
   }
 
-  void RtxParticleSystemManager::spawnParticles(DxvkContext* ctx, const RtxParticleSystemDesc& desc, const uint32_t instanceId, const DrawCallState& drawCallState, const MaterialData& renderMaterialData) {
+  void RtxParticleSystemManager::spawnParticles(DxvkContext* ctx, const RtxParticleSystemDesc& desc, const uint32_t instanceId, const uint64_t instanceUid, const SceneDraw& drawCallState, const MaterialData& renderMaterialData) {
     ScopedCpuProfileZone();
     if (!enable() || !enableSpawning()) {
       return;
@@ -595,6 +595,7 @@ namespace dxvk {
     spawnCtx.numberOfParticles = numParticles;
     spawnCtx.particleOffset = particleSystem->context.particleHeadOffset;
     spawnCtx.instanceId = instanceId;
+    spawnCtx.instanceUid = instanceUid;
     spawnCtx.particleSystemHash = particleSystem->getHash();
 
     // Update material specific counters
@@ -624,14 +625,16 @@ namespace dxvk {
 
     allocStaticBuffers(ctx);
 
-    // Fork (2026-07-25): with nothing simulating there are no spawn dispatches,
-    // so zero the published occlusion diagnostics instead of letting the dev
-    // panel show numbers from whenever particles last ran.
+    // With nothing simulating there are no spawn dispatches, so the published diagnostics are zeroed
+    // instead of showing numbers from whenever particles last ran.
     if (m_particleSystems.empty()) {
       s_spawnTraceRays.store(0, std::memory_order_relaxed);
       s_spawnTraceShelterKills.store(0, std::memory_order_relaxed);
       s_spawnTraceLandingHits.store(0, std::memory_order_relaxed);
       s_spawnTraceRelocations.store(0, std::memory_order_relaxed);
+      // The TLAS flag is only stored in the has-systems branch below, so it is cleared here too.
+      // Otherwise "no system" and "a system that spawned nothing" would look the same in the panel.
+      s_spawnTraceTlasValid.store(false, std::memory_order_relaxed);
     }
 
     // If we have particles to simulate...
@@ -641,13 +644,9 @@ namespace dxvk {
       ParticleSystemConstants constants;
       setupConstants(ctx, constants);
 
-      // Fork (2026-07-25): bind the scene TLAS so the spawn kernel can trace
-      // real occlusion rays (GpuParticleSystemDesc::traceSpawnOcclusion). The
-      // binding is already declared for these passes via
-      // COMMON_RAYTRACING_BINDINGS; it simply was never populated, because
-      // bindCommonRayTracingResources runs later in the frame with the
-      // raytracing dispatches. See setupConstants for why this is last frame's
-      // structure and why sceneTlasValid gates its use.
+      // Binds the scene TLAS for the spawn kernel's occlusion rays (GpuParticleSystemDesc::traceSpawnOcclusion).
+      // COMMON_RAYTRACING_BINDINGS declares it, but bindCommonRayTracingResources only runs later in the frame.
+      // See setupConstants for why this is last frame's TLAS and why sceneTlasValid gates it.
       const bool tlasBound = ctx->getResourceManager().getTLAS(Tlas::Opaque).accelStructure.ptr() != nullptr;
       if (tlasBound) {
         ctx->bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE,
@@ -655,9 +654,8 @@ namespace dxvk {
       }
       s_spawnTraceTlasValid.store(tlasBound, std::memory_order_relaxed);
 
-      // Fork (2026-07-25): spawn-occlusion diagnostics ring (see the header).
-      // Mirrors ConservativeCounter's clear -> shader-atomics -> copy pattern
-      // and its 10-frames-in-flight retirement assumption.
+      // Spawn-occlusion diagnostics ring (see the header). It follows ConservativeCounter's
+      // clear -> shader atomics -> copy pattern and its 10-frames-in-flight retirement assumption.
       const uint32_t statsFrameIdx = ctx->getDevice()->getCurrentFrameId();
       constexpr VkDeviceSize kStatsSizeBytes = kSpawnTraceStatsCount * sizeof(uint32_t);
       if (m_spawnTraceStatsGpu == nullptr) {
@@ -698,6 +696,8 @@ namespace dxvk {
       ctx->bindResourceView(PARTICLE_SYSTEM_BINDING_PREV_WORLD_POSITION_INPUT,
                             rtOutput.getPreviousPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read,
                                                                                                rtOutput.getPreviousPrimaryWorldPositionWorldTriangleNormal().matchesWriteFrameIdx(constants.frameIdx - 1)), nullptr);
+      ctx->bindResourceView(PARTICLE_SYSTEM_BINDING_PREV_PRIMARY_SCREEN_SPACE_MOTION_INPUT,
+                            rtOutput.m_primaryScreenSpaceMotionVector.view, nullptr);
       const uint32_t frameIdx = ctx->getDevice()->getCurrentFrameId();
 
       for (auto& system : m_particleSystems) {
@@ -815,8 +815,7 @@ namespace dxvk {
         }
       }
 
-      // Fork (2026-07-25): stash this frame's spawn-occlusion counters into the
-      // readback ring after every system's spawn dispatch has run.
+      // Copies this frame's spawn-occlusion counters into the readback ring after every spawn dispatch.
       ctx->copyBuffer(m_spawnTraceStatsHost,
                       (statsFrameIdx % kSpawnTraceStatsFramesInFlight) * kStatsSizeBytes,
                       m_spawnTraceStatsGpu, 0, kStatsSizeBytes);
@@ -878,12 +877,14 @@ namespace dxvk {
       const uint32_t contextIdx = spawnCtxIt - m_spawnContexts.begin();
       GpuSpawnContext& gpuCtx = gpuSpawnContexts[contextIdx];
 
-      const RtInstance* pTargetInstance = spawnCtx.instanceId < ctx->getSceneManager().getInstanceTable().size() ? ctx->getSceneManager().getInstanceTable()[spawnCtx.instanceId] : nullptr;
+      // The recorded instanceId is a slot index into InstanceManager::m_instances, which garbageCollection()
+      // swap-compacts between spawnParticles and here. An emitter appended late in the frame (a camera-glued
+      // one gets a new RtInstance every frame) is the element that moves, so the stable RtInstance id is used.
+      const RtInstance* pTargetInstance = fork_hooks::resolveSpawnEmitterInstance(
+        ctx->getSceneManager().getInstanceTable(), spawnCtx.instanceId, spawnCtx.instanceUid);
 
       if (pTargetInstance == nullptr) {
-        // I dont see this case being hit, but in theory it could happen since we track the 
-        //   instance ID at draw time, and the instance list can change over the course of a frame.
-        //   In the event it does happen, handle gracefully...dw
+        // Reached only when the emitter instance was destroyed between draw time and here.
         memset(&gpuCtx, 0, sizeof(GpuSpawnContext));
         // zero out the spawn count, so we dont try to create any new particles here
         auto particleSystemIt = m_particleSystems.find(spawnCtx.particleSystemHash);
@@ -971,12 +972,13 @@ namespace dxvk {
 
       const RtCamera& camera = ctx->getSceneManager().getCamera();
 
-      DrawCallState newDrawCallState;
+      SceneDraw newDrawCallState;
       newDrawCallState.modifyGeometryData() = particleGeometry; // Note: Geometry Data replaced
       newDrawCallState.modifyCategoryFlags() = particleSystem.categories;
       newDrawCallState.modifyCategoryFlags().set(InstanceCategories::Particle); // ?
       newDrawCallState.modifyCategoryFlags().clr(InstanceCategories::ParticleEmitter);
       newDrawCallState.modifyCategoryFlags().clr(InstanceCategories::Hidden);
+      newDrawCallState.newGeometryEveryFrame = true;
       newDrawCallState.modifyTransformData().viewToProjection = camera.getViewToProjection();
       newDrawCallState.modifyTransformData().worldToView = camera.getWorldToView();
       newDrawCallState.modifyMaterialData() = particleSystem.legacyMaterialData;

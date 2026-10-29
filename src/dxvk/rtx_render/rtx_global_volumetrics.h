@@ -29,9 +29,14 @@
 
 namespace dxvk {
 
-// Forward declaration for the weather override pointer (full definition in
-// rtx_weather.h, included only by rtx_global_volumetrics.cpp).
-struct WeatherSnapshot;
+// Size of the froxel radiance cache kept for its surface consumers while volumetrics are off.
+enum class FroxelConsumerCacheQuality : int {
+  Off = 0,
+  Low,
+  Medium,
+  High,
+  Full
+};
 
   class RtxGlobalVolumetrics : public CommonDeviceObject, public RtxPass {
 
@@ -88,11 +93,12 @@ struct WeatherSnapshot;
     // this into a thread count by mulitplying by how many threads per warp there are (typically 32).
     // Example for a RTX 3090: 82 SMs * 64 warps per SM * 32 threads per warp = 167,936 froxels to saturate the GPU. It is fine to be a bit below this though as most gpus will have fewer SMs than this, and higher resolutions
     // will also use more froxels due to how the grid is allocated with respect to the (downscaled when DLSS is in use) resolution, and we don't want the froxel passes to be too expensive (unless higher quality results are desired).
-    RTX_OPTION("rtx.volumetrics", float, restirGridGuardBandFactor, 1.1f, "The scale factor for the restir grid guard band, which is an extended part of the viewing frustum for which we should calculate lighting information for, even though they are technically offscreen.  This helps reduce noise in cases where the camera is moving around.");
+    RTX_OPTION_ARGS("rtx.volumetrics", float, restirGridGuardBandFactor, 1.1f, "The scale factor for the restir grid guard band, which is an extended part of the viewing frustum for which we should calculate lighting information for, even though they are technically offscreen.  This helps reduce noise in cases where the camera is moving around.",
+                    args.minValue = 1.0f);
     RTX_OPTION_ARGS("rtx.volumetrics", uint32_t, restirGridScale, 4,
                "The scale factor to divide the x and y froxel grid resolution by to determine the x and y dimensions of the ReSTIR froxel grid.\n"
                "Note that unlike the rtx.volumetrics.froxelGridResolutionScale option this is not dividing the render resolution, but rather is a scalar on top of the resulting froxel grid resolution after it is divided by the resolution scale.",
-               args.onChangeCallback = &onFroxelResourceOptionsChanged);
+               args.minValue = static_cast<uint32_t>(1), args.onChangeCallback = &onFroxelResourceOptionsChanged);
     RTX_OPTION_ARGS("rtx.volumetrics", uint32_t, froxelGridResolutionScale, 8, "The scale factor to divide the x and y render resolution by to determine the x and y dimensions of the froxel grid.",
                     args.minValue = static_cast<uint32_t>(1), args.onChangeCallback = &onFroxelResourceOptionsChanged, args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.volumetrics", uint16_t, froxelDepthSlices, 64, "The z dimension of the froxel grid. Must be constant after initialization.",
@@ -129,12 +135,29 @@ struct WeatherSnapshot;
                "Spatial resampling allows for reuse of spatial information when picking froxel grid light samples similar to how ReSTIR works, providing higher quality light samples.\n");
     RTX_OPTION_ARGS("rtx.volumetrics", uint16_t, temporalReuseMaxSampleCount, 2, "The number of samples to clamp temporal reservoirs to, should usually be around the value: desired_max_history_frames * average_reservoir_samples.",
                     args.minValue = static_cast<uint16_t>(1), args.maxValue = std::numeric_limits<uint16_t>::max());
-    RTX_OPTION("rtx.volumetrics", uint16_t, spatialReuseMaxSampleCount, 8, "The number of spatial samples to perform, generally higher is better, but the law of diminishing returns applies.");
-    RTX_OPTION("rtx.volumetrics", float, spatialReuseSamplingRadius, 0.8f, "Search radius (in froxels) to search for neighbour candidates in spatial reuse pass.");
+    RTX_OPTION_ARGS("rtx.volumetrics", uint16_t, spatialReuseMaxSampleCount, 8, "The number of spatial samples to perform, generally higher is better, but the law of diminishing returns applies.",
+                    args.minValue = static_cast<uint16_t>(1));
+    RTX_OPTION_ARGS("rtx.volumetrics", float, spatialReuseSamplingRadius, 0.8f, "Search radius (in froxels) to search for neighbour candidates in spatial reuse pass.",
+                    args.minValue = 0.0f);
     RTX_OPTION_FLAG("rtx.volumetrics", bool, enableReferenceMode, false, RtxOptionFlags::NoSave, "Enables reference mode for volumetrics.  This is very expensive, but allows for rendering engineers to test how close sampling approximations are to the real thing. This will not save.");
     RTX_OPTION_ARGS("rtx.volumetrics", bool, enable, true,
-               "Enabling volumetric lighting provides higher quality ray traced physical volumetrics, disabling falls back to cheaper depth based fog.\n"
-               "Note that disabling this option does not disable the froxel radiance cache as a whole as it is still needed for other non-volumetric lighting approximations.",
+               "Enables ray traced physical volumetric lighting, which looks better. Disabling it falls back to cheaper "
+               "depth-based fog.\n"
+               "With it off, the froxel radiance cache passes shrink or are skipped, as set by "
+               "rtx.volumetrics.consumerCacheQuality.",
+               args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.volumetrics", FroxelConsumerCacheQuality, consumerCacheQuality, FroxelConsumerCacheQuality::Medium,
+               "The froxel radiance cache resolution while rtx.volumetrics.enable is off. The cache then only lights "
+               "surface consumers (particles lit by the opacity lighting approximation, the decal and PSR diffuse "
+               "approximation, the stochastic alpha blend fallback and dust particles), which need far less resolution "
+               "than visible fog.\n"
+               "0: Off. The cache is skipped and costs nothing, and those consumers get no cache light.\n"
+               "1: Low. A 4x coarser grid in x and y and half the depth slices (about 1/32 of the cells).\n"
+               "2: Medium. A 2x coarser grid in x and y and half the depth slices (about 1/8 of the cells).\n"
+               "3: High. A 2x coarser grid in x and y and all depth slices (about 1/4 of the cells).\n"
+               "4: Full. The full-size cache, rebuilt every frame.\n"
+               "The graphics presets set it: Ultra uses High, High uses Medium, Medium and Low use Low. Ignored while "
+               "volumetrics are on, when the cache is always full size.",
                args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx.volumetrics", bool, enableTranslucentShadows, false,
                "Calculate coloured shadows from translucent materials (i.e. glass, water) in volumetric lighting. In engineering terms: include OBJECT_MASK_TRANSLUCENT into volumetric visibility rays.");
@@ -151,20 +174,14 @@ struct WeatherSnapshot;
     RTX_OPTION_ARGS("rtx.volumetrics", float, anisotropy, 0.05f, "The anisotropy of the scattering phase function (-1 being backscattering, 0 being isotropic, 1 being forward scattering).",
                     args.minValue = -1.0f, args.maxValue = 1.0f);
     RTX_OPTION_ARGS("rtx.volumetrics", float, fogSunVisibilityGain, 1.0f,
-                    "Artistic visibility gain applied to the sun's contribution to volumetric fog in-scattering. "
-                    "Scales fog-side sun visibility without affecting surface lighting (decals/particles/PSR/SAB read the cache straight). "
-                    "Default 1.0 = physical (no boost); raise it if fog reads too weak at normal exposure. "
-                    "The gmod-rtx port historically baked in a ~5x artistic gain here.",
+                    "An artistic gain on the sun's contribution to volumetric fog. Scales only the sun in the fog, not "
+                    "surface lighting. 1 = physical. Raise it if the fog looks too weak at normal exposure.",
                     args.minValue = 0.0f, args.maxValue = 50.0f);
     RTX_OPTION_ARGS("rtx.volumetrics", float, volumetricConsumerGain, 0.008f,
-                    "Gain on the volumetric froxel radiance cache as read by surface consumers "
-                    "(alpha-blended particles/decals, PSR, and SAB Path B) through evalVolumetricNEE. "
-                    "This was a hardcoded 0.0 that left those surfaces unlit by the volumetric cache "
-                    "(black particles). The cache is filled by per-froxel sun-visibility rays from "
-                    "positions in the air, so large values can produce false glow on alpha-blended "
-                    "surfaces that are actually in shadow; the small default (0.008, tuned against "
-                    "GTA IV) restores atmospheric tint on smoke/dust without obvious leaking. Set to "
-                    "0.0 to fully disable (the prior hardcoded behavior) if a game shows false glow.",
+                    "A gain on the froxel radiance cache as read by surface consumers (alpha-blended particles and "
+                    "decals, PSR, and the stochastic alpha blend fallback). Small values add atmospheric tint to smoke "
+                    "and dust. The cache is lit by sun visibility from points in the air, so large values can make "
+                    "alpha-blended surfaces that are in shadow glow. Set it to 0 if a game shows such false glow.",
                     args.minValue = 0.0f, args.maxValue = 1.0f);
     RTX_OPTION("rtx.volumetrics", bool, enableInPortals, false,
                "Enables using extra frustum-aligned volumes for lighting in portals.\n"
@@ -192,13 +209,16 @@ struct WeatherSnapshot;
                     args.minValue = 0.0f);
     RTX_OPTION_ARGS("rtx.volumetrics", float, noiseFieldGain, 0.5f, "Visual Parameter: A scale factor in the range (0, infinity) to apply to the noise amplitude with each noise octave. Larger values typically make the noise field more jagged whereas lower values make the noise field smoother.",
                     args.minValue = 0.0f);
-    RTX_OPTION("rtx.volumetrics", float, depthOffset, 0.5f, "Depth offset to avoid volumetric light leaking.");
+    RTX_OPTION_ARGS("rtx.volumetrics", float, depthOffset, 0.5f, "Depth offset to avoid volumetric light leaking.",
+                    args.minValue = 0.0f);
     RTX_OPTION("rtx.volumetrics", bool, enableAtmosphere, false,
                "Enables a finite atmosphere in the volumetrics system.\n"
                "When false, the volumetric volume is assumed to reach to infinity in every direction, when true the volumetric volume will be limited to that a finite atmosphere controlled by parameters describing atmosphere height and its curvature via a planetary radius.\n"
                "This option should generally be enabled if volumetrics are used in outdoor settings as without a finite atmosphere infinite light sources such as the skybox and distant lights will not function properly.");
-    RTX_OPTION("rtx.volumetrics", float, atmospherePlanetRadiusMeters, 10000.f, "Radius of the planet in meters, respects scene scale.");
-    RTX_OPTION("rtx.volumetrics", float, atmosphereHeightMeters, 30.0f, "Height of the atmosphere in meters, respects scene scale.");
+    RTX_OPTION_ARGS("rtx.volumetrics", float, atmospherePlanetRadiusMeters, 10000.f, "Radius of the planet in meters, respects scene scale.",
+                    args.minValue = 0.0f);
+    RTX_OPTION_ARGS("rtx.volumetrics", float, atmosphereHeightMeters, 30.0f, "Height of the atmosphere in meters, respects scene scale.",
+                    args.minValue = 0.0f);
     RTX_OPTION("rtx.volumetrics", bool, atmosphereInverted, false,
                "A flag to invert the rendering of the volumetric atmosphere if rtx.volumetrics.enableAtmosphere is enabled.\n"
                "Some games render the world upside down and that cannot be detected automatically, this setting can be used to correct that inversion for the volumetric atmosphere.");
@@ -221,10 +241,11 @@ struct WeatherSnapshot;
                "A flag to enable or disable remapping fixed function fox's max distance. Only takes effect when fog remapping in general is enabled.\n"
                "Enables or disables remapping functionality relating to the max distance parameter of fixed function fog.\n"
                "This allows dynamic changes to the game's fog max distance to be reflected somewhat in the volumetrics system. Overrides the specified volumetric transmittance measurement distance.");
-    RTX_OPTION("rtx.volumetrics", float, waterFogDensityThreshold, 0.065f,
+    RTX_OPTION_ARGS("rtx.volumetrics", float, waterFogDensityThreshold, 0.065f,
                "The fog density threshold for determining when to use physical volumetrics vs fixed function fog.\n"
                "Values below this threshold will use physical volumetrics, while values above will fall back to fixed function fog.\n"
-               "This threshold was created specifically for Portal RTX's underwater fixed function fog.");
+               "The default is tuned for a game whose fixed function fog is used for underwater.",
+               args.minValue = 0.0f);
     RTX_OPTION_ARGS("rtx.volumetrics", float, fogRemapMaxDistanceMinMeters, 1.0f,
                "A value controlling the \"max distance\" fixed function fog parameter's minimum remapping bound.\n"
                "Note that fog remapping and fog max distance remapping must be enabled for this setting to have any effect.  In meters.",
@@ -261,20 +282,11 @@ struct WeatherSnapshot;
 
     VolumeArgs getVolumeArgs(CameraManager const& cameraManager, FogState const& fogState, bool enablePortalVolumes) const;
 
-    /**
-     * \brief Set the per-frame weather snapshot override.
-     *
-     * When non-null, getVolumeArgs() reads blended volumetric weather values
-     * from the snapshot instead of the RTX_OPTION getters for every field that
-     * the WeatherBlender can drive. Frame-local: call once per frame before
-     * getVolumeArgs() runs; do NOT cache the pointer across frames.
-     */
-    void applyWeatherOverride(const dxvk::WeatherSnapshot* wx) {
-      m_weatherOverride = wx;
-    }
-
     void dispatch(class RtxContext* ctx, const Resources::RaytracingOutput& rtOutput, uint32_t numActiveFroxelVolumes);
-    
+
+    // Whether the froxel radiance cache is built this frame (latched in onFrameBegin).
+    bool isFroxelCacheActive() const { return m_froxelCacheActive; }
+
     const Resources::Resource& getCurrentVolumeReservoirs() const { return m_volumeReservoirs[0]; }
     const Resources::Resource& getPreviousVolumeReservoirs() const { return m_volumeReservoirs[1]; }
     const Resources::Resource& getCurrentVolumeAccumulatedRadianceY() const { return m_volumeAccumulatedRadianceY[m_swapTextures]; }
@@ -285,8 +297,9 @@ struct WeatherSnapshot;
     const Resources::Resource& getPreviousVolumeAccumulatedRadianceAge() const { return m_volumeAccumulatedRadianceAge[!m_swapTextures]; }
 
     void showPresetMenu();
-    void showImguiUserSettings();
-    void showImguiSettings(const WeatherSnapshot* weatherSnapshot = nullptr);
+    void showFroxelCacheQuality();
+    void setConsumerCacheQualityLevel(const QualityLevel desiredQualityLevel);
+    void showImguiSettings();
 
     void setQualityLevel(const QualityLevel desiredQualityLevel);
     void setPreset(const PresetType desiredPreset);
@@ -307,12 +320,17 @@ struct WeatherSnapshot;
     Resources::Resource m_volumeAccumulatedRadianceAge[2];
     bool m_swapTextures = false;
     bool m_rebuildFroxels = false;
-
-    // Per-frame weather snapshot override. Set once per frame
-    // by applyWeatherOverride() (called from rtx_context.cpp before
-    // getVolumeArgs runs). getVolumeArgs() reads the snapshot's fields instead
-    // of the RTX_OPTION getters for every weather-blendable volumetric param.
-    const dxvk::WeatherSnapshot* m_weatherOverride = nullptr;
+    // Whether the froxel cache passes run this frame, latched in onFrameBegin.
+    // m_froxelCacheHistoryStale makes the first frame after a skip or a size change drop its history like a camera cut.
+    bool m_froxelCacheActive = true;
+    bool m_froxelCacheHistoryStale = false;
+    // Whether the froxel textures were last allocated at grid size rather than as 1x1x1 placeholders.
+    // onFrameBegin reallocates them when this disagrees with the gate.
+    bool m_froxelTexturesFull = true;
+    // The cache reduction latched for this frame and the one the textures were last allocated with.
+    // Off means the full-size cache.
+    FroxelConsumerCacheQuality m_froxelCacheReduction = FroxelConsumerCacheQuality::Off;
+    FroxelConsumerCacheQuality m_froxelTexturesReduction = FroxelConsumerCacheQuality::Off;
 
     DxvkRaytracingPipelineShaders getPipelineShaders(bool useRayQuery) const;
 

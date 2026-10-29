@@ -52,9 +52,7 @@ namespace dxvk {
 
   void ImGuiCapture::show(const Rc<DxvkContext>& ctx) {
     auto capturer = ctx->getCommonObjects()->capturer();
-    const bool disableCapture =
-      ctx->getCommonObjects()->getSceneManager().areAllReplacementsLoaded() &&
-      RtxOptions::getEnableAnyReplacements();
+    const bool disableCapture = RtxOptions::getEnableAnyReplacements();
     if(RemixGui::CollapsingHeader("USD Scene Capture", ImGuiTreeNodeFlags_DefaultOpen)) {
       ImGui::Indent();
       ImGui::Text(disableCapture ? "Disable enhanced assets to enable capturing." : "Ready to capture.");
@@ -66,6 +64,9 @@ namespace dxvk {
       }
       RemixGui::Separator();
       RemixGui::Checkbox("Correct baked world transforms", &GameCapturer::correctBakedTransformsObject());
+      RemixGui::DragFloat("Max instance distance (0 = all)", &GameCapturer::maxInstanceDistanceObject(), 64.f, 0.f, 1000000.f, "%.0f");
+      RemixGui::DragFloat("Meters per world unit (0 = scene scale)", &GameCapturer::metersPerUnitObject(), 0.001f, 0.f, 1000.f, "%.4f");
+      RemixGui::DragInt("Max placements per instanced draw (0 = all)", &GameCapturer::maxHostInstancesPerDrawObject(), 16.f, 0, 1000000);
       RemixGui::Checkbox("Show menu on capture hotkey", &RtxOptions::captureShowMenuOnHotkeyObject());
       if(RtxOptions::captureShowMenuOnHotkey()) {
         ImGui::PushTextWrapPos(ImGui::GetCurrentWindow()->Size.x);

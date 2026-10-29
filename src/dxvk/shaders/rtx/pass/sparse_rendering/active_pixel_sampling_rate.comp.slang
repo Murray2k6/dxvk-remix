@@ -24,9 +24,11 @@
 #include "rtx/pass/sparse_rendering/sparse_rendering.slangh"
 #include "rtx/pass/sparse_rendering/per_pixel_rate.slangh"
 #include "rtx/utility/geometry_flags.slangh"
+#include "rtx/utility/gbuffer_helpers.slangh"
+#include "rtx/utility/debug_view_helpers.slangh" // Resolves gbuffer_helpers.slangh's debug paths, unused here
 
-// Returns the per-pixel direct-lighting sampling rate in [0,1] for the active sparse rendering mode.
-float calculateDirectPixelSamplingRate(uvec2 pixelCoordinate, SparseRenderingArgs args)
+// Returns the per-pixel sampling rate in [0,1] for the active sparse rendering mode.
+float calculatePixelSamplingRate(uvec2 pixelCoordinate, SparseRenderingArgs args)
 {
   switch (args.mode)
   {
@@ -35,21 +37,7 @@ float calculateDirectPixelSamplingRate(uvec2 pixelCoordinate, SparseRenderingArg
       return 1.f;
 
     case SparseRenderingMode::Uniform:
-      return args.directPixelSamplingRate;
-  }
-}
-
-// Returns the per-pixel indirect-lighting sampling rate in [0,1] for the active sparse rendering mode.
-float calculateIndirectPixelSamplingRate(uvec2 pixelCoordinate, SparseRenderingArgs args)
-{
-  switch (args.mode)
-  {
-    default:
-    case SparseRenderingMode::Off:
-      return 1.f;
-
-    case SparseRenderingMode::Uniform:
-      return args.indirectPixelSamplingRate;
+      return args.pixelSamplingRate;
   }
 }
 
@@ -58,13 +46,21 @@ float calculateIndirectPixelSamplingRate(uvec2 pixelCoordinate, SparseRenderingA
 layout(binding = ACTIVE_PIXEL_MASK_BINDING_SHARED_FLAGS_INPUT)
 Texture2D<uint16_t> SharedFlags;
 
+layout(binding = ACTIVE_PIXEL_MASK_BINDING_PRIMARY_CONE_RADIUS_INPUT)
+Texture2D<float> PrimaryConeRadius;
+
+layout(binding = ACTIVE_PIXEL_MASK_BINDING_SECONDARY_CONE_RADIUS_INPUT)
+Texture2D<float> SecondaryConeRadius;
+
+// Input-Outputs
+
+layout(r32ui, binding = ACTIVE_PIXEL_MASK_BINDING_NRC_TRAINING_QUERY_RESERVOIR_INPUT_OUTPUT)
+RWTexture2D<uint> NrcTrainingQueryReservoir;
+
 // Outputs
 
-layout(r8, binding = ACTIVE_PIXEL_MASK_BINDING_DIRECT_PIXEL_SAMPLING_RATE_OUTPUT)
-RWTexture2D<float> DirectPixelSamplingRate;
-
-layout(r8, binding = ACTIVE_PIXEL_MASK_BINDING_INDIRECT_PIXEL_SAMPLING_RATE_OUTPUT)
-RWTexture2D<float> IndirectPixelSamplingRate;
+layout(r8, binding = ACTIVE_PIXEL_MASK_BINDING_PIXEL_SAMPLING_RATE_OUTPUT)
+RWTexture2D<float> PixelSamplingRate;
 
 [shader("compute")]
 [numthreads(ACTIVE_PIXEL_MASK_THREADGROUP_SIZE_WIDTH, ACTIVE_PIXEL_MASK_THREADGROUP_SIZE_HEIGHT, 1)]
@@ -76,8 +72,7 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
     return;
   }
 
-  float directRate = 1.f;
-  float indirectRate = 1.f;
+  float rate = 1.f;
 
   // When secondary surfaces are not sparsely lit, force pixels whose selected integration
   // surface is the secondary surface to full rate when enabled
@@ -86,25 +81,43 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
                                    geometryFlags.secondarySurfaceMask &&
                                    !geometryFlags.primarySelectedIntegrationSurface;
 
-  // Force NRC training pixels to full rate so the training network always sees a sample
-  // at this location and downstream consumers reconstruct radiance with weight 1.
-  const bool isForcedNrcTrainingPixel = isForcedNrcTrainingPixel(pixelCoordinate, cb.enableNrc, cb.sparseRenderingArgs);
-
   // Calculate sampling rate for the inactive ones
-  if (!isSecondaryFullRate && !isForcedNrcTrainingPixel)
+  if (!isSecondaryFullRate)
   {
-    directRate = calculateDirectPixelSamplingRate(pixelCoordinate, cb.sparseRenderingArgs);
-    indirectRate = calculateIndirectPixelSamplingRate(pixelCoordinate, cb.sparseRenderingArgs);
+    rate = calculatePixelSamplingRate(pixelCoordinate, cb.sparseRenderingArgs);
   }
 
   // The rate is stored in an R8_UNORM texture (8-bit / 256 levels). Hardware UNORM
   // rounding is implementation-defined, so explicitly round-to-nearest here. This ensures the
   // value seen by every consumer is as intended, keeping the per-pixel sampling rate used for sample
   // drawing in sync with the scale used for radiance reconstruction.
-  const float kQuantum = 1.0f / 255.0f;
-  const float quantizedDirectRate = round(clamp(directRate, 0.0f, 1.0f) * 255.0f) * kQuantum;
-  const float quantizedIndirectRate = round(clamp(indirectRate, 0.0f, 1.0f) * 255.0f) * kQuantum;
+  // Store the dequantized value so the mask pass reads back exactly what the activity test here used.
+  const float quantizedRate = dequantizeSamplingRate(quantizeSamplingRate(rate));
+  PixelSamplingRate[pixelCoordinate] = quantizedRate;
 
-  DirectPixelSamplingRate[pixelCoordinate] = quantizedDirectRate;
-  IndirectPixelSamplingRate[pixelCoordinate] = quantizedIndirectRate;
+  // Enter this active candidate into its training cell's reservoir, carrying the pixel that drew the key.
+  // The quantized rate keeps the active test matched to the one the mask pass runs.
+  // Disregard misses for integration selected surface to avoid wasting a training path activation there
+  if (cb.sparseRenderingArgs.resampledNrcTrainingPaths &&
+      isActivePixelFromSamplingRate(pixelCoordinate, quantizedRate, cb.sparseRenderingArgs, cb.frameIdx) &&
+      !isSelectedIntegrationSurfaceGBufferMiss(ivec2(pixelCoordinate), geometryFlags, PrimaryConeRadius, SecondaryConeRadius))
+  {
+    const uvec2 trainingPixelCoordinate = Nrc::calculateTrainingPixelCoordinate(pixelCoordinate, cb.nrcArgs);
+    if (all(trainingPixelCoordinate < uvec2(cb.nrcArgs.activeTrainingDimensions)))
+    {
+      const uvec2 cellOrigin =
+        Nrc::calculateTrainingCellOriginInQuerySpace(trainingPixelCoordinate, cb.nrcArgs);
+      const uvec2 queryPixelOffsetInCell = pixelCoordinate - cellOrigin;
+
+      // Only enter candidates the offset field can address. Storing a wrapped offset would hand the cell's training
+      // path to a different pixel, which may not even be active this frame.
+      if (Nrc::isNrcTrainingQueryPixelOffsetRepresentable(queryPixelOffsetInCell))
+      {
+        const uint key = calculateNrcTrainingQueryKey(pixelCoordinate, cb.frameIdx, quantizedRate);
+
+        InterlockedMax(NrcTrainingQueryReservoir[trainingPixelCoordinate],
+          Nrc::packNrcTrainingQueryReservoirEntry(key, queryPixelOffsetInCell));
+      }
+    }
+  }
 }

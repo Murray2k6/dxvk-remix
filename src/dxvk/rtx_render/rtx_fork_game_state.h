@@ -1,17 +1,11 @@
 #pragma once
 
-// rtx_fork_game_state.h — fork-owned generic key/value store for plugin-
-// injected runtime state that graph components read by name. The store is a
-// header-only singleton guarded by an internal mutex. Writes happen on the
-// plugin thread via remixapi_SetGameValue; reads happen on the render thread
-// from GameValueRead* graph components.
+// A key/value store for plugin-injected runtime state that graph components read by name. It is a header-only
+// singleton guarded by an internal mutex. Plugins write it through remixapi_SetGameValue on their own thread, and
+// GameValueRead* graph components read it on the render thread.
 //
-// Lifetime is deliberately API-lifetime (function-local static): the store
-// survives Remix Shutdown / re-init so plugins do not have to re-populate
-// their state across device resets.
-//
-// See docs/fork-touchpoints.md for the upstream file touches
-// associated with the remixapi_SetGameValue entrypoint.
+// The store is a function-local static, so it survives Remix Shutdown and re-init, and plugins do not have to
+// re-populate their state across device resets.
 
 #include <mutex>
 #include <string>

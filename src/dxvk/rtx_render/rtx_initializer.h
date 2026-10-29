@@ -20,7 +20,10 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #pragma once
+#include <chrono>
+
 #include "../../util/rc/util_rc_ptr.h"
+#include "../dxvk_pipecache.h"
 #include "rtx_option.h"
 #include "rtx_common_object.h"
 
@@ -31,16 +34,7 @@ namespace dxvk {
   public:
     explicit RtxInitializer(DxvkDevice* device);
 
-    void onDestroy() override {
-      waitForShaderPrewarm();
-
-      if (m_asyncAssetLoadThread.joinable()) {
-        if (!m_assetsLoaded) {
-          Logger::warn("Async asset loading thread is running while device is being destroyed! Attempting to join...");
-        }
-        m_asyncAssetLoadThread.join();
-      }
-    }
+    void onDestroy() override;
 
     void initialize();
     void release();
@@ -51,12 +45,56 @@ namespace dxvk {
       return m_warmupComplete;
     }
 
+    struct PrewarmProgress {
+      // True while the startup prewarm has pipelines left to compile.
+      bool running = false;
+      // True once one of its pipelines took longer than a pipeline cache hit, which means the caches were cold.
+      bool compiling = false;
+      uint32_t done = 0;
+      uint32_t total = 0;
+      double elapsedSeconds = 0.0;
+    };
+
+    // The startup prewarm's progress. Called once per presented frame. The first call that finds every
+    // prewarmed pipeline compiled ends the startup prewarm and logs its duration and cache use.
+    PrewarmProgress updateStartupPrewarm();
+
+    // Called on the render thread once per presented frame and before each frame decides whether to ray trace.
+    // After an option change it registers the shaders the new settings can use, which compile in the background.
+    // A frame that finds them compiling skips ray tracing instead of waiting for them.
+    // Before the first ray traced frame, those compiles reopen the startup prewarm and its wait screen.
+    void refreshPrewarm();
+
+    // Called once per ray traced frame on the render thread.
+    // Logs the pipelines compiled in the first kFirstFramesReportSeconds of ray traced frames.
+    void onRaytracedFrame();
+
   private:
+    static constexpr double kFirstFramesReportSeconds = 10.0;
+
     bool m_warmupComplete = false;
     bool m_assetsLoaded = false;
 
+    bool m_startupPrewarmRunning = false;
+    bool m_startupPrewarmCompiling = false;
+    const char* m_startupPrewarmName = "startup prewarm";
+    std::chrono::steady_clock::time_point m_startupPrewarmStart;
+    uint32_t m_startupPrewarmQueuedBase = 0;
+    DxvkPipelineCache::CompileCounts m_startupPrewarmCountsBase;
+    uint32_t m_prewarmOptionGeneration = 0;
+    std::chrono::steady_clock::time_point m_lastPrewarmRefresh;
+
+    bool m_raytracedFrameSeen = false;
+    bool m_firstFramesReported = false;
+    std::chrono::steady_clock::time_point m_firstRaytracedFrame;
+    DxvkPipelineCache::CompileCounts m_firstFramesCountsBase;
+
+    void beginPrewarmTracking(const char* name, uint32_t queuedBase);
+
     void loadAssets();
     void startPrewarmShaders();
+    bool prewarmEnabled() const;
+    void registerPrewarmShaders();
 
     dxvk::thread m_asyncAssetLoadThread;
 

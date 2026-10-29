@@ -154,6 +154,19 @@ namespace dxvk {
     VkImage     image = VK_NULL_HANDLE;
     DxvkMemory  memory;
   };
+
+  // Live application textures and images Remix keeps after the application released them,
+  // for the [VramBudget] log. Any thread.
+  struct DxvkAppImageStats {
+    std::atomic<int64_t> textures = { 0 };
+    std::atomic<int64_t> textureBytes = { 0 };
+    std::atomic<int64_t> heldAfterRelease = { 0 };
+    std::atomic<int64_t> heldAfterReleaseBytes = { 0 };
+    std::atomic<uint64_t> created = { 0 };
+    std::atomic<uint64_t> destroyed = { 0 };
+
+    static DxvkAppImageStats& get();
+  };
   
   /**
    * \brief DXVK image
@@ -308,6 +321,15 @@ namespace dxvk {
       m_info.layout = layout;
     }
 
+    // NV-DXVK start: an image shared with Remix is also read by ray tracing.
+    // Every later barrier on it uses these, so writes made after the handoff
+    // are ordered against those reads in both directions.
+    void addShaderReadStages(VkPipelineStageFlags stages) {
+      m_info.stages |= stages;
+      m_info.access |= VK_ACCESS_SHADER_READ_BIT;
+    }
+    // NV-DXVK end
+
     /**
      * \brief Checks whether a subresource is entirely covered
      * 
@@ -347,6 +369,10 @@ namespace dxvk {
       return m_image.memory.length();
     }
 
+    // Counts the image in DxvkAppImageStats::heldAfterRelease until it is destroyed. Called when
+    // the application releases its texture while other references keep the image alive.
+    void markHeldAfterAppRelease();
+
     // NV-DXVK start: Hashes to identify textures.
     void setHash(XXH64_hash_t hash) {
       m_hash = hash;
@@ -367,6 +393,14 @@ namespace dxvk {
 
     VkDeviceMemory getMemory() const {
       return m_image.memory.memory();
+    }
+
+    uint32_t getMemoryTypeIndex() const {
+      return m_image.memory.memoryTypeIndex();
+    }
+
+    VkDeviceSize getMemoryOffset() const {
+      return m_image.memory.offset();
     }
 
     /**
@@ -406,6 +440,7 @@ namespace dxvk {
     GpuMemoryTracker m_tracker;
 
     small_vector<VkFormat, 4> m_viewFormats;
+    std::atomic<bool>     m_heldAfterAppRelease = { false };
     
     bool canShareImage(const VkImageCreateInfo&  createInfo, const DxvkSharedHandleInfo& sharingInfo) const;
   };

@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -21,7 +21,6 @@
 */
 #include "rtx/pass/tonemap/tonemapping.slangh"
 #include "rtx/pass/tonemap/tonemapping_noise.slangh"
-#include "rtx/pass/tonemap/fork_tonemap_operators.slangh"
 #include "rtx/utility/math.slangh"
 #include "rtx/utility/color.slangh"
 
@@ -40,63 +39,13 @@ RWTexture2D<float4> OutColorBuffer;
 layout(push_constant)
 ConstantBuffer<ToneMappingApplyToneMappingArgs> cb;
 
-// Apply post-tonemap color grading: tint, contrast, saturation.
-float3 colorGrading(float3 inputColor)
-{
-  // Tint.
-  inputColor = inputColor * cb.colorBalance;
-
-  // Contrast around 18% mid grey.
-  inputColor = saturate((cb.contrast * (inputColor - 0.18f)) + 0.18f);
-
-  // Saturation around BT.709 luminance.
-  inputColor = mix(float3(calcBt709Luminance(inputColor)), inputColor, cb.saturation);
-
-  return inputColor;
-}
-
 float3 applyToneMapping(float3 color, uint2 pixelPosition)
 {
   color *= getExposure(InExposure, cb.enableAutoExposure, cb.exposureFactor);
 
   if (cb.toneMappingEnabled != 0)
   {
-    // Observer adaptive state passed to psycho17; all other operators
-    // ignore this parameter. Fixed at the renodx reference mid-gray
-    // (0.18, 0.18, 0.18) unconditionally — AE state is not wired in.
-    const float3 adaptiveStateBT709 = float3(0.18f, 0.18f, 0.18f);
-
-    color = applyTonemapOperator(cb.tonemapOperator, color, /*suppressBlackLevelClamp=*/false,
-                                 cb.hableExposureBias,
-                                 cb.hableShoulderStrength,
-                                 cb.hableLinearStrength,
-                                 cb.hableLinearAngle,
-                                 cb.hableToeStrength,
-                                 cb.hableToeNumerator,
-                                 cb.hableToeDenominator,
-                                 cb.hableWhitePoint,
-                                 cb.agxSaturation,
-                                 cb.agxLook,
-                                 cb.psycho17PeakValue,
-                                 cb.psycho17Exposure,
-                                 cb.psycho17Highlights,
-                                 cb.psycho17Shadows,
-                                 cb.psycho17Contrast,
-                                 cb.psycho17PurityScale,
-                                 cb.psycho17BleachingIntensity,
-                                 cb.psycho17ClipPoint,
-                                 cb.psycho17HueRestore,
-                                 cb.psycho17AdaptationContrast,
-                                 cb.psycho17WhiteCurveMode,
-                                 cb.psycho17ConeResponseExponent,
-                                 cb.psycho17GamutCompression,
-                                 cb.psycho17GamutCompressionMode,
-                                 adaptiveStateBT709);
-  }
-
-  if (cb.colorGradingEnabled > 0)
-  {
-    color = colorGrading(color);
+    color = tonemap(color, cb.tonemapPeak, cb.tonemapPrimaries, cb.grade);
   }
 
   if (cb.performSRGBConversion > 0)
@@ -104,16 +53,8 @@ float3 applyToneMapping(float3 color, uint2 pixelPosition)
     color = linearToGamma(color);
   }
 
-  // Apply dithering to the output to break up banding artifacts. First-order
-  // only; ideally we would dither in linear space using sRGB range info, but
-  // the resulting error is small.
-  // fork — 2026-06-27 (experimental): only dither when this pass actually
-  // encoded to gamma. The fork's tonemap refactor defers sRGB conversion to the
-  // dedicated srgb_dither pass (performSRGBConversion=false here), so dithering
-  // here would add the ±0.5/255 perturbation in LINEAR space — which the later
-  // linearToGamma in srgb_dither amplifies ~13x in the near-black toe, producing
-  // a heavy boiling grain only in dark regions (plus a redundant double-dither).
-  // Gating on performSRGBConversion ties the dither to the space it is valid in.
+  // Dither only when this pass encodes to gamma. Linear-space dither would be
+  // amplified in the near-black toe by the later sRGB encode in srgb_dither.
   return ditherTo8Bit(
     color,
     pixelPosition,
@@ -127,12 +68,23 @@ float3 applyToneMapping(float3 color, uint2 pixelPosition)
 [numthreads(16, 16, 1)]
 void main(uint2 threadId : SV_DispatchThreadID)
 {
+  uint width;
+  uint height;
+  OutColorBuffer.GetDimensions(width, height);
+  if (threadId.x >= width || threadId.y >= height)
+  {
+    return;
+  }
+
   float3 inputColor = imageLoad(InColorBuffer, threadId).xyz;
 
   float3 outputColor = applyToneMapping(inputColor, threadId);
 
-  // Clamp outputColor to avoid problems with NIS.
-  outputColor = saturate(outputColor);
+  // Clamp outputColor to avoid problems with NIS. HDR output keeps everything up to the peak
+  // (relative to paper white) for the encode at present.
+  outputColor = cb.hdrOutput != 0
+    ? clamp(outputColor, 0.0f, max(cb.tonemapPeak, 1.0f))
+    : saturate(outputColor);
 
   OutColorBuffer[threadId] = vec4(outputColor, 1.0f);
 }

@@ -2,6 +2,9 @@
 #include "d3d11_context_imm.h"
 #include "d3d11_device.h"
 #include "d3d11_texture.h"
+// NV-DXVK start: Native D3D11 Remix context
+#include "../dxvk/rtx_render/rtx_context.h"
+// NV-DXVK end
 
 constexpr static uint32_t MinFlushIntervalUs = 750;
 constexpr static uint32_t IncFlushIntervalUs = 250;
@@ -15,7 +18,9 @@ namespace dxvk {
           D3D11Device*    pParent,
     const Rc<DxvkDevice>& Device)
   : D3D11DeviceContext(pParent, Device, DxvkCsChunkFlag::SingleUse),
-    m_csThread(Device, Device->createContext()),
+    // NV-DXVK start: The native API records RTX passes on this stream
+    m_csThread(Device, Device->createRtxContext()),
+    // NV-DXVK end
     m_videoContext(this, Device) {
     EmitCs([
       cDevice                 = m_device,
@@ -39,6 +44,52 @@ namespace dxvk {
   }
   
   
+  // NV-DXVK start: Native D3D11 Remix composition
+  void D3D11ImmediateContext::RenderRemix(const Rc<DxvkImage>& image, bool render) {
+    auto lock = LockContext();
+    m_remixTarget = image;
+    EndReflexSimulation();
+    if (render) {
+      EmitCs([image, frameId = m_remixFrameId, bound = sceneCommandsIssued(*m_device)](DxvkContext* ctx) {
+        auto* rtx = static_cast<RtxContext*>(ctx);
+        rtx->flushCommandList();
+        rtx->setInjectionSceneCommandBound(bound);
+        rtx->injectRTX(frameId, image);
+      });
+      RestoreState();
+    }
+  }
+
+  bool D3D11ImmediateContext::FinishRemixFrame(const Rc<DxvkImage>& image, uint64_t& frameId) {
+    auto lock = LockContext();
+    if (m_remixTarget != image) {
+      return false;
+    }
+    EndReflexSimulation();
+    frameId = m_remixFrameId++;
+    m_remixTarget = nullptr;
+    EmitCs([image, frameId](DxvkContext* ctx) {
+      auto* rtx = static_cast<RtxContext*>(ctx);
+      rtx->endFrame(frameId, image, false);
+      rtx->getCommonObjects()->metaScreenshot().capture(rtx, image, false);
+      rtx->onPresent(image);
+    });
+    return true;
+  }
+
+  // Used by rtx.reflexD3D11Markers. The game has finished its frame when the plugin's
+  // Present hook hands Remix the output (remixapi_RenderD3D11), so simulation ends there. As on the D3D9
+  // path, the game's D3D11 calls count as simulation; Remix's own render submit is marked on the submit
+  // thread around the injectRTX command list and may overlap this region, which Reflex allows.
+  void D3D11ImmediateContext::EndReflexSimulation() {
+    if (!RtxOptions::reflexD3D11Markers() || m_reflexSimEndedFrame == m_remixFrameId) {
+      return;
+    }
+    m_reflexSimEndedFrame = m_remixFrameId;
+    m_device->getCommon()->metaReflex().endSimulation(m_remixFrameId);
+  }
+  // NV-DXVK end
+
   D3D11ImmediateContext::~D3D11ImmediateContext() {
     Flush();
     SynchronizeCsThread(DxvkCsThread::SynchronizeAll);

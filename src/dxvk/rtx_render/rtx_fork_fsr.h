@@ -54,6 +54,17 @@ namespace dxvk {
   class DxvkDevice;
   class RtCamera;
 
+  // How FFX should read Remix's primary depth, the device depth of the camera's jittered projection.
+  struct FfxDepthConvention {
+    bool inverted = false;
+    bool infinite = false;
+    float cameraNear = 0.0f;
+    float cameraFar = 0.0f;
+    float viewSpaceToMeters = 1.0f;
+  };
+
+  FfxDepthConvention getFfxDepthConvention(const RtCamera& camera);
+
   // FSR quality presets matching DLSS/XeSS pattern
   enum class FSRPreset : uint32_t {
     UltraPerformance = 0,  // 3.0x upscale
@@ -80,19 +91,18 @@ namespace dxvk {
       friend class DxvkFSR;
       friend class ImGUI;
 
-      RTX_OPTION("rtx.fsr", FSRPreset, preset, FSRPreset::Balanced, "Adjusts FSR scaling factor, trades quality for performance.");
+      RTX_OPTION("rtx.fsr", FSRPreset, preset, FSRPreset::Balanced,
+                 "The FSR upscaling preset, which trades quality for performance. 0: Ultra Performance (3x), 1: "
+                 "Performance (2x), 2: Balanced (1.7x), 3: Quality (1.5x), 4: Native AA (1x), 5: Custom (uses "
+                 "rtx.resolutionScale).");
       // Note: sharpening amount is shared with the standalone RCAS pass and lives
       // at `rtx.sharpening.sharpness` (see DxvkRCAS::Options).
-      RTX_OPTION("rtx.fsr", bool, useAutoExposure, false, "Use automatic exposure for FSR3.");
-      RTX_OPTION("rtx.fsr", bool, enableHDR, false, "Enable HDR mode for FSR3 input/output.");
     };
 
     // Constructor with device
     DxvkFSR(DxvkDevice* device);
 
     ~DxvkFSR();
-
-    void initialize(Rc<DxvkContext> renderContext, const VkExtent3D& targetExtent);
 
     VkExtent3D getInputSize(const VkExtent3D& targetExtent) const;
     
@@ -108,10 +118,7 @@ namespace dxvk {
     void setSetting(const uint32_t displaySize[2], const FSRPreset preset, uint32_t outRenderSize[2]);
     void getInputSize(uint32_t& width, uint32_t& height) const;
     void getOutputSize(uint32_t& width, uint32_t& height) const;
-    
-    // FSR3 public helper methods
-    float calcRecommendedMipBias() const;
-    uint32_t calcRecommendedJitterSequenceLength() const;
+        
 
   protected:
 
@@ -123,7 +130,7 @@ namespace dxvk {
   private:
     float getUpscaleFactor(FSRPreset preset) const;
     float calcUpscaleFactor() const;
-    void createFSRContext(const VkExtent3D& targetExtent);
+    void createFSRContext(const VkExtent3D& targetExtent, const FfxDepthConvention& depthConvention);
     void destroyFSRContext();
     
     // Member variables
@@ -140,10 +147,12 @@ namespace dxvk {
     bool m_recreate;
     float m_lastResolutionScale;
     
-    // Jitter state
-    uint32_t m_jitterIndex;
-    float m_jitterX;
-    float m_jitterY;
+    // The depth convention the context was created with.
+    FfxDepthConvention m_contextDepth;
+
+    // Interval counters for the [FSR] log line.
+    uint64_t m_dispatches = 0;
+    uint64_t m_resets = 0;
     
     // Manual DLL handle
     HMODULE m_hFFX;

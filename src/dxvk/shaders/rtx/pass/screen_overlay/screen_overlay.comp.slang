@@ -36,15 +36,24 @@ void main(uint2 threadId : SV_DispatchThreadID) {
   if (any(threadId >= cb.imageSize))
     return;
 
-  // Map pixel position to normalized UV for overlay sampling
-  float2 uv = (float2(threadId) + 0.5f) / float2(cb.imageSize);
+  // Map the pixel into the layer's destination rectangle.
+  const float2 screenUv = (float2(threadId) + 0.5f) / float2(cb.imageSize);
+  const float2 uv = (screenUv - float2(cb.rectX, cb.rectY)) / float2(cb.rectW, cb.rectH);
+  if (any(uv < 0.0f) || any(uv > 1.0f))
+    return;
 
   float4 overlay = OverlayTexture.SampleLevel(uv, 0);
+  if (cb.alphaCutoff > 0.0f && overlay.a <= cb.alphaCutoff)
+    return;
   float4 target = InOutImage[threadId];
 
-  // Standard alpha blend: overlay over target
-  float alpha = overlay.a * cb.opacity;
-  float3 blended = overlay.rgb * alpha + target.rgb * (1.0f - alpha);
+  // Overlay over target. Premultiplied sources already carry alpha in RGB,
+  // so only the opacity scales them; straight-alpha sources are weighted here.
+  const float alpha = saturate(overlay.a * cb.opacity);
+  const float3 source = (cb.flags & SCREEN_OVERLAY_FLAG_PREMULTIPLIED) != 0
+    ? overlay.rgb * cb.opacity
+    : overlay.rgb * alpha;
+  float3 blended = source + target.rgb * (1.0f - alpha);
 
   InOutImage[threadId] = float4(blended, 1.0f);
 }

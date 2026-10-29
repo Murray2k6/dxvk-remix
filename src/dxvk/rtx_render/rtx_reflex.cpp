@@ -20,7 +20,10 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx_reflex.h"
+#include "rtx_bridge_message_channel.h"
 #include "dxvk_device.h"
+#include "../../util/util_env.h"
+#include "../../util/util_frame_pacer.h"
 
 #include <limits>
 #include <cassert>
@@ -62,7 +65,10 @@ namespace dxvk {
   // Reflex uses global variables for PCL init, so if a game uses multiple devices, we need to ensure we only do PCL init once.
   static std::atomic<std::uint32_t> s_initPclRefcount = 0;
 
-  RtxReflex::RtxReflex(DxvkDevice* device) : CommonDeviceObject(device) {
+  RtxReflex::RtxReflex(DxvkDevice* device)
+    : CommonDeviceObject(device)
+    , m_framePacer(std::make_unique<FramePacer>())
+    , m_presentPacer(std::make_unique<FramePacer>()) {
     // Initialize PCL stats
     // Note: PCL stats are always desired even if Reflex itself is disabled, so this is done before any checks for Reflex enablement/support.
 
@@ -529,11 +535,12 @@ namespace dxvk {
       return;
     }
 
-    // Check the current Reflex Mode
+    // Check the current Reflex Mode and frame interval
 
     const auto newMode = RtxOptions::reflexMode();
+    const uint32_t newIntervalUs = m_requestedIntervalUs.load();
 
-    if (newMode == m_currentReflexMode) {
+    if (newMode == m_currentReflexMode && newIntervalUs == m_currentIntervalUs) {
       return;
     }
 
@@ -541,8 +548,8 @@ namespace dxvk {
 
     NVLL_VK_SET_SLEEP_MODE_PARAMS sleepParams = {};
 
-    // Note: No framerate limit.
-    sleepParams.minimumIntervalUs = 0;
+    // Reflex enforces the frame rate limit inside its sleep. 0 means no limit.
+    sleepParams.minimumIntervalUs = newIntervalUs;
 
     switch (newMode) {
     case ReflexMode::None:
@@ -571,6 +578,83 @@ namespace dxvk {
     }
 
     m_currentReflexMode = newMode;
+    m_currentIntervalUs = newIntervalUs;
+  }
+
+  void RtxReflex::limitFrameRate(bool reflexSleeps) {
+    const uint32_t limit = frameRateLimit();
+    const bool bridgeActive = env::isRemixBridgeActive();
+
+    // Under the bridge the game runs in another process and can be a frame ahead of this one,
+    // so only a wait in the game process holds back its next input sample.
+    // documentation/FrameRateLimit.md explains the choice.
+    FrameRateLimiter limiter = FrameRateLimiter::Off;
+
+    if (limit) {
+      if (bridgeActive) {
+        limiter = FrameRateLimiter::BridgeClient;
+      } else if (reflexSleeps && reflexInitialized() && RtxOptions::reflexMode() != ReflexMode::None) {
+        limiter = FrameRateLimiter::Reflex;
+      } else {
+        limiter = FrameRateLimiter::PresentThread;
+      }
+    }
+
+    // updateMode applies the interval on the next injected frame.
+    m_requestedIntervalUs = limiter == FrameRateLimiter::Reflex ? 1000000u / limit : 0u;
+
+    // The bridge client keeps the last limit it was sent, so it is posted again only when it changes.
+    // Before the swapchain opens the message channel there is no client window to post to, so it is retried.
+    if (bridgeActive && limit != m_bridgeFrameRateLimit && BridgeMessageChannel::get().canSend()) {
+      BridgeMessageChannel::get().send(kFrameRateLimitMsgName, limit, 0);
+      m_bridgeFrameRateLimit = limit;
+    }
+
+    if (limiter != m_frameRateLimiter || limit != m_loggedFrameRateLimit) {
+      switch (limiter) {
+      case FrameRateLimiter::Off:
+        Logger::info("[FrameLimit] off");
+        break;
+      case FrameRateLimiter::Reflex:
+        Logger::info(str::format("[FrameLimit] ", limit, " fps via Reflex"));
+        break;
+      case FrameRateLimiter::PresentThread:
+        Logger::info(str::format("[FrameLimit] ", limit, " fps via game-side limiter (present thread)"));
+        break;
+      case FrameRateLimiter::BridgeClient:
+        Logger::info(str::format("[FrameLimit] ", limit, " fps via game-side limiter (bridge client)"));
+        break;
+      }
+
+      m_frameRateLimiter = limiter;
+      m_loggedFrameRateLimit = limit;
+      m_framePacer->reset();
+    }
+
+    if (limiter == FrameRateLimiter::PresentThread) {
+      ScopedCpuProfileZoneN("FrameRateLimit_Wait");
+      m_framePacer->waitForFrameStart(limit);
+
+      std::string report;
+      if (m_framePacer->takeReport("present thread wait", report)) {
+        Logger::info(report);
+      }
+    }
+  }
+
+  uint32_t RtxReflex::presentFrameRateLimit() const {
+    const bool holdsPresents = m_frameRateLimiter == FrameRateLimiter::PresentThread || m_frameRateLimiter == FrameRateLimiter::BridgeClient;
+    return holdsPresents ? m_loggedFrameRateLimit : 0u;
+  }
+
+  void RtxReflex::pacePresent(uint32_t limit) {
+    ScopedCpuProfileZoneN("FrameRateLimit_Present");
+    m_presentPacer->holdFrame(limit);
+
+    std::string report;
+    if (m_presentPacer->takeReport("present", report)) {
+      Logger::info(report);
+    }
   }
 
   void RtxReflex::setMarker(std::uint64_t frameId, std::uint32_t marker) const {

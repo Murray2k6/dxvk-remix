@@ -35,7 +35,7 @@ server_header = files([
 thread_dep = dependency('threads')
 
 server_tag = vcs_tag(
-  command: [python_interpreter.full_path(), global_src_root_norm + './scripts-common/echo.py', full_version],
+  command: vcs_version_command,
   input:   'version.rc.in',
   output:  'version.rc')
 
@@ -53,10 +53,14 @@ dependencies        : [ thread_dep, util_dep, lib_version, tracy_dep ],
 include_directories : [ bridge_include_path, util_include_path, public_include_path ],
 win_subsystem       : 'windows')
 
-
-server_output_dir = output_dir + '.trex'
-
 if (cpu_family == 'x86_64') or (cpu_family == 'aarch64')
+	# Note: dir names must match util_filesys.h !
+	if cpu_family != 'aarch64'
+		server_output_dir = output_dir + '.trex'
+	else
+		server_output_dir = output_dir + '.trex_arm64'
+	endif
+
 	if build_os == 'windows'
 	custom_target('copy_server_to_output',
 		output           : ['copy_server_to_output'],

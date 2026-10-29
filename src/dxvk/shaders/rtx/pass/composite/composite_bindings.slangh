@@ -24,6 +24,8 @@
 #include "rtx/pass/composite/composite_binding_indices.h"
 
 #include "rtx/utility/shader_types.h"
+#include "numos/lib/atmosphere_args.h"
+#include "numos/lib/aerial_perspective_light.h"
 
 // Constants
 
@@ -38,6 +40,85 @@ layout(binding = COMPOSITE_SHARED_RADIANCE_RG_INPUT)
 Texture2D<float2> SharedRadianceRG;
 layout(binding = COMPOSITE_SHARED_RADIANCE_B_INPUT)
 Texture2D<float> SharedRadianceB;
+layout(binding = COMPOSITE_ATMOSPHERE_FOREGROUND_INPUT)
+Texture2D<float4> AtmosphereForeground;
+
+// Sky provider (NUMOS) outputs, see composite_binding_indices.h. The Atmosphere* names are
+// numos_host.slangh's binding contract (ATMOSPHERE_AVAILABLE): the far fog's lighting reads them.
+layout(binding = COMPOSITE_SKY_ARGS)
+ConstantBuffer<AtmosphereArgs> skyArgs;
+
+layout(binding = COMPOSITE_SKY_CLOUD_RENDER_INPUT)
+Texture2D<float4> SkyCloudRender;
+
+layout(binding = COMPOSITE_SKY_CLOUD_DEPTH_INPUT)
+Texture2D<float4> SkyCloudDepth;
+
+layout(binding = COMPOSITE_SKY_AP_NEAR_SCATTER_INPUT)
+Texture3D<float4> SkyApNearScatter;
+
+layout(binding = COMPOSITE_SKY_AP_FAR_SCATTER_INPUT)
+Texture3D<float4> SkyApFarScatter;
+
+layout(binding = COMPOSITE_SKY_AP_FAR_TRANSMITTANCE_INPUT)
+Texture3D<float4> SkyApFarTransmittance;
+
+layout(binding = COMPOSITE_SKY_AP_FROXEL_AUX_INPUT)
+Texture3D<float4> SkyApFroxelAux;
+
+layout(binding = COMPOSITE_SKY_AP_LIGHTS_INPUT)
+StructuredBuffer<AerialPerspectiveLight> SkyApLights;
+
+layout(binding = COMPOSITE_SKY_AP_LIGHT_CLUSTERS_INPUT)
+StructuredBuffer<uint> SkyApLightClusters;
+
+layout(binding = COMPOSITE_SKY_AP_SAMPLER)
+SamplerState SkyApSampler;
+
+layout(binding = COMPOSITE_SKY_TRANSMITTANCE_LUT_INPUT)
+Texture2D AtmosphereTransmittanceLut;
+
+layout(binding = COMPOSITE_SKY_MULTISCATTERING_LUT_INPUT)
+Texture2D AtmosphereMultiscatteringLut;
+
+layout(binding = COMPOSITE_SKY_SKY_VIEW_LUT_INPUT)
+Texture2D AtmosphereSkyViewLut;
+
+layout(binding = COMPOSITE_SKY_SKY_VIEW_SAMPLER)
+SamplerState AtmosphereSkyViewSampler;
+
+layout(binding = COMPOSITE_SKY_CLOUD_SKY_TRANSMITTANCE_LUT_INPUT)
+Texture2D<float4> AtmosphereCloudSkyTransmittanceLut;
+
+layout(binding = COMPOSITE_SKY_CLOUD_SHADOW_MAP_INPUT)
+Texture3D<float2> AtmosphereCloudShadowMap;
+
+layout(binding = COMPOSITE_SKY_CLOUD_NOISE_SAMPLER)
+SamplerState AtmosphereCloudNoise3DSampler;
+
+layout(binding = COMPOSITE_SKY_CLOUD_SECONDARY_LUT_INPUT)
+Texture2D<float4> AtmosphereCloudSecondaryLut;
+
+#define ATMOSPHERE_AVAILABLE
+
+layout(binding = COMPOSITE_SKY_NIGHT_SKY_STAR_CELLS_INPUT)
+StructuredBuffer<uint> NightSkyStarCells;
+
+layout(binding = COMPOSITE_SKY_NIGHT_SKY_STARS_INPUT)
+StructuredBuffer<float4> NightSkyStars;
+
+layout(binding = COMPOSITE_SKY_NIGHT_SKY_MILKY_WAY_INPUT)
+StructuredBuffer<uint> NightSkyMilkyWay;
+
+layout(binding = COMPOSITE_SKY_NIGHT_SKY_STARLIGHT_LOW_INPUT)
+Texture2D<float4> NightSkyStarlightLow;
+
+layout(binding = COMPOSITE_SKY_NIGHT_SKY_MOON_INPUT)
+Texture2D<float4> NightSkyMoon;
+
+#define NIGHT_SKY_AVAILABLE
+layout(binding = COMPOSITE_SECONDARY_HIT_DISTANCE_INPUT)
+Texture2D<float> SecondaryHitDistance;
 
 layout(binding = COMPOSITE_PRIMARY_ATTENUATION_INPUT)
 RWTexture2D<uint> PrimaryAttenuation;
@@ -73,11 +154,8 @@ Texture2D<float2> BSDFFactor;
 layout(binding = COMPOSITE_BSDF_FACTOR2_INPUT)
 Texture2D<float2> BSDFFactor2;
 
-layout(binding = COMPOSITE_DIRECT_PIXEL_SAMPLING_RATE_INPUT)
-Texture2D<float> SparseRenderingDirectPixelSamplingRate;
-
-layout(binding = COMPOSITE_INDIRECT_PIXEL_SAMPLING_RATE_INPUT)
-Texture2D<float> SparseRenderingIndirectPixelSamplingRate;
+layout(binding = COMPOSITE_PIXEL_SAMPLING_RATE_INPUT)
+Texture2D<float> SparseRenderingPixelSamplingRate;
 
 layout(binding = COMPOSITE_VOLUME_FILTERED_RADIANCE_AGE_INPUT)
 Sampler3D<float> VolumeFilteredRadianceAge;
@@ -98,23 +176,11 @@ Sampler3D<float4> ValueNoiseSampler;
 layout(binding = COMPOSITE_SKY_LIGHT_TEXTURE)
 Sampler2D<float3> SkyLight;
 
-layout(binding = COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT)
-Texture3D<float4> AtmosphereAerialPerspectiveLut;
-
-layout(binding = COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_SAMPLER)
-SamplerState AtmosphereAerialPerspectiveSampler;
-
 layout(binding = COMPOSITE_ACTIVE_PIXEL_MASK_INPUT)
 Texture2D<uint> SparseRenderingActivePixelMask;
 
-layout(binding = COMPOSITE_DIRECT_ACTIVE_PIXEL_MASK_INPUT)
-Texture2D<uint> SparseRenderingDirectActivePixelMask;
-
-layout(binding = COMPOSITE_INDIRECT_ACTIVE_PIXEL_MASK_INPUT)
-Texture2D<uint> SparseRenderingIndirectActivePixelMask;
-
 layout(binding = COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
-Texture2D<uint16_t> UnionActiveLocalPixelCoords;
+Texture2D<uint16_t> ActiveLocalPixelCoords;
 
 // Inputs/Outputs
 layout(binding = COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT)
@@ -131,9 +197,20 @@ RWTexture2D<float4> LastFinalOutput;
 layout(binding = COMPOSITE_ALPHA_BLEND_RADIANCE_OUTPUT)
 RWTexture2D<float4> AlphaBlendRadiance;
 
-layout(binding = COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT)
-RWTexture2D<float4> RayReconstructionParticleOutput;
 layout(binding = COMPOSITE_DEBUG_VIEW_OUTPUT)
 RWTexture2D<float4> DebugView;
 layout(r16f, binding = COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT)
 RWTexture2D<float> RayReconstructionHitDistanceOutput;
+[[vk::binding(COMPOSITE_DLSS_NR_CONTROL_MASK_OUTPUT)]]
+RWTexture2D<float4> DlssNrControlMask;
+layout(r8, binding = COMPOSITE_BIAS_CURRENT_COLOR_MASK_INPUT_OUTPUT)
+RWTexture2D<float> BiasCurrentColorMask;
+
+layout(r32f, binding = COMPOSITE_PRIMARY_DEPTH_INPUT_OUTPUT)
+RWTexture2D<float> PrimaryDepth;
+layout(rg16f, binding = COMPOSITE_PRIMARY_SCREEN_SPACE_MOTION_VECTOR_INPUT_OUTPUT)
+RWTexture2D<float2> PrimaryScreenSpaceMotionVector;
+layout(r32f, binding = COMPOSITE_PRIMARY_DEPTH_DLSSRR_INPUT_OUTPUT)
+RWTexture2D<float> PrimaryDepthDLSSRR;
+layout(rg16f, binding = COMPOSITE_PRIMARY_SCREEN_SPACE_MOTION_VECTOR_DLSSRR_INPUT_OUTPUT)
+RWTexture2D<float2> PrimaryScreenSpaceMotionVectorDLSSRR;

@@ -47,10 +47,11 @@ namespace dxvk {
       RTXOpacityMicromap,
       RTXMaterialTexture,
       RTXRenderTarget,
+      RTXSceneGeometry,   // Ray-tracing copies of scene vertex and index data, kept per mesh
 
       Count,
       First = AppBuffer,
-      Last = RTXRenderTarget,
+      Last = RTXSceneGeometry,
     };
 
     DxvkMemoryStats() = default;
@@ -88,6 +89,7 @@ namespace dxvk {
     std::atomic<VkDeviceSize> rtxMaterialTextures = 0;
     std::atomic<VkDeviceSize> rtxRenderTargets = 0;
     std::atomic<VkDeviceSize> rtxReplacementGeometry = 0;
+    std::atomic<VkDeviceSize> rtxSceneGeometry = 0;
   };
 
 
@@ -161,6 +163,9 @@ namespace dxvk {
 
     std::vector<Rc<DxvkMemoryChunk>> chunks;
 
+    // Chunk visiting order for one allocation, reused to avoid a heap allocation per call.
+    std::vector<std::pair<VkDeviceSize, uint32_t>> chunkOrder;
+
     // NV-DXVK start: use a per-memory-type mutex rather than an allocator-wide mutex
     dxvk::mutex        mutex;
     // NV-DXVK end
@@ -198,6 +203,11 @@ namespace dxvk {
      */
     VkMemoryPropertyFlags propertyFlags() const {
       return m_type->memType.propertyFlags;
+    }
+
+    // Returns the index of the Vulkan memory type the memory was allocated from.
+    uint32_t memoryTypeIndex() const {
+      return m_type->memTypeId;
     }
 
     /**
@@ -252,6 +262,10 @@ namespace dxvk {
     operator bool () const {
       return m_memory != VK_NULL_HANDLE;
     }
+
+    // True when the slice lies in a chunk that is draining (DxvkMemoryChunk::isDraining),
+    // so a resource that can be rebuilt or copied should move to new memory.
+    bool isInDrainingChunk() const;
     
   private:
     
@@ -281,6 +295,13 @@ namespace dxvk {
     GpuWritable       = 2,  ///< High-priority resource
     Transient         = 3,  ///< Resource is short-lived
     IgnoreConstraints = 4,  ///< Ignore most allocation flags
+    AccelStructure    = 5,  ///< Acceleration-structure chunk class
+    IgnorePriority    = 6,  ///< Lets a chunk of another priority class take the allocation
+    Micromap          = 7,  ///< Opacity micromap chunk class (a cache with its own eviction)
+    Application       = 8,  ///< Scene content chunk class (application resources, material textures)
+    Dedicated         = 9,  ///< Allocation gets device memory of its own
+    Geometry          = 10, ///< Scene geometry copies chunk class
+    UseDraining       = 11, ///< Lets draining chunks take the allocation
   };
 
   using DxvkMemoryFlags = Flags<DxvkMemoryFlag>;
@@ -347,6 +368,25 @@ namespace dxvk {
      */
     bool isCompatible(const Rc<DxvkMemoryChunk>& other) const;
 
+    // Fragmentation diagnostics. Chunk size, bytes free, largest free slice.
+    VkDeviceSize getSize() const { return m_memory.memSize; }
+    VkDeviceSize getFreeBytes() const { return m_freeBytes; }
+    DxvkMemoryFlags getHints() const { return m_hints; }
+
+    // A draining chunk takes no new allocations while other chunks can, so it empties as
+    // its resources are freed and can be returned to the driver. Guarded by the type mutex.
+    bool isDraining() const { return m_draining.load(std::memory_order_relaxed); }
+    void setDraining(bool draining) { m_draining.store(draining, std::memory_order_relaxed); }
+
+    void getFreeSpace(VkDeviceSize& freeBytes, VkDeviceSize& largestFreeSlice) const {
+      freeBytes = 0;
+      largestFreeSlice = 0;
+      for (const auto& slice : m_freeList) {
+        freeBytes += slice.length;
+        largestFreeSlice = std::max(largestFreeSlice, slice.length);
+      }
+    }
+
   private:
     
     struct FreeSlice {
@@ -358,7 +398,9 @@ namespace dxvk {
     DxvkMemoryType*       m_type;
     DxvkDeviceMemory      m_memory;
     DxvkMemoryFlags       m_hints;
-    
+    VkDeviceSize          m_freeBytes;
+    std::atomic<bool>     m_draining = { false };
+
     std::vector<FreeSlice> m_freeList;
 
     bool checkHints(DxvkMemoryFlags hints) const;
@@ -377,6 +419,7 @@ namespace dxvk {
     friend class DxvkMemoryChunk;
 
     constexpr static VkDeviceSize SmallAllocationThreshold = 256 << 10;
+    constexpr static VkDeviceSize DedicatedAllocationThreshold = 32 << 20;
   public:
     
     DxvkMemoryAllocator(const DxvkDevice* device);
@@ -454,6 +497,53 @@ namespace dxvk {
     void freeUnusedChunks();
     // NV-DXVK end
 
+    // Sub-allocation (chunk) usage of one heap, for fragmentation diagnostics.
+    // Memory allocated on the heap but not in any chunk is dedicated allocations.
+    // Chunk classes by resource lifetime (see DxvkMemoryFlag), for the per-pool figures.
+    enum class ChunkPool : uint32_t { Other, AccelStructure, Micromap, Application, Geometry, Count };
+    static const char* chunkPoolName(ChunkPool pool);
+    static ChunkPool chunkPoolOf(DxvkMemoryFlags hints);
+
+    struct PoolUsage {
+      uint32_t     chunkCount = 0;
+      uint32_t     drainingCount = 0;
+      VkDeviceSize chunkBytes = 0;
+      VkDeviceSize freeBytes = 0;
+    };
+
+    struct ChunkUsage {
+      uint32_t     chunkCount = 0;
+      uint32_t     emptyChunkCount = 0;
+      VkDeviceSize chunkBytes = 0;
+      VkDeviceSize freeBytes = 0;
+      VkDeviceSize largestFreeSlice = 0;
+      PoolUsage    pools[uint32_t(ChunkPool::Count)];
+    };
+    ChunkUsage getChunkUsage(uint32_t heapId);
+
+    // Marks, per chunk class whose free space is at least minSlack of its chunk bytes, the
+    // chunks used below maxOccupancy as draining, sparsest first, while the free space of
+    // the class's other chunks can still hold what the draining chunks hold. enable = false
+    // clears every mark. Returns the bytes still used inside draining chunks.
+    VkDeviceSize updateDrainingChunks(bool enable, float minSlack, float maxOccupancy);
+
+    // vkAllocateMemory calls since the last call, and their total and longest time.
+    struct AllocTiming {
+      uint32_t calls = 0;
+      double   totalMs = 0.0;
+      double   maxMs = 0.0;
+      uint32_t chunksMade = 0;
+      uint32_t chunksFreed = 0;
+    };
+
+    // Frees empty chunks beyond the first of each chunk class, at most maxFrees of them.
+    void freeSpareChunks(uint32_t maxFrees);
+
+    // While set, an allocation that fits no other chunk uses free space in a draining chunk
+    // before a new chunk is made. The VRAM budget sets it below pressure level 2.
+    void setDrainingBeforeNewChunk(bool enable) { m_drainingBeforeNewChunk.store(enable, std::memory_order_relaxed); }
+    AllocTiming takeAllocTiming();
+
   private:
 
     const Rc<vk::DeviceFn>                 m_vkd;
@@ -463,6 +553,16 @@ namespace dxvk {
     
     std::array<DxvkMemoryHeap, VK_MAX_MEMORY_HEAPS> m_memHeaps;
     std::array<DxvkMemoryType, VK_MAX_MEMORY_TYPES> m_memTypes;
+
+    // Live VkDeviceMemory objects, chunks and dedicated allocations, against maxMemoryAllocationCount.
+    std::atomic<uint32_t> m_deviceMemoryCount = { 0u };
+
+    std::atomic<uint32_t> m_allocCalls = { 0u };
+    std::atomic<uint32_t> m_chunksMade = { 0u };
+    std::atomic<uint32_t> m_chunksFreed = { 0u };
+    std::atomic<bool>     m_drainingBeforeNewChunk = { true };
+    std::atomic<uint64_t> m_allocNsTotal = { 0u };
+    std::atomic<uint64_t> m_allocNsMax = { 0u };
 
     DxvkMemory tryAlloc(
       const VkMemoryRequirements*             req,
@@ -480,6 +580,14 @@ namespace dxvk {
       const VkMemoryDedicatedAllocateInfo*    dedAllocInfo,
       DxvkMemoryStats::Category               category);
     
+    DxvkMemory allocFromChunks(
+      DxvkMemoryType*                         type,
+      VkMemoryPropertyFlags                   flags,
+      VkDeviceSize                            size,
+      VkDeviceSize                            align,
+      DxvkMemoryFlags                         hints,
+      DxvkMemoryStats::Category               category);
+
     DxvkDeviceMemory tryAllocDeviceMemory(
       DxvkMemoryType*                         type,
       VkMemoryPropertyFlags                   flags,

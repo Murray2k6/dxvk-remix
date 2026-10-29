@@ -41,6 +41,7 @@
 
 #include <rtx_shaders/rtxdi_initial_sampling.h>
 #include <rtx_shaders/rtxdi_initial_sampling_no_portals.h>
+#include "rtx_fork_light_bvh.h"
 #include <rtx_shaders/rtxdi_spatial_reuse.h>
 #include <rtx_shaders/rtxdi_spatial_reuse_no_bsdf_detail.h>
 #include <rtx_shaders/rtxdi_spatial_reuse_no_portals.h>
@@ -89,6 +90,7 @@ namespace dxvk {
         TEXTURE2D(RTXDI_REUSE_BINDING_SHARED_FLAGS_INPUT)
         TEXTURE2D(RTXDI_REUSE_BINDING_BEST_LIGHTS_INPUT)
         TEXTURE2D(RTXDI_REUSE_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
+        STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_ACTIVE_PIXEL_LIST_INPUT)
 
         // Inputs / Outputs
         RW_STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_RTXDI_RESERVOIR_INPUT_OUTPUT)
@@ -132,6 +134,7 @@ namespace dxvk {
         TEXTURE2D(RTXDI_REUSE_BINDING_SHARED_FLAGS_INPUT)
         TEXTURE2D(RTXDI_REUSE_BINDING_BEST_LIGHTS_INPUT)
         TEXTURE2D(RTXDI_REUSE_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
+        STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_ACTIVE_PIXEL_LIST_INPUT)
         
         // Inputs / Outputs
         RW_STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_RTXDI_RESERVOIR_INPUT_OUTPUT)
@@ -175,6 +178,7 @@ namespace dxvk {
         TEXTURE2D(RTXDI_REUSE_BINDING_SHARED_FLAGS_INPUT)
         TEXTURE2D(RTXDI_REUSE_BINDING_BEST_LIGHTS_INPUT)
         TEXTURE2D(RTXDI_REUSE_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
+        STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_ACTIVE_PIXEL_LIST_INPUT)
 
         // Inputs / Outputs
         RW_STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_RTXDI_RESERVOIR_INPUT_OUTPUT)
@@ -344,7 +348,10 @@ namespace dxvk {
     rtOutput.m_raytraceArgs.enableRtxdiStealBoundaryPixelSamplesWhenOutsideOfScreen = stealBoundaryPixelSamplesWhenOutsideOfScreen();
     rtOutput.m_raytraceArgs.enableRtxdiSpatialReuse = enableSpatialReuse();
     rtOutput.m_raytraceArgs.enableRtxdiTemporalBiasCorrection = enableTemporalBiasCorrection();
-    rtOutput.m_raytraceArgs.enableRtxdiTemporalReuse = enableTemporalReuse();
+    // On the frame the light sampling mode switches (Auto or by hand), the previous
+    // frame's reservoirs are LightBVH select-pass reservoirs (targetPdf 1, M 1) or stale, so take no temporal history
+    // this frame (maxHistoryLength 0 in the temporal pass). The frame after reuses RTXDI's own reservoirs again.
+    rtOutput.m_raytraceArgs.enableRtxdiTemporalReuse = enableTemporalReuse() && !LightBvh::modeSwitchedThisFrame();
     rtOutput.m_raytraceArgs.enableRtxdiDiscardInvisibleSamples = enableDiscardInvisibleSamples();
     rtOutput.m_raytraceArgs.enableRtxdiDiscardEnlargedPixels= enableDiscardEnlargedPixels();
     rtOutput.m_raytraceArgs.rtxdiDisocclusionSamples = disocclusionSamples();
@@ -385,6 +392,12 @@ namespace dxvk {
       return false;
     }
 
+    // Without the gradient resources the reservoir buffer keeps a single history page, leaving no previous frame
+    // to compare against. They follow the consumers' options, see Resources::needsRtxdiGradientResources.
+    if (!ctx.getResourceManager().areRtxdiGradientResourcesAllocated()) {
+      return false;
+    }
+
     return true;
   }
 
@@ -405,7 +418,7 @@ namespace dxvk {
   void DxvkRtxdiRayQuery::dispatch(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput) {
     ScopedGpuProfileZone(ctx, "RTXDI");
 
-    if (!RtxOptions::useRTXDI()) {
+    if (!RtxOptions::rtxdiActive()) {
       return;
     }
 
@@ -414,6 +427,10 @@ namespace dxvk {
     const auto& numRaysExtent = rtOutput.m_compositeOutputExtent;
     VkExtent3D workgroups = util::computeBlockCount(numRaysExtent, VkExtent3D{ 16, 8, 1 });
     const bool usePortalShaderVariants = useRtxdiPortalShaderVariants();
+
+    // The passes launch over the active-pixel list when this frame's args say so.
+    const SparseRendering& sparseRendering = ctx->getCommonObjects()->metaSparseRendering();
+    const SparseRenderingArgs& sparseArgs = rtOutput.m_raytraceArgs.sparseRenderingArgs;
 
     ctx->bindCommonRayTracingResources(rtOutput);
     
@@ -443,29 +460,36 @@ namespace dxvk {
       ctx->bindResourceView(RTXDI_REUSE_BINDING_SHARED_TERMINATOR_FIX_PREVIOUS_INPUT, rtOutput.getPreviousSharedTerminatorFix().view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_BEST_LIGHTS_INPUT, rtOutput.m_rtxdiBestLights.view(Resources::AccessType::Read, rtOutput.m_raytraceArgs.enableRtxdiBestLightSampling) , nullptr);
-      ctx->bindResourceView(RTXDI_REUSE_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT, rtOutput.m_sparseRenderingDirectActiveLocalPixelCoords.view, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT, rtOutput.m_sparseRenderingActiveLocalPixelCoords.view, nullptr);
+      ctx->bindResourceBuffer(RTXDI_REUSE_BINDING_ACTIVE_PIXEL_LIST_INPUT, sparseRendering.getActivePixelListSlice());
 
       // Inputs / Outputs
 
-      ctx->bindResourceBuffer(RTXDI_REUSE_BINDING_RTXDI_RESERVOIR_INPUT_OUTPUT, DxvkBufferSlice(rtOutput.m_rtxdiReservoirBuffer, 0, rtOutput.m_rtxdiReservoirBuffer->info().size));
+      // Initial sampling writes the scratch page before temporal reuse reads the history, so this takes the buffer back.
+      ctx->bindResourceBuffer(RTXDI_REUSE_BINDING_RTXDI_RESERVOIR_INPUT_OUTPUT, rtOutput.m_rtxdiReservoirBuffer.slice(Resources::AccessType::Write));
       ctx->bindResourceView(RTXDI_REUSE_BINDING_LAST_GBUFFER_INPUT_OUTPUT, rtOutput.m_gbufferLast.view, nullptr);
 
       // Outputs
 
       ctx->bindResourceView(RTXDI_REUSE_BINDING_REPROJECTION_CONFIDENCE_OUTPUT, rtOutput.m_reprojectionConfidence.view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_BSDF_FACTOR_OUTPUT, rtOutput.m_bsdfFactor.view, nullptr);
-      ctx->bindResourceView(RTXDI_REUSE_BINDING_TEMPORAL_POSITION_OUTPUT, rtOutput.m_primaryRtxdiTemporalPosition.view(Resources::AccessType::Write), nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_TEMPORAL_POSITION_OUTPUT,
+        rtOutput.m_primaryRtxdiTemporalPosition.empty()
+          ? nullptr
+          : rtOutput.m_primaryRtxdiTemporalPosition.view(Resources::AccessType::Write), nullptr);
 
       {
         ScopedGpuProfileZone(ctx, "RTXDI Initial Sampling");
         ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getRtxdiInitialSamplingShader(usePortalShaderVariants));
-        ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+        sparseRendering.dispatchLaunch(*ctx, sparseArgs, COMPACT_ACTIVE_PIXELS_LAUNCH_RTXDI_INITIAL, workgroups);
+        ctx->recordGpuStageTiming("RTXDIInitialSampling"); // Per-pass [PerfGpu] split
       }
 
       {
         ScopedGpuProfileZone(ctx, "RTXDI Temporal Reuse");
         ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getRtxdiTemporalReuseShader(usePortalShaderVariants));
-        ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+        sparseRendering.dispatchLaunch(*ctx, sparseArgs, COMPACT_ACTIVE_PIXELS_LAUNCH_RTXDI_REUSE, workgroups);
+        ctx->recordGpuStageTiming("RTXDITemporalReuse"); // Per-pass [PerfGpu] split
       }
     }
 
@@ -494,30 +518,35 @@ namespace dxvk {
       ctx->bindResourceView(RTXDI_REUSE_BINDING_SHARED_TERMINATOR_FIX_INPUT, rtOutput.getCurrentSharedTerminatorFix().view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_SHARED_TERMINATOR_FIX_PREVIOUS_INPUT, rtOutput.getPreviousSharedTerminatorFix().view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
-      ctx->bindResourceView(RTXDI_REUSE_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT, rtOutput.m_sparseRenderingDirectActiveLocalPixelCoords.view, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT, rtOutput.m_sparseRenderingActiveLocalPixelCoords.view, nullptr);
+      ctx->bindResourceBuffer(RTXDI_REUSE_BINDING_ACTIVE_PIXEL_LIST_INPUT, sparseRendering.getActivePixelListSlice());
 
       // Inputs / Outputs
 
-      ctx->bindResourceBuffer(RTXDI_REUSE_BINDING_RTXDI_RESERVOIR_INPUT_OUTPUT, DxvkBufferSlice(rtOutput.m_rtxdiReservoirBuffer, 0, rtOutput.m_rtxdiReservoirBuffer->info().size));
+      ctx->bindResourceBuffer(RTXDI_REUSE_BINDING_RTXDI_RESERVOIR_INPUT_OUTPUT, rtOutput.m_rtxdiReservoirBuffer.slice(Resources::AccessType::ReadWrite));
       ctx->bindResourceView(RTXDI_REUSE_BINDING_LAST_GBUFFER_INPUT_OUTPUT, rtOutput.m_gbufferLast.view, nullptr);
 
       // Outputs
 
       ctx->bindResourceView(RTXDI_REUSE_BINDING_REPROJECTION_CONFIDENCE_OUTPUT, rtOutput.m_reprojectionConfidence.view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_BSDF_FACTOR_OUTPUT, rtOutput.m_bsdfFactor.view, nullptr);
-      ctx->bindResourceView(RTXDI_REUSE_BINDING_TEMPORAL_POSITION_OUTPUT, rtOutput.m_primaryRtxdiTemporalPosition.view(Resources::AccessType::Write), nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_TEMPORAL_POSITION_OUTPUT,
+        rtOutput.m_primaryRtxdiTemporalPosition.empty()
+          ? nullptr
+          : rtOutput.m_primaryRtxdiTemporalPosition.view(Resources::AccessType::Write), nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_BEST_LIGHTS_INPUT, rtOutput.m_rtxdiBestLights.view(Resources::AccessType::Read, rtOutput.m_raytraceArgs.enableRtxdiBestLightSampling), nullptr);
 
       ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getRtxdiSpatialReuseShader(
         usePortalShaderVariants,
         useRtxdiSpatialBsdfDetailShaderVariant(rtOutput)));
-      ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+      sparseRendering.dispatchLaunch(*ctx, sparseArgs, COMPACT_ACTIVE_PIXELS_LAUNCH_RTXDI_REUSE, workgroups);
+      ctx->recordGpuStageTiming("RTXDISpatialReuse"); // Per-pass [PerfGpu] split
     }
   }
 
   void DxvkRtxdiRayQuery::dispatchGradient(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput) {
 
-    if (!RtxOptions::useRTXDI()) {
+    if (!RtxOptions::rtxdiActive()) {
       return;
     }
 
@@ -541,13 +570,16 @@ namespace dxvk {
       
       // Inputs
 
-      ctx->bindResourceBuffer(RTXDI_COMPUTE_GRADIENTS_BINDING_RTXDI_RESERVOIR, DxvkBufferSlice(rtOutput.m_rtxdiReservoirBuffer, 0, rtOutput.m_rtxdiReservoirBuffer->info().size));
+      ctx->bindResourceBuffer(RTXDI_COMPUTE_GRADIENTS_BINDING_RTXDI_RESERVOIR, rtOutput.m_rtxdiReservoirBuffer.slice(Resources::AccessType::Read));
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_CURRENT_WORLD_POSITION_INPUT, rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read), nullptr);
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_PREVIOUS_WORLD_POSITION_INPUT, rtOutput.getPreviousPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read, rtOutput.getPreviousPrimaryWorldPositionWorldTriangleNormal().matchesWriteFrameIdx(frameIdx - 1)), nullptr);
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_CONE_RADIUS_INPUT, rtOutput.m_primaryConeRadius.view, nullptr);
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_MVEC_INPUT, rtOutput.m_primaryVirtualMotionVector.view(Resources::AccessType::Read), nullptr);
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_POSITION_ERROR_INPUT, rtOutput.m_primaryPositionError.view, nullptr);
-      ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_TEMPORAL_POSITION_INPUT, rtOutput.m_primaryRtxdiTemporalPosition.view(Resources::AccessType::Read), nullptr);
+      ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_TEMPORAL_POSITION_INPUT,
+        rtOutput.m_primaryRtxdiTemporalPosition.empty()
+          ? nullptr
+          : rtOutput.m_primaryRtxdiTemporalPosition.view(Resources::AccessType::Read), nullptr);
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_CURRENT_ILLUMINANCE_INPUT, rtOutput.getCurrentRtxdiIlluminance().view(Resources::AccessType::Read), nullptr);
 
       const bool isPreviousIlluminanceValid = rtOutput.getPreviousRtxdiIlluminance().matchesWriteFrameIdx(frameIdx - 1);
@@ -579,7 +611,7 @@ namespace dxvk {
 
   void DxvkRtxdiRayQuery::dispatchConfidence(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput) {
     
-    if (!RtxOptions::useRTXDI() ||
+    if (!RtxOptions::rtxdiActive() ||
         !getEnableDenoiserConfidence(*ctx)) {
       return;
     }
@@ -614,6 +646,7 @@ namespace dxvk {
         ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
       }
     }
+    ctx->recordGpuStageTiming("RTXDIFilterGradients"); // Per-pass [PerfGpu] split
 
     workgroups = util::computeBlockCount(numThreads, VkExtent3D { 16, 8, 1 });
 

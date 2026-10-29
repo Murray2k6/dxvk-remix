@@ -30,7 +30,7 @@
 
 
 namespace dxvk {
-  extern bool g_combineGuiInFinalColor = true;
+  bool g_combineGuiInFinalColor = true;
 
   D3D9SwapchainExternal::D3D9SwapchainExternal(
         D3D9DeviceEx* pDevice,
@@ -67,6 +67,9 @@ namespace dxvk {
     m_parent->SynchronizeCsThread();
 
     m_context->beginRecording(m_device->createCommandList());
+
+    // Screenshots copy the back buffer before the HUD and the Remix menu are drawn into it.
+    m_device->getCommon()->metaScreenshot().capture(m_context.ptr(), targetImage, false);
 
     DxvkRenderTargets renderTargets;
     renderTargets.color[0].view = swapImageView;

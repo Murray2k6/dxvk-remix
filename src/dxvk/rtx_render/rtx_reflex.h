@@ -21,13 +21,17 @@
 */
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <vulkan/vulkan.h>
 
 #include "rtx_resources.h"
 #include "rtx_options.h"
 
 namespace dxvk {
+
+  class FramePacer;
 
   // A set of various Reflex-related stats. Note that duration values are floating point millisecond times (due to being mostly near 0),
   // wereas all other times are integer microsecond time values.
@@ -94,8 +98,24 @@ namespace dxvk {
     float combinedDurationMax;
   };
 
+  // Which part of the frame loop enforces rtx.frameRateLimit.
+  enum class FrameRateLimiter {
+    Off,
+    Reflex,
+    PresentThread,
+    BridgeClient,
+  };
+
   class RtxReflex : public CommonDeviceObject {
   public:
+    RTX_OPTION_ARGS("rtx", uint32_t, frameRateLimit, 0,
+                    "Caps the frame rate at this many frames per second. 0 turns the cap off.\n"
+                    "The cap holds the game before it starts its next frame, which keeps input latency low. "
+                    "With Reflex enabled the Reflex limiter does the waiting. "
+                    "Games running through the 32-bit bridge wait in the game process instead. "
+                    "Frame generation adds generated frames on top of the cap.",
+                    args.maxValue = 1000u, args.flags = RtxOptionFlags::UserSetting);
+
     explicit RtxReflex(DxvkDevice* device);
     ~RtxReflex();
 
@@ -144,6 +164,25 @@ namespace dxvk {
     void updateMode();
 
     /**
+      * \brief: Applies rtx.frameRateLimit. Call it on the presenting thread right after the point where
+      * sleep() would run, and pass whether sleep() runs on this present path.
+      * Waits out the rest of the frame interval when neither Reflex nor the bridge client enforces the cap.
+      */
+    void limitFrameRate(bool reflexSleeps);
+
+    /**
+      * \brief: Returns the rate that pacePresent holds presents to, read on the presenting thread before the present is queued.
+      * Returns 0 when the cap is off or Reflex enforces it.
+      */
+    uint32_t presentFrameRateLimit() const;
+
+    /**
+      * \brief: Holds a queued present until one frame interval, less a small tolerance, has passed since the previous one.
+      * Call it on the thread that submits presents, once per presented frame, with the rate from presentFrameRateLimit.
+      */
+    void pacePresent(uint32_t limit);
+
+    /**
       * \brief: Gets latency stats from Reflex. Stats are initialized to all zeros when Reflex has not been initialized (due to
       * failing to initialize or due to being disabled), if stats fail to be acquired, or if Reflex has not run for enough
       * frames to generate reliable stats.
@@ -182,6 +221,20 @@ namespace dxvk {
     // Reflex starts in by default (low latency mode disabled and boost disabled, the documentation doesn't
     // say this anywhere but it is reasonable to assume).
     ReflexMode m_currentReflexMode = ReflexMode::None;
+
+    // The Reflex frame interval that limitFrameRate asks for and updateMode applies, in microseconds.
+    // 0 means Reflex does not limit the frame rate.
+    std::atomic<uint32_t> m_requestedIntervalUs = 0;
+    uint32_t m_currentIntervalUs = 0;
+
+    FrameRateLimiter m_frameRateLimiter = FrameRateLimiter::Off;
+    uint32_t m_loggedFrameRateLimit = 0;
+    // The limit last posted to the bridge client. UINT32_MAX means nothing has been posted yet.
+    uint32_t m_bridgeFrameRateLimit = UINT32_MAX;
+    // Waits on the presenting thread before the game's next frame.
+    std::unique_ptr<FramePacer> m_framePacer;
+    // Spaces the presents on the thread that submits them. Only pacePresent touches it.
+    std::unique_ptr<FramePacer> m_presentPacer;
 
     void setMarker(std::uint64_t frameId, std::uint32_t marker) const;
   };

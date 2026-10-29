@@ -87,8 +87,11 @@ namespace bridge_util {
     }
   }
 
-  // Determines the bytes per pixel for the given color format
-  static uint32_t getBytesFromFormat(const D3DFORMAT& format) {
+  constexpr uint32_t kUnknownFormatBytes = 0xFFFFFFFFu;
+
+  // Returns the bytes per pixel for the given color format.
+  // Returns kUnknownFormatBytes when the bridge does not know the format.
+  static uint32_t lookupBytesFromFormat(const D3DFORMAT& format) {
     switch (format) {
     case D3DFMT_DXT1:
       return 8;
@@ -154,6 +157,7 @@ namespace bridge_util {
     case D3DFMT_V16U16:
     case D3DFMT_A2W10V10U10:
     case D3DFMT_A2B10G10R10:
+    case D3DFMT_A2B10G10R10_XR_BIAS:
     case D3DFMT_A8B8G8R8:
     case D3DFMT_X8B8G8R8:
     case D3DFMT_G16R16:
@@ -210,10 +214,23 @@ namespace bridge_util {
       return 1;
 
     default:
+      return kUnknownFormatBytes;
+    }
+  }
+
+  // Returns true when the bridge can size surfaces of the given format.
+  static bool isKnownFormat(const D3DFORMAT& format) {
+    return lookupBytesFromFormat(format) != kUnknownFormatBytes;
+  }
+
+  // Determines the bytes per pixel for the given color format
+  static uint32_t getBytesFromFormat(const D3DFORMAT& format) {
+    const uint32_t bytes = lookupBytesFromFormat(format);
+    if (bytes == kUnknownFormatBytes) {
       Logger::err("Unknown D3DFORMAT passed for conversion: "+ std::to_string(static_cast<int>(format)));
       throw;
-      return 0;
     }
+    return bytes;
   }
 
   // Num pixels OR num compressed pixels

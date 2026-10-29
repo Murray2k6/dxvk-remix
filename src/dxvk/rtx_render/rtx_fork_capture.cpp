@@ -1,15 +1,5 @@
-// src/dxvk/rtx_render/rtx_fork_capture.cpp
-//
-// Fork-owned file. Contains the implementations of fork_hooks:: functions
-// for the GameCapturer capture path, lifted from rtx_game_capturer.cpp
-// during the 2026-04-18 fork touchpoint-pattern refactor.
-//
-// See docs/fork-touchpoints.md for the full fork-hooks catalogue.
-//
-// NOTE: captureMaterialApiPath accesses GameCapturer::m_exporter and
-// GameCapturer::m_pCap, which are private members. This file requires that
-// GameCapturer declare fork_hooks::captureMaterialApiPath as a friend —
-// see rtx_game_capturer.h.
+// The fork_hooks functions of the GameCapturer capture path (see rtx_fork_hooks.h).
+// captureMaterialApiPath accesses GameCapturer's private members, so GameCapturer names it a friend.
 
 // Replicate the BASE_DIR macro so the texture export paths resolve the same
 // way they do in rtx_game_capturer.cpp.
@@ -38,19 +28,9 @@
 namespace dxvk {
 namespace fork_hooks {
 
-  // ---------------------------------------------------------------------------
-  // captureMaterialApiPath
-  //
-  // Full implementation of GameCapturer::captureMaterial, handling both the
-  // standard D3D9 path (color texture valid — export directly) and the
-  // API-submitted path (no direct color texture — locate via texture-manager
-  // table by hash and export). Caches the populated lss::Material in
-  // GameCapturer::m_pCap->materials keyed by runtimeMaterialHash.
-  //
-  // ACCESS NOTE: this function reads GameCapturer::m_exporter and
-  // GameCapturer::m_pCap (both private). A friend declaration for this
-  // function is required in GameCapturer. See rtx_game_capturer.h.
-  // ---------------------------------------------------------------------------
+  // Implements GameCapturer::captureMaterial. A D3D9 material exports its color texture directly. An API material
+  // has none, so its albedo is found in the texture table by hash. The result is cached in
+  // GameCapturer::m_pCap->materials under runtimeMaterialHash.
   void captureMaterialApiPath(
       GameCapturer& capturer,
       const Rc<DxvkContext> ctx,
@@ -158,14 +138,8 @@ namespace fork_hooks {
     Logger::debug("[GameCapturer][" + capturer.m_pCap->idStr + "][Mat:" + matName + "] New");
   }
 
-  // ---------------------------------------------------------------------------
-  // captureCoordSystemSkip
-  //
-  // Applies the global coordinate-system transform for the USD export stage.
-  // When the game is configured as a left-handed coordinate system, the
-  // handedness inversion is skipped entirely: external API content is already
-  // in consistent Y-up space, so inverting would produce a wrong-handed result.
-  // ---------------------------------------------------------------------------
+  // Applies the global coordinate-system transform for the USD export stage. With rtx.leftHandedCoordinateSystem
+  // the handedness inversion is skipped, because external API content is already in consistent Y-up space.
   void captureCoordSystemSkip(lss::Export& exportPrep) {
     // For external API content with explicit left-handed coordinate system setting,
     // skip the coordinate transformation - it's already in consistent Y-up space.

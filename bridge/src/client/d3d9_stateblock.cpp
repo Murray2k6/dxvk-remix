@@ -64,8 +64,7 @@ HRESULT Direct3DStateBlock9_LSS::GetDevice(IDirect3DDevice9** ppDevice) {
   if (ppDevice == nullptr) {
     return D3DERR_INVALIDCALL;
   }
-  m_pDevice->AddRef();
-  (*ppDevice) = m_pDevice;
+  m_pDevice->reportDevice(ppDevice);
   return S_OK;
 }
 
@@ -208,9 +207,13 @@ HRESULT Direct3DStateBlock9_LSS::Capture() {
 
 HRESULT Direct3DStateBlock9_LSS::Apply() {
   LogFunctionCall();
+  // Same lock order as the setters: the client bridge mutex, then the channel (inside ClientMessage).
+  bridge_util::ResponseTransaction transaction;
   StateTransfer(m_dirtyFlags, m_captureState, m_pDevice->m_state);
   {
     ClientMessage { Commands::IDirect3DStateBlock9_Apply, getId() };
   }
+  // The server's state now holds the block's values; the sent-state shadow no longer knows it.
+  m_pDevice->invalidateSentState();
   return S_OK;
 }

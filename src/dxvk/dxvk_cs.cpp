@@ -6,6 +6,7 @@
 // NV-DXVK end
 
 #include "../tracy/TracyC.h"
+#include "../util/util_stress.h"
 
 namespace dxvk {
   
@@ -183,10 +184,13 @@ namespace dxvk {
           }
           
           if (m_chunksQueued.size() == 0) {
+            const auto idleStart = dxvk::high_resolution_clock::now();
             m_condOnAdd.wait(lock, [this] {
               return (m_chunksQueued.size() != 0)
                   || (m_stopped.load());
             });
+            m_device->addStatCtr(DxvkStatCounter::CsIdleTicks,
+              std::chrono::duration_cast<std::chrono::microseconds>(dxvk::high_resolution_clock::now() - idleStart).count());
           }
           
           if (m_chunksQueued.size() != 0) {
@@ -197,7 +201,12 @@ namespace dxvk {
         
         if (chunk) {
           m_context->addStatCtr(DxvkStatCounter::CsChunkCount, 1);
+          stress::delay(stress::Site::CsChunk);
+          const auto t0 = dxvk::high_resolution_clock::now();
           chunk->executeAll(m_context.ptr());
+          const auto t1 = dxvk::high_resolution_clock::now();
+          m_device->addStatCtr(DxvkStatCounter::CsExecTicks,
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
         }
       }
     } catch (const DxvkError& e) {

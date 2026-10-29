@@ -21,7 +21,7 @@
 #############################################################################
 
 d3d9_version = vcs_tag(
-  command: [python_interpreter.full_path(), global_src_root_norm + './scripts-common/echo.py', full_version],
+  command: vcs_version_command,
   input:   'version.rc.in',
   output:  'version.rc')
 

@@ -102,11 +102,10 @@ struct BlasEntry;
 class RtInstance;
 struct RaytraceGeometry;
 struct MaterialData;
-struct DrawCallState;
+struct SceneDraw;
 struct LegacyMaterialData;
 
-// Forward decls so GameCapturer can friend the fork hook that needs access
-// to private m_exporter and m_pCap state. See docs/fork-touchpoints.md.
+// Declared here so GameCapturer can befriend the hook, which uses m_exporter and m_pCap.
 class GameCapturer;
 namespace fork_hooks {
   void captureMaterialApiPath(
@@ -120,9 +119,6 @@ namespace fork_hooks {
 
 class GameCapturer : public RcObject
 {
-  // Fork touchpoint: the capture material API-path hook needs access to
-  // private m_exporter and m_pCap. Tracked as an inline tweak in
-  // docs/fork-touchpoints.md.
   friend void fork_hooks::captureMaterialApiPath(
     GameCapturer&, const Rc<DxvkContext>, const RtInstance&,
     XXH64_hash_t, const LegacyMaterialData&, bool);
@@ -134,6 +130,20 @@ public:
                 "to all have identity xform matrices, enabling will attempt to correct this and\n"
                 "improve stage + mesh viewability in tools.\n"
                 "Hashes are unaffected.");
+  RTX_OPTION("rtx.capture", float, maxInstanceDistance, 0.f,
+                "Captures only instances whose bounds come within this distance of the camera, in world units. 0 "
+                "captures everything. Large open worlds submit thousands of distant instances (LODs and far cells) that "
+                "make captures slow and heavy to open. A skipped instance is simply absent from the capture, and hashes "
+                "are unaffected.");
+  RTX_OPTION("rtx.capture", float, metersPerUnit, 0.f,
+                "The size of one world unit in metres, written as the capture stage's metersPerUnit so that tools such "
+                "as the RTX Remix Toolkit show the scene at its real size. Set it when rtx.sceneScale is tuned for the "
+                "look rather than set to the true size of a world unit. 0 writes rtx.sceneScale.");
+  RTX_OPTION("rtx.capture", uint32_t, maxHostInstancesPerDraw, 512,
+                "A draw that the host GPU-instances through the Remix API (batched statics, grass) is captured as one "
+                "instance prim per placement, so modders can see where its replacements will appear. This limits the "
+                "prims per such draw, keeping the placements nearest the camera. 0 captures every placement. "
+                "Replacements apply to all placements either way.");
 
   GameCapturer(DxvkDevice* const pDevice, SceneManager& sceneManager, AssetExporter& exporter);
   ~GameCapturer();
@@ -229,6 +239,11 @@ private:
   void captureDistantLight(const RtDistantLight& rtLight);
   void captureInstances(const Rc<DxvkContext> ctx);
   void newInstance(const Rc<DxvkContext> ctx, const RtInstance& rtInstance);
+  // instanceKey: the capture's instance id (the RtInstance id, or one per host placement).
+  void newInstance(const Rc<DxvkContext> ctx, const RtInstance& rtInstance, const XXH64_hash_t instanceKey);
+  // A draw GPU-instanced by the host: one captured instance per placement (see maxHostInstancesPerDraw).
+  void captureHostInstances(const Rc<DxvkContext> ctx, const RtInstance& rtInstance, const uint8_t instanceFlags);
+  pxr::GfMatrix4d instanceXformCorrection() const;
   void captureMaterial(const Rc<DxvkContext> ctx, const RtInstance& rtInstance, const XXH64_hash_t runtimeMaterialHash, const LegacyMaterialData& materialData, const bool bEnableOpacity);
   void captureMesh(const Rc<DxvkContext> ctx,
                    const XXH64_hash_t currentMeshHash,

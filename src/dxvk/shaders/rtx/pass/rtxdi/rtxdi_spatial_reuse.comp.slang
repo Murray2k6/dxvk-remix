@@ -69,18 +69,18 @@
 #endif
 #include "rtx/pass/sparse_rendering/compact_active_pixels.slangh"
 
+// The pass can be launched over the active-pixel list, which counts groups of the consumer group size.
+#if COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE_X != 16 || COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE_Y != 8
+#error "The RTXDI passes run 16x8 groups, which must match COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE_X / _Y."
+#endif
+
 [shader("compute")]
 [numthreads(16, 8, 1)]
 void main(int2 threadIndex : SV_DispatchThreadID)
 {
-  if (any(threadIndex >= cb.camera.resolution))
-  {
-    return;
-  }
-
   uvec2 remapped;
-  const bool isActive = loadPixelCoordinate(uint2(threadIndex), DirectActiveLocalPixelCoords,
-    cb.camera.resolution, cb.sparseRenderingArgs, remapped);
+  const bool isActive = loadLaunchPixelCoordinate(uint2(threadIndex), ActiveLocalPixelCoords, ActivePixelList,
+    cb.camera.resolution, cb.sparseRenderingArgs, COMPACT_ACTIVE_PIXELS_LAUNCH_RTXDI_REUSE, remapped);
   int2 pixelCoordinate = int2(remapped);
 
   if (!isActive) {

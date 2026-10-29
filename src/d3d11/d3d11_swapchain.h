@@ -74,6 +74,19 @@ namespace dxvk {
       const DXGI_MODE_DESC*           pDisplayMode);
 
   private:
+    // NV-DXVK start: Frame ownership comes from native API composition
+    bool m_remixPresent = false;
+    bool m_remixWindowHooked = false;
+    bool m_remixOverlayPrimed = false;
+    uint64_t m_remixFrameId = 0;
+    // The rtx.reflexD3D11Markers value latched for this present, and the Reflex sleep
+    // that ran after the previous Remix present (ms; -1 = none), which the trace CSV gets with this one.
+    bool m_reflexMarkers = false;
+    float m_lastReflexSleepMs = -1.0f;
+    // Effective frame latency last logged (0 = never)
+    uint32_t m_loggedFrameLatency = 0;
+    // NV-DXVK end
+
 
     enum BindingIds : uint32_t {
       Image = 0,
@@ -119,7 +132,8 @@ namespace dxvk {
     void SubmitPresent(
             D3D11ImmediateContext*  pContext,
       const vk::PresenterSync&      Sync,
-            uint32_t                FrameId);
+            uint32_t                FrameId,
+            uint32_t                AcquiredImageIndex);
 
     void SynchronizePresent();
 

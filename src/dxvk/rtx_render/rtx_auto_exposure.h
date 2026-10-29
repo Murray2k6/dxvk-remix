@@ -34,6 +34,10 @@ namespace dxvk {
 
   class DxvkDevice;
 
+  // Auto exposure: the incident-light meter of the halocedlaart Halo CE path tracer addon (composite.hlsl's
+  // Meter / MeterResolve). Each pixel's lighting (albedo divided out) is metered as its channel average, the
+  // center-weighted log mean of that drives the exposure, limited in EV and adapted at the same speed at any
+  // frame rate. Remix adds sky weighting, a mean floor, a coverage hold and an EV compensation curve.
   class DxvkAutoExposure: public CommonDeviceObject {
   public:
     explicit DxvkAutoExposure(DxvkDevice* device);
@@ -53,64 +57,104 @@ namespace dxvk {
 
   private:
 
-    void dispatchAutoExposure(
+    void dispatchHaloMeter(
       Rc<DxvkContext> ctx,
-      Rc<DxvkSampler> linearSampler,
       const Resources::RaytracingOutput& rtOutput,
       const float frameTimeMilliseconds);
 
+    void createHaloPartials(Rc<DxvkContext> ctx, uint32_t groupsX, uint32_t groupsY);
+
     Rc<vk::DeviceFn> m_vkd;
 
+    // The adapted exposure the tonemapper multiplies in (1x1 R32F).
     Resources::Resource m_exposure;
-    Resources::Resource m_exposureHistogram;
+
+    // One float4 (sum w*log, sum w, surface center weight, total center weight) per 16x16 tile, and the
+    // adapted exposure + "has metered" flag carried between frames (the addon's meterState).
+    Resources::Resource m_haloPartials;
+    Resources::Resource m_haloState;
+    uint32_t m_haloPartialsX = 0;
+    uint32_t m_haloPartialsY = 0;
 
     bool m_resetState = true;
+    bool m_haloResetState = true;
 
-    // Eye-adaptation settings.
-    //
-    // Perceptual auto-exposure pipeline (replaces the prior
-    // Naka-Rushton resolve):
-    //   1. Per-pixel CIE 170-2 luminosity Yf (Stockman-Sharpe LMS,
-    //      shared with the psycho17 tonemap operator) is binned into a
-    //      log2-Yf histogram.
-    //   2. The resolve pass takes a geometric (log) mean across bins,
-    //      giving the adapted scene Yf level the observer model would
-    //      settle on.
-    //   3. The target exposure scale is computed from a first-site
-    //      cone-contrast law, exposure = Y_target / (Y_adapt + Y_noise)
-    //      (Stockman & Brainard 2010), with Y_target = mid-gray (0.18)
-    //      and Y_noise = the cone-system noise floor. This caps the
-    //      dark-scene boost without an arbitrary clamp.
-    //   4. The stored exposure is advanced toward that target in
-    //      log-space with asymmetric exponential dynamics — light_tau
-    //      while brightening (cone-bleach), dark_tau while dimming
-    //      (rod-recovery). Log-space blending makes the tau invariant
-    //      to absolute scene level.
-    //
-    // The exposure scalar this produces is consumed by every tonemap
-    // operator. The psycho17 operator additionally reads it back as an
-    // adaptive-state hint (in BT.709 mid-gray space) for its cone-
-    // response stage; the other operators ignore that channel.
     RTX_OPTION("rtx.autoExposure", bool, enabled, true,
-               "Automatically adjusts exposure so the image is neither too bright nor too dark. "
-               "Uses a perceptual observer model (geometric-mean Yf + first-site cone contrast).");
-    RTX_OPTION("rtx.autoExposure", float, lightAdaptTau, 0.15f,
-               "Photopic (light) adaptation time constant in seconds. "
-               "Controls how quickly the eye dims down when the scene brightens. "
-               "Smaller = faster response. Typical range: 0.05 – 0.50 s.");
-    RTX_OPTION("rtx.autoExposure", float, darkAdaptTau, 0.75f,
-               "Scotopic (dark) adaptation time constant in seconds. "
-               "Controls how slowly the eye brightens up when the scene dims. "
-               "Larger = slower response. Typical range: 0.25 – 3.00 s.");
-    RTX_OPTION("rtx.autoExposure", float, targetAdaptedYf, 0.18f,
-               "Adaptation target Yf (mid-gray reflectance, default 0.18). "
-               "After exposure is applied the scene's geometric-mean Yf lands here. "
-               "Raise above 0.18 to bias the image brighter; lower to darken it.");
-    RTX_OPTION("rtx.autoExposure", float, maxExposure, 8.0f,
-               "Maximum auto-exposure multiplier. Caps how much the algorithm is allowed "
-               "to brighten the image when looking at something dark (1.0 = no brightening, "
-               "8.0 = up to 8x brighter, ~56 = uncapped default behaviour). Lower this if "
-               "shadows / dark rooms get blown out into mid-gray.");
+               "Adjusts exposure automatically, so the image is neither too bright nor too dark. The meter is the "
+               "incident-light meter of the Halo CE path tracer addon by halocedlaart (rtx.autoExposure.halo.*): a "
+               "center-weighted mean of each pixel's lighting channel average, with albedo divided out and the view "
+               "model excluded, limited in EV and adapted at the same speed at any frame rate. "
+               "rtx.tonemap.exposureBias adds an EV offset on top.");
+
+    // Meter parameters. Names, defaults and ranges are the addon's
+    // (addon.cpp: AutoExposureTarget / Speed / Centre / MinEv / MaxEv).
+    RTX_OPTION("rtx.autoExposure.halo", float, target, 0.2f,
+               "Halo Meter: the brightness the metered frame is driven to, as how bright an 18% grey card in this light "
+               "comes out. 0.18 is a photographic grey card. Lower values give a darker, more contrasted image. The "
+               "addon allows 0.02 to 0.6.");
+    RTX_OPTION("rtx.autoExposure.halo", float, speed, 2.0f,
+               "Halo Meter: adaptation speed. Each frame moves exposure 1 - exp(-dt * speed) of the way to its target, "
+               "with dt the frame time in seconds (at most 0.25), so it adapts the same at any frame rate. The addon "
+               "allows 0.1 to 16.");
+    RTX_OPTION("rtx.autoExposure.halo", float, centreWeight, 0.75f,
+               "Halo Meter: how much more the middle of the frame counts than the edges. 0 meters the whole frame "
+               "evenly, 1 ignores the edges entirely. The falloff is a circle in units of half the frame height, "
+               "centered 10% of the frame height below the middle so the sky at the top counts less.");
+    RTX_OPTION("rtx.autoExposure.halo", float, minEv, -16.0f,
+               "Halo Meter: the lowest exposure, in stops. The addon allows -24 to 0.");
+    RTX_OPTION("rtx.autoExposure.halo", float, maxEv, 4.0f,
+               "Halo Meter: the highest exposure, in stops. 4 (16x) suits a game in its own light units and keeps dark "
+               "interiors and nights from being lifted into noise. The addon uses 8 (256x). A game calibrated to "
+               "physical units through a sky provider (NUMOS, where scene EV100 is about meter EV + 16) needs about 16, "
+               "and keeps nights and interiors dark with the compensation curve (rtx.autoExposure.halo.compensation*). "
+               "Range 0 to 24.");
+    RTX_OPTION("rtx.autoExposure.halo", bool, demodulateAlbedo, true,
+               "Halo Meter: meters the lighting rather than the image. Each pixel is divided by its albedo (at least "
+               "0.05) and multiplied by 0.18, so dark and pale textures under the same light meter the same. Sky pixels "
+               "count as albedo 1. This is the addon's behaviour. Turn it off only to compare.");
+    RTX_OPTION("rtx.autoExposure.halo", bool, excludeViewModel, true,
+               "Halo Meter: ignores view model pixels (the first-person weapon and hands), like the addon's "
+               "first-person meter mask.");
+    RTX_OPTION("rtx.autoExposure.halo", float, skyWeightMax, 1.0f,
+               "Halo Meter: the metering weight of a bright sky pixel relative to scene surfaces. The weight fades with "
+               "the sky's own brightness between rtx.autoExposure.halo.skyLumLow and skyLumHigh, so a day sky counts, "
+               "dusk less and a night sky barely at all. Otherwise a night sky meters as near-black and pushes exposure "
+               "to its maximum. 0 = never meter the sky.");
+    RTX_OPTION("rtx.autoExposure.halo", float, skyLumLow, 0.01f,
+               "Halo Meter: sky radiance (the linear channel average, before exposure) at or below which a sky pixel "
+               "has no metering weight.");
+    RTX_OPTION("rtx.autoExposure.halo", float, skyLumHigh, 0.1f,
+               "Halo Meter: sky radiance at or above which a sky pixel has the full rtx.autoExposure.halo.skyWeightMax "
+               "weight. Set it at or below skyLumLow for full weight at any brightness.");
+    RTX_OPTION("rtx.autoExposure.halo", float, meanFloorEv, -24.0f,
+               "Halo Meter: the darkest scene the meter believes, in stops (log2 of the metered grey-card level). "
+               "Exposure can then never exceed target / 2^meanFloorEv, however dark the frame, which acts as a second "
+               "exposure limit in scene terms. -24 = off, so rtx.autoExposure.halo.maxEv is the only limit. With a "
+               "physically calibrated sky (NUMOS), values above about -20 hold every night at a fixed exposure. In a "
+               "game's own units it only matters if set above log2(target) - maxEv.");
+    RTX_OPTION("rtx.autoExposure.halo", float, minCoverage, 0.05f,
+               "Halo Meter: holds the current exposure while less than this fraction of the centre-weighted frame is "
+               "scene surface (not sky or view model), for example when looking straight up at a night sky. 0 = never "
+               "hold. Range 0 to 0.5.");
+    RTX_OPTION("rtx.autoExposure.halo", float, compensationNightStops, 0.0f,
+               "Halo Meter compensation curve: the exposure bias, in stops, for scenes at or below "
+               "rtx.autoExposure.halo.compensationNightEv (the EV100 of the metered grey card). It fades linearly to 0 "
+               "at rtx.autoExposure.halo.compensationDayEv. Negative values keep nights darker than mid grey, as they "
+               "look to the eye (about -2 to -4). 0 = no curve.");
+    RTX_OPTION("rtx.autoExposure.halo", float, compensationNightEv, 0.0f,
+               "Halo Meter compensation curve: the scene EV100 at and below which the full "
+               "rtx.autoExposure.halo.compensationNightStops applies. A moonlit landscape is about -2 to -3, deep "
+               "twilight or a street under lamps about 0 to 4. EV100 needs a calibrated sky provider (NUMOS). Without "
+               "one it is measured in Remix units.");
+    RTX_OPTION("rtx.autoExposure.halo", float, compensationDayEv, 12.0f,
+               "Halo Meter compensation curve: the scene EV100 at and above which no compensation applies. An interior "
+               "is about 5 to 7, an overcast day 12 and sunlight 15. With the night at EV 0 and the day at 12, a dim "
+               "interior gets about half the night bias, so it stays darker than mid grey.");
+    RTX_OPTION("rtx.autoExposure.halo", bool, addonFaithful, false,
+               "Halo Meter: uses the addon's exact sky handling: the sky metered at albedo 1 with full weight at any "
+               "brightness, no mean floor and no hold. Overrides rtx.autoExposure.halo.skyWeightMax, skyLumLow, "
+               "skyLumHigh, meanFloorEv and minCoverage. Use it with rtx.autoExposure.halo.maxEv = 8 for the addon's "
+               "limit.");
   };
-  
+
 }

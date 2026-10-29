@@ -69,20 +69,6 @@ namespace dxvk {
   
   
   /**
-   * \brief Render pass barrier
-   * 
-   * External subpass dependency that is to be
-   * executed after a render pass has completed.
-   */
-  struct DxvkRenderPassBarrier {
-    VkPipelineStageFlags  srcStages = 0;
-    VkAccessFlags         srcAccess = 0;
-    VkPipelineStageFlags  dstStages = 0;
-    VkAccessFlags         dstAccess = 0;
-  };
-  
-  
-  /**
    * \brief Render pass transitions
    * 
    * Stores transitions for all depth and color attachments.
@@ -90,7 +76,6 @@ namespace dxvk {
    * from a group of render passes with the same format.
    */
   struct DxvkRenderPassOps {
-    DxvkRenderPassBarrier  barrier;
     DxvkDepthAttachmentOps depthOps;
     DxvkColorAttachmentOps colorOps[MaxNumRenderTargets];
   };

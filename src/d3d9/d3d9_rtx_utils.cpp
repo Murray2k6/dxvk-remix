@@ -13,6 +13,24 @@
 #include "../util/util_math.h"
 
 namespace dxvk {
+  namespace {
+    Vector4 toVector4(const D3DCOLORVALUE& c) {
+      return Vector4(c.r, c.g, c.b, c.a);
+    }
+
+    FixedFunctionMaterial toFixedFunctionMaterial(const D3DMATERIAL9& material) {
+      FixedFunctionMaterial result;
+      result.diffuse = toVector4(material.Diffuse);
+      result.ambient = toVector4(material.Ambient);
+      result.specular = toVector4(material.Specular);
+      result.emissive = toVector4(material.Emissive);
+      result.power = material.Power;
+      return result;
+    }
+  }
+
+  static_assert(sizeof(FixedFunctionMaterial) == sizeof(D3DMATERIAL9));
+
   bool getMinMaxBoneIndices(const uint8_t* pBoneIndices, uint32_t stride, uint32_t vertexCount, uint32_t numBonesPerVertex, int& minBoneIndex, int& maxBoneIndex) {
     ScopedCpuProfileZone();
     if (vertexCount == 0)
@@ -217,12 +235,17 @@ namespace dxvk {
     m.alphaSrcFactor = NormalizeFactor(m.alphaSrcFactor);
     m.alphaDstFactor = NormalizeFactor(m.alphaDstFactor);
 
-    materialData.d3dMaterial = d3d9State.material;
+    materialData.fixedFunctionMaterial = toFixedFunctionMaterial(d3d9State.material);
 
     // Allow the users to configure vertex color as baked lighting for legacy draw calls.
     materialData.isVertexColorBakedLighting = RtxOptions::vertexColorIsBakedLighting();
   }
 
+
+  // The neutral fog modes take D3DFOGMODE's values. A render state holds any DWORD, and an unknown value converts
+  // unchanged, so the fog hash keeps its bits.
+  static_assert(uint32_t(frontend::FogMode::None) == D3DFOG_NONE && uint32_t(frontend::FogMode::Exp) == D3DFOG_EXP &&
+                uint32_t(frontend::FogMode::Exp2) == D3DFOG_EXP2 && uint32_t(frontend::FogMode::Linear) == D3DFOG_LINEAR);
 
   void setFogState(D3D9DeviceEx* pDevice, FogState& fogState) {
     const Direct3DState9& d3d9State = *pDevice->GetRawState();
@@ -234,13 +257,13 @@ namespace dxvk {
       float end = bit::cast<float>(d3d9State.renderStates[D3DRS_FOGEND]);
       float start = bit::cast<float>(d3d9State.renderStates[D3DRS_FOGSTART]);
 
-      fogState.mode = d3d9State.renderStates[D3DRS_FOGTABLEMODE] != D3DFOG_NONE ? d3d9State.renderStates[D3DRS_FOGTABLEMODE] : d3d9State.renderStates[D3DRS_FOGVERTEXMODE];
+      fogState.mode = static_cast<frontend::FogMode>(d3d9State.renderStates[D3DRS_FOGTABLEMODE] != D3DFOG_NONE ? d3d9State.renderStates[D3DRS_FOGTABLEMODE] : d3d9State.renderStates[D3DRS_FOGVERTEXMODE]);
       fogState.color = color.xyz();
       fogState.scale = 1.0f / (end - start);
       fogState.end = end;
       fogState.density = bit::cast<float>(d3d9State.renderStates[D3DRS_FOGDENSITY]);
     } else {
-      fogState.mode = D3DFOG_NONE;
+      fogState.mode = frontend::FogMode::None;
     }
   }
 }

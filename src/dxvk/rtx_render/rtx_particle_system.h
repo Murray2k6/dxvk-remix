@@ -52,6 +52,10 @@ namespace dxvk {
       uint32_t instanceId;
       XXH64_hash_t particleSystemHash;
       uint32_t particleOffset;
+      // RtInstance::getId() of the emitter, captured at spawn time. instanceId above is a slot index that
+      // garbageCollection() can invalidate before writeSpawnContextsToGpu reads it, and the id survives
+      // the reindex (see fork_hooks::resolveSpawnEmitterInstance).
+      uint64_t instanceUid;
     };
 
     class ConservativeCounter : public RcObject {
@@ -169,17 +173,11 @@ namespace dxvk {
 
     Rc<DxvkBuffer> m_cb;
 
-    // Fork (2026-07-25): spawn-occlusion diagnostics. The spawn kernel bumps
-    // four counters (rays traced / shelter kills / landing hits / shelter
-    // relocations) into a tiny GPU buffer; each frame the buffer is copied
-    // into one slot of a 10-frames-in-flight host ring (the same delay
-    // contract ConservativeCounter uses) and the oldest slot - guaranteed
-    // retired - is published to the static atomics for the Precipitation dev
-    // panel to read. This exists because the occlusion feature failed silently
-    // on its first in-game test: with these numbers on screen, "no occlusion"
-    // immediately separates into "trace not running" (rays == 0) vs "trace
-    // running but nothing reachable to hit" (rays > 0, hits == 0), which are
-    // entirely different bug classes.
+    // Spawn-occlusion diagnostics. The spawn kernel bumps four counters (rays traced, shelter kills,
+    // landing hits, shelter relocations) in a GPU buffer. Each frame it is copied into one slot of a
+    // 10-frames-in-flight host ring, as ConservativeCounter does, and the oldest, retired slot is published
+    // to the static atomics for the Precipitation dev panel. Rays == 0 means the trace is not running, and
+    // rays > 0 with hits == 0 means it has nothing to hit.
     static constexpr uint32_t kSpawnTraceStatsCount = 4;
     static constexpr uint32_t kSpawnTraceStatsFramesInFlight = 10;
     Rc<DxvkBuffer> m_spawnTraceStatsGpu;
@@ -272,9 +270,9 @@ namespace dxvk {
 
     void prepareForNextFrame();
 
-    bool fetchParticleSystem(DxvkContext* ctx, const DrawCallState& drawCallState, RtxParticleSystemDesc desc, const MaterialData& renderMaterialData, ParticleSystem** materialSystem);
+    bool fetchParticleSystem(DxvkContext* ctx, const SceneDraw& drawCallState, RtxParticleSystemDesc desc, const MaterialData& renderMaterialData, ParticleSystem** materialSystem);
 
-    static uint32_t getNumberOfParticlesToSpawn(ParticleSystem* materialSystem, const DrawCallState& drawCallState);
+    static uint32_t getNumberOfParticlesToSpawn(ParticleSystem* materialSystem, const SceneDraw& drawCallState);
 
   public:
     RtxParticleSystemManager(DxvkDevice* device);
@@ -300,10 +298,13 @@ namespace dxvk {
       * \param ctx                Command list to perform any potential allocation clears with.
       * \param desc               Description for the particle system.
       * \param instanceIdx        This is the index into the vector of instances held by instance manager.
+      * \param instanceUid        RtInstance::getId() of that same instance. The index above does not
+      *                           survive the instance vector being swap-compacted by garbage collection
+      *                           later in the frame; this stable id does.
       * \param drawCallState      The current draw call state referencing material info.
       * \param renderMaterialData The material preference to apply to particle system
       */
-    void spawnParticles(DxvkContext* ctx, const RtxParticleSystemDesc& desc, const uint32_t instanceIdx, const DrawCallState& drawCallState, const MaterialData& overrideMaterial);
+    void spawnParticles(DxvkContext* ctx, const RtxParticleSystemDesc& desc, const uint32_t instanceIdx, const uint64_t instanceUid, const SceneDraw& drawCallState, const MaterialData& overrideMaterial);
 
     /**
       * Issues the draw state (vertex buffer, index buffer) for rendering particles
@@ -324,9 +325,8 @@ namespace dxvk {
       */
     void simulate(RtxContext* ctx);
 
-    // Fork (2026-07-25): read-only spawn-occlusion diagnostics for dev UI
-    // (see the m_spawnTraceStats* members for why these exist). Values are a
-    // few frames stale by construction - fine for a readout.
+    // Read-only spawn-occlusion diagnostics for the dev UI (see the m_spawnTraceStats* members).
+    // The values are a few frames old.
     struct SpawnTraceDiagnostics {
       uint32_t raysTraced;
       uint32_t shelterKills;

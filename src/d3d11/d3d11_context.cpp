@@ -1019,7 +1019,9 @@ namespace dxvk {
     if (DstSubresource >= dstTextureInfo->CountSubresources()
      || SrcSubresource >= srcTextureInfo->CountSubresources())
       return;
-    
+
+    NotifyRemixSharedWrite(dstTextureInfo);  // NV-DXVK
+
     const VkImageSubresource dstSubresource =
       dstTextureInfo->GetSubresourceFromIndex(
         dstVulkanFormatInfo->aspectMask, DstSubresource);
@@ -3291,6 +3293,28 @@ namespace dxvk {
   }
 
 
+  // NV-DXVK start: Deferred initial-upload submit for Remix host imports
+  void D3D11DeviceContext::FlushRemixInitUploads() {
+    m_parent->FlushInitContext();
+  }
+  // NV-DXVK end
+
+
+  // NV-DXVK start: Remix host import copy-on-write
+  void D3D11DeviceContext::NotifyRemixSharedWrite(
+          D3D11CommonTexture*               pDstTexture) {
+    // Remix samples this image in place. Before the first write reaches it,
+    // queue Remix's copy of what it holds now; the write is emitted after
+    // this on the same CS thread, so the copy sees the old contents.
+    if (unlikely(pDstTexture->TakeRemixShared())) {
+      EmitCs([cImage = pDstTexture->GetImage()] (DxvkContext* ctx) {
+        remixHostImportCopyOnWrite(ctx, cImage);
+      });
+    }
+  }
+  // NV-DXVK end
+
+
   void D3D11DeviceContext::CopyImage(
           D3D11CommonTexture*               pDstTexture,
     const VkImageSubresourceLayers*         pDstLayers,
@@ -3299,6 +3323,8 @@ namespace dxvk {
     const VkImageSubresourceLayers*         pSrcLayers,
           VkOffset3D                        SrcOffset,
           VkExtent3D                        SrcExtent) {
+    NotifyRemixSharedWrite(pDstTexture);
+
     // Image formats must be size-compatible
     auto dstFormatInfo = imageFormatInfo(pDstTexture->GetPackedFormat());
     auto srcFormatInfo = imageFormatInfo(pSrcTexture->GetPackedFormat());
@@ -3673,6 +3699,10 @@ namespace dxvk {
           VkExtent3D                        DstExtent,
           DxvkBufferSlice                   StagingBuffer) {
     bool dstIsImage = pDstTexture->GetMapMode() != D3D11_COMMON_TEXTURE_MAP_MODE_STAGING;
+
+    if (dstIsImage) {
+      NotifyRemixSharedWrite(pDstTexture);
+    }
 
     uint32_t dstSubresource = D3D11CalcSubresource(pDstSubresource->mipLevel,
       pDstSubresource->arrayLayer, pDstTexture->Desc()->MipLevels);

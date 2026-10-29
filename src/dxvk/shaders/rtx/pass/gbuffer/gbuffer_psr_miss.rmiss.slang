@@ -38,19 +38,6 @@
 //!>       ENABLE_NRC=1
 //!>       UNORDERED_RESOLVE_WBOIT
 
-
-// Atmosphere variants
-
-
-// NRC
-
-
-// WBOIT
-
-
-// NRC
-
-
 //!end-variants
 #define ATMOSPHERE_AVAILABLE
 

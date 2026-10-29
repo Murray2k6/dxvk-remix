@@ -4,6 +4,7 @@
 #include "d3d9_format.h"
 #include "../dxvk/dxvk_buffer.h"
 #include "../util/util_memoization.h"
+#include "../frontends/translator/resource_stamp.h"
 
 namespace dxvk {
 
@@ -216,7 +217,26 @@ namespace dxvk {
     };
     using RemixIboMemoizer = MemoryRegionMemoizer<RemixIndexBufferMemoizationData>;
     RemixIboMemoizer remixMemoization;
+
+    // Bumped wherever remixMemoization is invalidated, i.e. on every CPU write-lock of this
+    // buffer. Callers that want to know "has this buffer's content changed since I last looked"
+    // without re-reading it can compare this counter. It intentionally shares the invalidation
+    // hooks of the memoizer above so the two can never disagree about what is stale.
+    // Values come from one process-wide counter (nextRemixContentVersion), so a new buffer created
+    // at a freed buffer's address never repeats a (pointer, version) pair the geometry hash memo
+    // (D3D9Rtx::buildGeometryHashMemoizationKey) keys on.
+    static uint64_t nextRemixContentVersion() {
+      static std::atomic<uint64_t> s_counter { 0 };
+      return s_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+    uint64_t remixContentVersion = nextRemixContentVersion();
     // NV-DXVK end
+
+    // D3D9 v2: never-reused object id; the version is remixContentVersion.
+    uint64_t remixResourceId = translator::nextStamp();
+    // Counts the honoured D3DLOCK_DISCARD locks. A buffer discarded more than once is a ring the CPU refills, so the
+    // D3D9 v2 frontend treats its draws as dynamic sources (a single discard is often just the initial fill).
+    uint32_t remixDiscards = 0;
 
   private:
 

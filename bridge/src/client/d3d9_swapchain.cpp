@@ -25,6 +25,12 @@
 #include "d3d9_surface.h"
 #include "d3d9_surfacebuffer_helper.h"
 #include "swapchain_map.h"
+#include "../../../src/util/util_frame_pacer.h"
+
+#include <atomic>
+
+// Defined in message_channels.cpp.
+extern std::atomic<uint32_t> gFrameRateLimit;
 
 extern std::mutex gSwapChainMapMutex;
 extern SwapChainMap gSwapChainMap;
@@ -184,6 +190,20 @@ HRESULT Direct3DSwapChain9_LSS::Present(CONST RECT* pSourceRect, CONST RECT* pDe
     return ERROR_SEM_TIMEOUT;
   }
 
+  // The frame rate limit waits after the server has caught up and before the game samples input for its next frame.
+  {
+    ZoneScopedN("FrameRateLimit_Wait");
+    static dxvk::FramePacer framePacer;
+    framePacer.waitForFrameStart(gFrameRateLimit.load());
+
+    std::string report;
+    if (framePacer.takeReport("bridge client wait", report)) {
+      Logger::info(report);
+    }
+  }
+
+  DeviceBridge::perfOnFrame();
+
   FrameMark;
 
   return D3D_OK;
@@ -194,6 +214,8 @@ HRESULT Direct3DSwapChain9_LSS::GetFrontBufferData(IDirect3DSurface9* pDestSurfa
 
   const auto pLssDestinationSurface = bridge_cast<Direct3DSurface9_LSS*>(pDestSurface);
   const auto pIDestinationSurface = pLssDestinationSurface->D3D<IDirect3DSurface9>();
+
+  DeviceBridge::ResponseTransaction responseTransaction;
 
   UID currentUID = 0;
   {
@@ -235,6 +257,8 @@ HRESULT Direct3DSwapChain9_LSS::GetBackBuffer(UINT iBackBuffer, D3DBACKBUFFER_TY
   setChild(iBackBuffer, pLssSurface);
     
   (*ppBackBuffer) = pLssSurface;
+
+  DeviceBridge::ResponseTransaction responseTransaction;
 
   UID currentUID = 0;
   // Add handles for backbuffer
@@ -297,8 +321,7 @@ HRESULT Direct3DSwapChain9_LSS::GetDevice(IDirect3DDevice9** ppDevice) {
   if (ppDevice == nullptr) {
     return D3DERR_INVALIDCALL;
   }
-  m_pDevice->AddRef();
-  (*ppDevice) = m_pDevice;
+  m_pDevice->reportDevice(ppDevice);
   return D3D_OK;
 }
 

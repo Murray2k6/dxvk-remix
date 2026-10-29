@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -22,10 +22,14 @@
 #pragma once
 
 #include "rtx_resources.h"
+#include "rtx_option.h"
 
 namespace dxvk {
 
   class DxvkDevice;
+  struct RtFrameFeatures;
+  struct VariantTableSelfCheckResult;
+  class RtxContext;
 
   class DxvkPathtracerIntegrateDirect : public CommonDeviceObject {
   public:
@@ -33,6 +37,19 @@ namespace dxvk {
       RayQuery = 0,
       RayQueryRayGen,
       Count
+    };
+
+    // Which compile-time slice of the direct integrator (CS RayQuery path) a frame can use.
+    // The Lean levels run as a shade kernel and a trace kernel over a per-pixel record.
+    enum class SlimLevel {
+      Full = 0, // diffusion-profile SSS compiled in (255 regs on Blackwell)
+      NoSss,    // INTEGRATE_DIRECT_SSS_PROFILE=0: no diffusion-profile SSS instance in this frame's TLAS (163 regs)
+      Lean,     // + INTEGRATE_DIRECT_LEAN_VISIBILITY=1: no translucent / thin-opaque shadow-ray hits possible
+      // Lean with the NEE cutout candidates read from the core material
+      // record (VISIBILITY_CORE_MATERIAL): LeanCore applies only the TextureOps part of the legacy record (no surface with
+      // other legacy state this frame), LeanLegacy the whole LegacySurface record.
+      LeanCore,
+      LeanLegacy,
     };
 
     explicit DxvkPathtracerIntegrateDirect(DxvkDevice* device);
@@ -44,8 +61,41 @@ namespace dxvk {
 
     static const char* raytraceModeToString(RaytraceMode raytraceMode);
 
+    // Exhaustive check of the variant table against selectSlimLevel (rtx_fork_variant_tables.h).
+    static void runVariantTableSelfCheck(VariantTableSelfCheckResult& result);
+
   private:
-    static DxvkRaytracingPipelineShaders getPipelineShaders(const bool useRayQuery, const bool ommEnabled);
-    Rc<DxvkShader> getComputeShader() const;
+    static DxvkRaytracingPipelineShaders getPipelineShaders(const bool useRayQuery, const bool ommEnabled, const bool deferredNrcTrainingSetup);
+    Rc<DxvkShader> getComputeShader(const bool deferredNrcTrainingSetup, const SlimLevel slimLevel) const;
+    static SlimLevel selectSlimLevel(const RtFrameFeatures& features);
+    static const char* slimLevelToString(SlimLevel level);
+    // Lean -> LeanCore / LeanLegacy when the core forms apply this frame
+    // (coreTableValid / legacyTableValid: RaytraceArgs::coreMaterialTable / legacySurfaceTable are set).
+    static SlimLevel selectCoreMaterialLevel(const RtFrameFeatures& features, const SlimLevel level, const bool coreTableValid,
+                                             const bool legacyTableValid);
+
+    // Picks the level from the variant table (checked against selectSlimLevel),
+    // applies the compile fallback and writes the [IntegrateDirect] slim level line.
+    SlimLevel selectVariantTableLevel(RtxContext* ctx, const bool deferredNrcTrainingSetup, const SlimLevel legacyLevel,
+                                      const bool coreTableValid, const bool legacyTableValid);
+    std::string m_loggedVariantInfo;
+    uint32_t m_lastVariantLogFrame = UINT32_MAX;
+
+    // The split kernels of the Lean levels.
+    static bool isSplitLevel(const SlimLevel level);
+    Rc<DxvkShader> getSplitShadeShader(const bool dedicatedSun) const;
+    Rc<DxvkShader> getSplitTraceShader(const SlimLevel slimLevel) const;
+    // Creates the kernels a level binds, for prewarming.
+    void prewarmLevel(const bool deferredNrcTrainingSetup, const SlimLevel level) const;
+    bool isLevelReady(RtxContext& ctx, const bool deferredNrcTrainingSetup, const SlimLevel level) const;
+    // Sizes the record buffer for the camera resolution and marks it used this frame.
+    // Returns false if it could not be allocated.
+    bool prepareSplitRecords(const uint32_t width, const uint32_t height, const uint32_t frameId);
+    // Frees the record buffer once no frame has used it for kSplitRecordIdleFrames.
+    void releaseIdleSplitRecords(const uint32_t frameId);
+    Rc<DxvkBuffer> m_splitRecords;
+    uint32_t m_splitLastUseFrame = 0;
+    VkDeviceSize m_splitFailedSize = 0;
+    bool m_splitAllocationFailed = false;
   };
 }

@@ -33,6 +33,8 @@
 #include "rtx_common_object.h"
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/raytrace_args.h"
+#include "rtx_fork_light_bvh.h"
+#include "rtx_frontend_interface.h"
 
 #ifndef REMIXAPI_LIGHTHANDLE_DEFINED
 #define REMIXAPI_LIGHTHANDLE_DEFINED
@@ -70,12 +72,16 @@ struct LightRange {
   uint32_t count;
 };
 
+// GPU layout of a single light identity table entry. Matches StructuredBuffer<uint2>
+// lightIdentities in the shaders: .x = runtime-stable light identity,
+// .y = current light-buffer index.
+struct LightIdentityGpuEntry {
+  uint32_t identity;
+  uint32_t index;
+};
+
 struct LightManager : public CommonDeviceObject {
-  // Grant fork_hooks functions access to private members used from
-  // rtx_fork_light.cpp (m_externalLights, m_externalDomeLights,
-  // m_externalActiveLightList, m_externalActiveDomeLight,
-  // m_pendingExternalLightErases, m_pendingExternalLightUpdates,
-  // m_pendingExternalActiveLights, m_persistentExternalLights).
+  // The external-light hooks in rtx_fork_light.cpp use the private external-light state.
   friend void fork_hooks::flushPendingLightMutations(LightManager&);
   friend void fork_hooks::updateLightStaticSleep(RtLight*, const RtLight&, DxvkDevice*, uint64_t);
   friend void fork_hooks::setExternalLightEmplace(LightManager&, remixapi_LightHandle, const RtLight&);
@@ -111,21 +117,34 @@ public:
   const Rc<DxvkBuffer> getLightBuffer() const { return m_lightBuffer; }
   const Rc<DxvkBuffer> getPreviousLightBuffer() const { return m_previousLightBuffer.ptr() ? m_previousLightBuffer : m_lightBuffer; }
   const Rc<DxvkBuffer> getLightMappingBuffer() const { return m_lightMappingBuffer; }
+  const Rc<DxvkBuffer> getLightIdentityBuffer() const { return m_lightIdentityBuffer; }
+  // The light BVH for LightBVH light sampling (rtx_fork_light_bvh.cpp).
+  const Rc<DxvkBuffer>& getLightBvhBuffer() const { return m_lightBvh.getBuffer(); }
+  LightBvh& getLightBvh() { return m_lightBvh; }
+  bool isLightIdentityTableBuilt() const { return !m_lightIdentityData.empty(); }
   const uint32_t getActiveCount() const { return m_currentActiveLightCount; }
+  // This frame's lights in the order they were packed for the GPU, rebuilt by prepareSceneData.
+  // Consumers that need light PROPERTIES rather than light indices read this rather than decoding
+  // the packed buffer: the shader-side decode lives behind rtx/concept/light, whose include chain
+  // reaches cb-dependent headers that standalone compute passes have no constant buffer for.
+  const std::vector<RtLight*>& getLinearizedLights() const { return m_linearizedLights; }
   const DomeLightArgs& getDomeLightArgs();
 
   void clear();
   void clearFromUIThread();
 
   void garbageCollection(RtCamera& camera);
+  // A camera cut kept the scene. Sleeping static lights last touched
+  // before it are collected like awake ones, as a clear would have removed them.
+  void setKeptCutFrame(uint32_t frame) { m_keptCutFrame = frame; }
 
   void dynamicLightMatching();
 
   void prepareSceneData(Rc<DxvkContext> ctx, CameraManager const& cameraManager);
 
-  void addGameLight(D3DLIGHTTYPE type, const RtLight& light);
+  void addGameLight(frontend::FixedFunctionLight::Type type, const RtLight& light);
   RtLight* addLight(const RtLight& light, const RtLightAntiCullingType antiCullingType);
-  RtLight* addLight(const RtLight& light, const DrawCallState& drawCallState, const RtLightAntiCullingType antiCullingType);
+  RtLight* addLight(const RtLight& light, const SceneDraw& drawCallState, const RtLightAntiCullingType antiCullingType);
 
   // Externally tracked lights are lights whose lifecycle (creation, update, removal) is managed externally, rather than the
   // existing frame-to-frame tracking and anti-culling systems. These are kept separte to avoid any interference from anti culling
@@ -155,6 +174,7 @@ private:
   // order to be deterministic in tests.
   std::unordered_map<uint64_t, RtLight> m_externallyTrackedLights;
   uint64_t m_nextExternallyTrackedLightId = 0;
+  uint64_t m_nextLightIdentity = 1;
   // Note: A fallback light tracked seperately and handled specially to not be mixed up with
   // lights provided from the application.
   std::optional<RtLight> m_fallbackLight{};
@@ -173,6 +193,8 @@ private:
   Rc<DxvkBuffer> m_lightBuffer;
   Rc<DxvkBuffer> m_previousLightBuffer;
   Rc<DxvkBuffer> m_lightMappingBuffer;
+  Rc<DxvkBuffer> m_lightIdentityBuffer;
+  LightBvh m_lightBvh;
 
   uint32_t m_currentActiveLightCount = 0;
   std::array<LightRange, lightTypeCount> m_lightTypeRanges;
@@ -182,7 +204,21 @@ private:
   // memory usage, but these buffers are fairly small at only 4 MiB or so max with 2^16 lights present).
   std::vector<RtLight*> m_linearizedLights{};
   std::vector<unsigned char> m_lightsGPUData{};
+  // These track the incremental light upload.
+  // They hold the light buffer layout (linearized order, types, active flags), how many uploads it has been unchanged,
+  // the upload count, and the upload in which each slot's GPU data last changed.
+  uint64_t m_lightLayoutHash = 0;
+  uint32_t m_lightLayoutCount = ~0u;
+  uint32_t m_lightLayoutStableFrames = 0;
+  uint32_t m_lightPrepSerial = 0;
+  std::vector<uint32_t> m_lightSlotChangedSerial;
+  uint32_t m_keptCutFrame = ~0u;  // setKeptCutFrame
+  uint32_t m_lightSlotsUploaded = 0;  // [PerfCpu]-style counter: slots written last frame (incremental or full)
+public:
+  uint32_t getLightSlotsUploaded() const { return m_lightSlotsUploaded; }
+private:
   std::vector<uint16_t> m_lightMappingData{};
+  std::vector<LightIdentityGpuEntry> m_lightIdentityData{};
 
   // Mutex to prevent the debugging UI from accessing the light data after it's been deleted.
   mutable std::mutex m_lightUIMutex;
@@ -197,6 +233,7 @@ private:
   //  Returns 0~1 if similar, higher is more similar
   static float isSimilar(const RtLight& a, const RtLight& b, float distanceThreshold);
   static void updateLight(const RtLight& in, RtLight& out);
+  uint32_t allocateLightIdentity();
 
   RTX_OPTION("rtx", bool, suppressLightKeeping, false, 
              "If true, Remix doesn't keep game's original light sources for many frames. "
@@ -223,6 +260,10 @@ private:
   }
   RTX_OPTION_ARGS("rtx", FallbackLightType, fallbackLightType, FallbackLightType::Distant, "The light type to use for the fallback light. Determines which other fallback light options are used.", args.onChangeCallback = &fallbackLightOnChange);
   RTX_OPTION_ARGS("rtx", Vector3, fallbackLightRadiance, Vector3(1.6f, 1.8f, 2.0f), "The radiance to use for the fallback light (used across all light types).", args.minValue = Vector3(0.0f, 0.0f, 0.0f), args.onChangeCallback = &fallbackLightOnChange);
+  RTX_OPTION_ARGS("rtx", float, fallbackLightVolumetricRadianceScale, 1.0f,
+                  "Scales the fallback light's contribution to volumetric lighting only, for all fallback light types. "
+                  "Its surface lighting is unchanged. 0 removes the fallback light from volumetric lighting.",
+                  args.onChangeCallback = &fallbackLightOnChange, args.minValue = 0.0f, args.maxValue = FLOAT16_MAX);
   RTX_OPTION_ARGS("rtx", Vector3, fallbackLightDirection, Vector3(-0.2f, -1.0f, 0.4f), "The direction to use for the fallback light (used only for Distant light types)", args.onChangeCallback = &fallbackLightOnChange);
   RTX_OPTION_ARGS("rtx", float, fallbackLightAngle, 5.0f, "The angular size in degrees to use for the fallback light (used only for Distant light types). Should only be within the range [0, 180].",
                   args.onChangeCallback = &fallbackLightOnChange, args.minValue = 0.0f);

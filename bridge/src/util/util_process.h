@@ -45,9 +45,12 @@ namespace bridge_util {
     Process(LPCTSTR cmd, ProcessExitCallback callback):
       hProcess(NULL),
       hWait(NULL),
+      hDuplicate(NULL),
       exitCallback(NULL) {
       hProcess = createChildProcess(cmd);
-      RegisterExitCallback(callback);
+      if (hProcess) {
+        RegisterExitCallback(callback);
+      }
     }
 
     ~Process() {
@@ -59,6 +62,15 @@ namespace bridge_util {
     bool RegisterExitCallback(ProcessExitCallback callback);
     void UnregisterExitCallback();
     HANDLE GetCurrentProcessHandle();
+
+    bool isLaunched() const {
+      return hProcess != NULL;
+    }
+
+    // Returns the CreateProcess error code, or 0 when the launch succeeded.
+    DWORD getLaunchError() const {
+      return launchError;
+    }
 
   private:
     static void CALLBACK OnExited(void* context, BOOLEAN isTimeout) {
@@ -77,6 +89,7 @@ namespace bridge_util {
     }
 
     DWORD  processMainThreadId = 0;
+    DWORD  launchError = 0;
     HANDLE hProcess;
     HANDLE hWait;
     HANDLE hDuplicate;
@@ -184,7 +197,23 @@ namespace bridge_util {
     }
     return ppid;
   }
-  
+
+  static const char* RTX_ARCH_UNKNOWN = "unk";
+  static const char* RTX_ARCH_X64 = "x64";
+  static const char* RTX_ARCH_ARM64 = "arm64";
+
+  static inline const char* getNativeArchString() {
+    USHORT curMachine, nativeMachine = IMAGE_FILE_MACHINE_AMD64;
+    ::IsWow64Process2(::GetCurrentProcess(), &curMachine, &nativeMachine);
+
+    if (nativeMachine == IMAGE_FILE_MACHINE_ARM64) {
+      return RTX_ARCH_ARM64;
+    } else if (nativeMachine == IMAGE_FILE_MACHINE_AMD64) {
+      return RTX_ARCH_X64;
+    }
+
+    return RTX_ARCH_UNKNOWN;
+  }
 }
 
 #endif // UTIL_PROCESS_H_

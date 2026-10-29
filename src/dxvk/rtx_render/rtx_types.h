@@ -22,10 +22,13 @@
 #pragma once
 
 #include "rtx_constants.h"
+#include "rtx_accel_size_cache.h"
 #include "rtx_utils.h"
 #include "rtx_materials.h"
 #include "rtx_hashing.h"
+#include "rtx_scene_types.h"
 #include "rtx_camera.h"
+#include "rtx_frontend_interface.h"
 #include "vulkan/vulkan_core.h"
 #include "../../util/util_bounding_box.h"
 #include "../../util/util_threadpool.h"
@@ -37,22 +40,17 @@
 #include <unordered_set>
 #include <future>
 
-using remixapi_MaterialHandle = struct remixapi_MaterialHandle_T*;
-using remixapi_MeshHandle = struct remixapi_MeshHandle_T*;
-
 namespace dxvk 
 {
 class RtCamera;
 class RtInstance;
 struct RtLight;
 class GraphInstance;
-struct D3D9FixedFunctionVS;
-struct D3D9FixedFunctionPS;
-struct DrawCallState;
+struct SceneDraw;
 struct AssetReplacement;
+struct ReplacementBucket;
 struct ReplacementInstance;
 
-using RasterBuffer = GeometryBuffer<Raster>;
 using RaytraceBuffer = GeometryBuffer<Raytrace>;
 
 // DLFG async compute overlap: max of 2 frames in flight
@@ -118,7 +116,7 @@ struct ReplacementInstance {
 
   // Bundled hash/position/transform parameters used to look up or create a
   // ReplacementInstance. Constructed by callers from whatever source they have
-  // (DrawCallState, D3DLIGHT9, ExternalDrawState).
+  // (SceneDraw, D3DLIGHT9, ExternalDrawState).
   struct LookupKey {
     XXH64_hash_t identityHash;
     // The hash to identify which spatial map to search for the replacementInstance.
@@ -180,13 +178,13 @@ struct ReplacementInstance {
   std::vector<PrimInstance> prims;
   PrimInstance root;
 
-  // Reset the RI and re-initialize it with the given root, prim count, and
-  // tracking pointer to the replacement vector that owns those prims (pass
-  // nullptr for non-replacement contexts -- e.g. standalone draws or external
-  // mesh submissions). The stored pointer is used by drawReplacements to
-  // detect when the underlying replacement data has changed across frames.
+  // Reset the RI and re-initialize it with the given root, prim count, and a
+  // reference to the replacement bucket that owns those prims (pass nullptr for
+  // non-replacement contexts -- e.g. standalone draws or external mesh
+  // submissions). The stored bucket is used by drawReplacements to detect when
+  // the underlying replacement data has changed across frames.
   void setup(PrimInstance newRoot, size_t numPrims,
-             const std::vector<AssetReplacement>* replacements);
+             std::shared_ptr<const ReplacementBucket> replacements);
 
   // Frame-to-frame tracking fields (used by SceneManager two-level lookup)
   uint32_t id = 0;
@@ -198,21 +196,24 @@ struct ReplacementInstance {
   Vector3 centroid = Vector3(0.f);
   uint32_t frameCreated = 0;
   uint32_t frameLastSeen = 0;
+  // rtx.retainedSteadyFastPath: a retained entry caches a pointer to this instance. Its
+  // destruction or re-keying then bumps DrawCallTracker::getRetainedSteadyEpoch().
+  bool retainedSteady = false;
   XXH64_hash_t spatialCacheTransformHash = kEmptyHash;
 
-  // Pointer to the replacement data this RI was set up with. Used to detect when
-  // replacements change (async load, hot reload, variant toggle) and the RI needs reinitialization.
-  // Comparing this against getReplacementsForMesh's return value is sufficient for all transitions:
-  // first-time publishes go nullptr → live ptr, and variant toggles produce a different lookup key
-  // (assetHash + variantId), which returns a different vector pointer. drawReplacements clears and
-  // rebuilds prims when this mismatches.
-  const std::vector<AssetReplacement>* activeReplacements = nullptr;
+  // The replacement data this RI was set up with. Used to detect when replacements
+  // change (async load, hot reload, variant toggle) and the RI needs reinitialization.
+  // Anti-culled RIs keep this reference between submissions; recalculateBoundingBox
+  // dereferences it, and the stale flag on it is checked by invalidateChangedReplacements.
+  std::shared_ptr<const ReplacementBucket> activeReplacements;
 
   // Draw call properties that affect anti-culling GC decisions.
-  // Set from the original DrawCallState each time the RI is matched.
+  // Set from the original SceneDraw each time the RI is matched.
   // Stored as raw bits because CategoryFlags is defined later in this file.
   uint32_t categoryFlags = 0;
   bool isSkinned = false;
+  // SceneDraw::newGeometryEveryFrame of the last draw.
+  bool newGeometryEveryFrame = false;
 
   // When true, the aggregate object-space bounding boxes (geometryBoundingBox,
   // lightBoundingBox) will be recomputed from the replacement mesh/light data
@@ -289,28 +290,24 @@ private:
   size_t m_replacementIndex = ReplacementInstance::kInvalidReplacementIndex;
 };
 
-// NOTE: Needed to move this here in order to avoid
-// circular includes.  This probably requires a 
-// general cleanup.
-struct SkinningData {
-  std::vector<Matrix4> pBoneMatrices;
-  uint32_t numBones = 0;
-  uint32_t numBonesPerVertex = 0;
-  XXH64_hash_t boneHash = 0;
-  uint32_t minBoneIndex = 0; // This is the smallest index of all bones actually used by vertex data
-
-  void computeHash() {
-    if (numBones > 0) {
-      assert(minBoneIndex >= 0);
-      const Matrix4* firstBone = &pBoneMatrices[minBoneIndex];
-      assert(numBones > minBoneIndex);
-      boneHash = XXH3_64bits(firstBone, (numBones - minBoneIndex) * sizeof(Matrix4));
-    } else {
-      boneHash = 0;
-    }
-  }
+// SccrShellManager's memo of a geometry's shell data (rtx_fork_sccr_shell.h). The buffers live in the manager's cache,
+// keyed by what a build reads, with their own bindless slots. This only saves the per-frame cache lookup. entry is
+// followed only while generation is the manager's current one (bumped whenever an entry is erased) and the key fields
+// still match the geometry. A miss is looked up again every frame.
+struct SccrShellCacheEntry;
+struct SccrShellGeometryMemo {
+  XXH64_hash_t positionHash = 0;
+  XXH64_hash_t indexHash = 0;
+  uint32_t vertexCount = 0;
+  uint32_t primitiveCount = 0;
+  // The manager's cache generation this was taken in (0: never).
+  uint32_t generation = 0;
+  // The cached buffer (null: not cached) and its slot.
+  SccrShellCacheEntry* entry = nullptr;
+  uint32_t slot = 0xFFFFu;
+  // kUpdateBVH events since the scan first saw this geometry. The second makes it dynamic (plain SCCR).
+  uint8_t vertexUpdates = 0;
 };
-
 
 // Stores the geometry data representing a raytracable object
 // Valid until the object is destroyed.
@@ -346,152 +343,16 @@ struct RaytraceGeometry {
   // Used to avoid redundant recomputation on subsequent frames for static geometry.
   bool smoothNormalsApplied = false;
 
+  // Where this geometry's mesh stands in SccrShellManager's cache of welded adjacency and inner-shell directions
+  // (Surface.shellBufferIndex). The geometry holds no buffer or slot of its own.
+  SccrShellGeometryMemo shellMemo;
+
   bool usesIndices() const { 
     return indexBuffer.defined();
   }
 
   uint32_t calculatePrimitiveCount() const {
     return (usesIndices() ? indexCount : vertexCount) / 3;
-  }
-};
-
-// Stores a snapshot of the geometry state for a draw call.
-// WARNING: Usage is undefined after the drawcall this was 
-//          generated from has finished executing on the GPU
-struct RasterGeometry {
-  GeometryHashes hashes;
-  Future<GeometryHashes> futureGeometryHashes;
-
-  // Actual vertex/index count (when applicable) as calculated by geo-engine
-  uint32_t vertexCount = 0;
-  uint32_t indexCount = 0;
-
-  // Copy of the bones per vertex from SkinningState.
-  // This allows replacements to have different values from the original.
-  uint32_t numBonesPerVertex = 0;
-
-  // Hashed values
-  VkPrimitiveTopology topology = VkPrimitiveTopology(0);
-  VkCullModeFlags cullMode = VkCullModeFlags(0);
-  VkFrontFace frontFace = VkFrontFace(0);
-
-  // Used by replacements mostly, to force the cull bit to that set by the geometry data
-  bool forceCullBit = false;
-
-  RasterBuffer positionBuffer;
-  RasterBuffer normalBuffer;
-  RasterBuffer texcoordBuffer;
-  RasterBuffer color0Buffer;
-  RasterBuffer indexBuffer;
-  RasterBuffer blendWeightBuffer;
-  RasterBuffer blendIndicesBuffer;
-
-  AxisAlignedBoundingBox boundingBox;
-  Future<AxisAlignedBoundingBox> futureBoundingBox;
-
-  remixapi_MaterialHandle externalMaterial = nullptr;
-  remixapi_MeshHandle externalMesh = nullptr;
-
-  template<uint32_t rule>
-  const XXH64_hash_t getHashForRule() const {
-    return hashes.getHashForRule<rule>();
-  }
-
-  const XXH64_hash_t getHashForRule(const HashRule& rule) const {
-    return hashes.getHashForRule(rule);
-  }
-
-  const XXH64_hash_t getHashForRuleLegacy(const HashRule& rule) const {
-    // Note: Only information relating to how the geometry is structured should be included here.
-    XXH64_hash_t h = getHashForRule(rule);
-    h = XXH64(&indexCount, sizeof(indexCount), h);
-    h = XXH64(&vertexCount, sizeof(vertexCount), h);
-    h = XXH64(&topology, sizeof(topology), h);
-    const uint32_t vertexStride = positionBuffer.stride();
-    h = XXH64(&vertexStride, sizeof(vertexStride), h);
-    const VkIndexType indexType = indexBuffer.indexType();
-    h = XXH64(&indexType, sizeof(indexType), h);
-    return h;
-  }
-  
-  uint32_t calculatePrimitiveCount() const;
-
-  bool usesIndices() const {
-    return indexBuffer.defined();
-  }
-
-  bool isVertexDataInterleaved() const {
-    if (normalBuffer.defined() && (!positionBuffer.matches(normalBuffer) || positionBuffer.stride() != normalBuffer.stride()))
-      return false;
-
-    if (texcoordBuffer.defined() && (!positionBuffer.matches(texcoordBuffer) || positionBuffer.stride() != texcoordBuffer.stride()))
-      return false;
-
-    if (color0Buffer.defined() && (!positionBuffer.matches(color0Buffer) || positionBuffer.stride() != color0Buffer.stride()))
-      return false;
-
-    return true;
-  }
-
-  bool areFormatsGpuFriendly() const {
-    assert(positionBuffer.defined());
-
-    if (positionBuffer.vertexFormat() != VK_FORMAT_R32G32B32_SFLOAT && positionBuffer.vertexFormat() != VK_FORMAT_R32G32B32A32_SFLOAT)
-      return false;
-
-    if (normalBuffer.defined() && (normalBuffer.vertexFormat() != VK_FORMAT_R32G32B32_SFLOAT && normalBuffer.vertexFormat() != VK_FORMAT_R32G32B32A32_SFLOAT && normalBuffer.vertexFormat() != VK_FORMAT_R32_UINT))
-      return false;
-
-    if (texcoordBuffer.defined() && (texcoordBuffer.vertexFormat() != VK_FORMAT_R32G32_SFLOAT && texcoordBuffer.vertexFormat() != VK_FORMAT_R32G32B32_SFLOAT && texcoordBuffer.vertexFormat() != VK_FORMAT_R32G32B32A32_SFLOAT))
-      return false;
-
-    if (color0Buffer.defined() && (color0Buffer.vertexFormat() != VK_FORMAT_B8G8R8A8_UNORM))
-      return false;
-
-    return true;
-  }
-
-  bool isTopologyRaytraceReady() const {
-    // Unsupported BVH builder topology
-    if (topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)
-      return false;
-
-    // Unsupported BVH builder topology
-    if (topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN)
-      return false;
-
-    // No index buffer so must create one (BVH builder does support this mode, our RT code does not)
-    if (indexCount == 0)
-      return false;
-
-    return true;
-  }
-
-  const void printDebugInfo(const char* name = "", uint32_t numTrisToPrint = 0) const {
-    Logger::warn(str::format(
-      "GeometryData ", name, " address: ", this,
-      " vertexCount: ", vertexCount,
-      " indexCount: ", indexCount,
-      " topology: ", topology,
-      " cullMode: ", cullMode,
-      " frontFace: ", frontFace,
-      " currentVertexHash: 0x", hashes[HashComponents::VertexPosition],
-      " drawIndexHash: 0x", hashes[HashComponents::Indices], std::dec));
-
-    // Print Triangles:
-    if (numTrisToPrint > 0) {
-      uint16_t* indexPtr = (uint16_t*) indexBuffer.mapPtr();
-      for (uint32_t i = 0; i < indexCount && i < numTrisToPrint * 3; i += 3) {
-        Vector3* position1 = (Vector3*) ((uint8_t*) positionBuffer.mapPtr() + positionBuffer.stride() * indexPtr[i]);
-        Vector3* position2 = (Vector3*) ((uint8_t*) positionBuffer.mapPtr() + positionBuffer.stride() * indexPtr[i + 1]);
-        Vector3* position3 = (Vector3*) ((uint8_t*) positionBuffer.mapPtr() + positionBuffer.stride() * indexPtr[i + 2]);
-        Logger::warn(str::format(
-          "[", std::setw(5), indexPtr[i], ", ", std::setw(5), indexPtr[i + 1], ", ", std::setw(5), indexPtr[i + 2], "] : ", std::setprecision(6),
-          "(", std::setw(9), position1->x, ", ", std::setw(9), position1->y, ", ", std::setw(9), position1->z, "),   ",
-          "(", std::setw(9), position2->x, ", ", std::setw(9), position2->y, ", ", std::setw(9), position2->z, "),   ",
-          "(", std::setw(9), position3->x, ", ", std::setw(9), position3->y, ", ", std::setw(9), position3->z, "), "));
-      }
-    }
   }
 };
 
@@ -585,93 +446,21 @@ struct GeometryBufferData {
 };
 
 
-struct DrawCallTransforms {
-  Matrix4 objectToWorld = Matrix4();
-  Matrix4 objectToView = Matrix4();
-  Matrix4 worldToView = Matrix4();
-  Matrix4 viewToProjection = Matrix4();
-  Matrix4 textureTransform = Matrix4();
-  bool enableClipPlane = false;
-  Vector4 clipPlane{ 0.f };
-  TexGenMode texgenMode = TexGenMode::None;
-  std::shared_ptr<const std::vector<Matrix4>> instancesToObject;
-
-  void sanitize() {
-    if (objectToWorld[3][3] == 0.f) objectToWorld[3][3] = 1.f;
-    if (objectToView[3][3] == 0.f) objectToView[3][3] = 1.f;
-    if (worldToView[3][3] == 0.f) worldToView[3][3] = 1.f;
-  }
-
-  Matrix4 calcFirstInstanceObjectToWorld() const {
-    if (instancesToObject && !instancesToObject->empty()) {
-      return objectToWorld * (*instancesToObject)[0];
-    } else {
-      return objectToWorld;
-    }
-  }
-};
-
-struct FogState {
-  uint32_t mode = D3DFOG_NONE;
-  Vector3 color = Vector3();
-  float scale = 0.f;
-  float end = 0.f;
-  float density = 0.f;
-
-  XXH64_hash_t getHash() const {
-    return XXH3_64bits(this, sizeof(FogState));
-  }
-};
-
-enum class InstanceCategories : uint32_t {
-  WorldUI,
-  WorldMatte,
-  Sky,
-  Ignore,
-  IgnoreLights,
-  IgnoreAntiCulling,
-  IgnoreMotionBlur,
-  IgnoreOpacityMicromap,
-  IgnoreAlphaChannel,
-  Hidden,
-  Particle,
-  Beam,
-  DecalStatic,
-  DecalDynamic,
-  DecalSingleOffset,
-  DecalNoOffset,
-  AlphaBlendToCutout,
-  Terrain,
-  AnimatedWater,
-  ThirdPersonPlayerModel,
-  ThirdPersonPlayerBody,
-  IgnoreBakedLighting,
-  IgnoreTransparencyLayer,
-  ParticleEmitter,
-  SmoothNormals,
-  HairCards,
-
-  Count,
-};
-
-using CategoryFlags = Flags<InstanceCategories>;
-
-#define DECAL_CATEGORY_FLAGS InstanceCategories::DecalStatic, InstanceCategories::DecalDynamic, InstanceCategories::DecalSingleOffset, InstanceCategories::DecalNoOffset
-
-// Forward decl so DrawCallState can friend the fork hook that needs access
-// to private setCategory. See docs/fork-touchpoints.md.
+// Declared here so SceneDraw can befriend the hook, which uses setCategory.
 struct MaterialData;
-struct DrawCallState;
+struct SceneDraw;
 namespace fork_hooks {
   void externalDrawTextureCategories(const MaterialData* material,
-                                     DrawCallState& drawCall,
+                                     SceneDraw& drawCall,
                                      XXH64_hash_t& textureHash);
 }
 
-struct DrawCallState {
-  DrawCallState() = default;
-  DrawCallState(const DrawCallState& _input) = default;
-  DrawCallState& operator=(const DrawCallState& drawCallState) = default;
+// One submesh of one instance as the scene builds it. BlasEntry::input keeps the one its geometry was last built from.
+// Its geometry hashes, bounds and skinning are final.
+struct SceneDraw {
+  SceneDraw() = default;
+  SceneDraw(const SceneDraw& _input) = default;
+  SceneDraw& operator=(const SceneDraw& sceneDraw) = default;
 
   // Note: This uses the original material for the hash, not the replaced material
   const XXH64_hash_t getHash(const HashRule& rule) const {
@@ -712,10 +501,6 @@ struct DrawCallState {
     return skinningData;
   }
 
-  const FogState& getFogState() const {
-    return fogState;
-  }
-
   const CategoryFlags getCategoryFlags() const {
     return categories;
   }
@@ -728,46 +513,33 @@ struct DrawCallState {
     return VK_CULL_MODE_FLAG_BITS_MAX_ENUM == overrides.cullMode ? getGeometryData().cullMode : overrides.cullMode;
   }
 
-  bool finalizePendingFutures(const RtCamera* pLastCamera);
-
   bool hasTextureCoordinates() const {
     return getGeometryData().texcoordBuffer.defined() || getTransformData().texgenMode != TexGenMode::None;
   }
   bool isEye() const;
 
-  bool stencilEnabled = false;
-
   // Camera type associated with the draw call
   CameraType::Enum cameraType = CameraType::Unknown;
 
-  // Uses programmamble VS/PS
-  bool usesVertexShader = false, usesPixelShader = false;
-
-  // Contains valid values only if usesVertex/PixelShader is set
-  DxsoProgramInfo programmableVertexShaderInfo;
-  DxsoProgramInfo programmablePixelShaderInfo;
-
-  float minZ = 0.0f;
-  float maxZ = 1.0f;
-
-  bool zWriteEnable = false;
-  bool zEnable = false;
+  // Uses a programmable vertex shader
+  bool usesVertexShader = false;
 
   uint32_t drawCallID = 0;
 
-  bool isDrawingToRaytracedRenderTarget = false;
   bool isUsingRaytracedRenderTarget = false;
 
-  // Set when the Sky category was assigned by skyAutoDetect heuristic
-  // (as opposed to explicit methods like skyBoxTextures/skyBoxGeometries/skyMinZThreshold).
-  // Used by tryHandleSky to optionally bypass cubemap rasterization for autoDetected sky,
-  // since it may be world geometry that should go through reprojection instead.
-  bool skyAutoDetected = false;
+  // The draw's geometry is new every frame, as the particle system's output is. Its instance is collected the first
+  // frame it is not drawn, whatever rtx.numFramesToKeepInstances is.
+  bool newGeometryEveryFrame = false;
 
-  void setupCategoriesForTexture();
-  void setupCategoriesForGeometry();
-  void setupCategoriesForHeuristics(uint32_t prevFrameSeenCamerasCount,
-                                    std::vector<Vector3>& seenCameraPositions);
+  // Set by submitExternalDraw for an API instance with a per-instance material override
+  // (remixapi_InstanceInfoMaterialOverrideEXT) while rtx.hostImport.shareGeometryAcrossMaterials
+  // is on. When both the draw and a BlasEntry's input carry it, the draw-call cache compares
+  // geometryShareKey instead of the material hash, so instances of one mesh with different
+  // materials share one geometry copy and one BLAS. The key is kEmptyHash-based for opaque
+  // materials and folds the material hash in for alpha-tested / blended ones (OMM safety).
+  bool materialIndependentGeometry = false;
+  XXH64_hash_t geometryShareKey = kEmptyHash;
 
   template<typename... InstanceCategories>
   bool testCategoryFlags(InstanceCategories... cat) const { return categories.any(cat...); }
@@ -775,23 +547,16 @@ struct DrawCallState {
   void printDebugInfo(const char* name = "") const {
 #ifdef REMIX_DEVELOPMENT
     Logger::warn(str::format(
-      "DrawCallState ", name, "\n",
+      "SceneDraw ", name, "\n",
       "  address: ", this, "\n",
       "  drawCallID: ", drawCallID, "\n",
       "  cameraType: ", static_cast<int>(cameraType), "\n",
       "  usesVertexShader: ", usesVertexShader, "\n",
-      "  usesPixelShader: ", usesPixelShader, "\n",
-      "  stencilEnabled: ", stencilEnabled, "\n",
-      "  zWriteEnable: ", zWriteEnable, "\n",
-      "  zEnable: ", zEnable, "\n",
-      "  minZ: ", minZ, "\n",
-      "  maxZ: ", maxZ, "\n",
-      "  isDrawingToRaytracedRenderTarget: ", isDrawingToRaytracedRenderTarget, "\n",
       "  isUsingRaytracedRenderTarget: ", isUsingRaytracedRenderTarget, "\n",
       "  categoryFlags: ", categories.raw(), "\n",
       "  hasTextureCoordinates: ", hasTextureCoordinates(), "\n",
       "  materialHash: 0x", std::hex, materialData.getHash(), std::dec));
-    
+
     // Print geometry info
     Logger::warn("=== Geometry Info ===");
     Logger::warn(str::format(
@@ -803,13 +568,13 @@ struct DrawCallState {
       "  frontFace: ", static_cast<int>(geometryData.frontFace), "\n",
       "  forceCullBit: ", geometryData.forceCullBit, "\n",
       "  externalMaterial: ", (geometryData.externalMaterial != nullptr ? "valid" : "null")));
-    
+
     // Print transform info
     Logger::warn("=== Transform Info ===");
     Logger::warn(str::format(
       "  enableClipPlane: ", transformData.enableClipPlane, "\n",
       "  clipPlane: (", transformData.clipPlane.x, ", ", transformData.clipPlane.y, ", ", transformData.clipPlane.z, ", ", transformData.clipPlane.w, ")"));
-    
+
     // Print skinning info
     Logger::warn("=== Skinning Info ===");
     Logger::warn(str::format(
@@ -817,42 +582,26 @@ struct DrawCallState {
       "  numBonesPerVertex: ", skinningData.numBonesPerVertex, "\n",
       "  minBoneIndex: ", skinningData.minBoneIndex, "\n",
       "  boneHash: 0x", std::hex, skinningData.boneHash, std::dec));
-    
-    // Print fog info
-    Logger::warn("=== Fog Info ===");
-    Logger::warn(str::format(
-      "  fogMode: ", fogState.mode, "\n",
-      "  fogColor: (", fogState.color.x, ", ", fogState.color.y, ", ", fogState.color.z, ")\n",
-      "  fogScale: ", fogState.scale, "\n",
-      "  fogEnd: ", fogState.end, "\n",
-      "  fogDensity: ", fogState.density));
-    
+
     // Print material info
     Logger::warn("=== Material Info ===");
-    materialData.printDebugInfo("(from DrawCallState)");
+    materialData.printDebugInfo("(from SceneDraw)");
 #endif
   }
 
-  void overrideGeometryData(const RasterGeometry* overriddenGeometryData) {
-    overrides.geometryData = overriddenGeometryData;
+  void overrideGeometryData(std::shared_ptr<const RasterGeometry> overriddenGeometryData) {
+    overrides.geometryData = std::move(overriddenGeometryData);
   }
 
   void overrideCullMode(VkCullModeFlags overriddenCullMode) {
     overrides.cullMode = overriddenCullMode;
   }
 
-private:
-  friend struct D3D9Rtx;
-  friend struct RemixAPIPrivateAccessor;
+protected:
+  friend struct FrontendSceneSeam;
 
-  // Fork touchpoint: the external-draw texture-category hook needs access to
-  // private setCategory. See docs/fork-touchpoints.md.
   friend void fork_hooks::externalDrawTextureCategories(
-    const MaterialData* material, DrawCallState& drawCall, XXH64_hash_t& textureHash);
-
-  bool finalizeGeometryHashes();
-  void finalizeGeometryBoundingBox();
-  void finalizeSkinningData(const RtCamera* pLastCamera);
+    const MaterialData* material, SceneDraw& drawCall, XXH64_hash_t& textureHash);
 
   // NOTE: 'setCategory' can only add a category, it will not unset a bit
   void setCategory(InstanceCategories category, bool set);
@@ -866,17 +615,15 @@ private:
 
   DrawCallTransforms transformData;
 
-  // Note: Set these pointers to nullptr when not used
   SkinningData skinningData;
-  Future<SkinningData> futureSkinningData;
-
-  FogState fogState;
 
   CategoryFlags categories = 0;
 
-  // Overridden geometry (replaced or external) and states
+  // Overridden geometry (replaced or external) and states.
+  // geometryData is an aliased shared pointer, and keeps the source MeshReplacement
+  // alive until the SceneDraw is released.
   struct {
-    const RasterGeometry* geometryData = nullptr; // TBD: use a shared ptr?
+    std::shared_ptr<const RasterGeometry> geometryData;
     VkCullModeFlags cullMode = VK_CULL_MODE_FLAG_BITS_MAX_ENUM;
   } overrides;
 };
@@ -893,6 +640,17 @@ struct PooledBlas : public RcObject {
   // Note: only used for tracking of OMMs for static BLASes
   XXH64_hash_t opacityMicromapSourceHash = kEmptyHash;
 
+  // The opacity micromaps this BLAS was last built with. A built BLAS references its micromaps'
+  // memory for as long as it is traced, but the OMM cache can evict (and free) a micromap at any
+  // time, by LRU age or when the OMM budget shrinks (rtx.vramBudget pressure), and the BLAS would then
+  // point at freed memory. Holding them here (rtx.ommHoldBoundMicromaps) keeps a micromap alive until
+  // every BLAS built with it has been rebuilt.
+  struct BoundOmm {
+    XXH64_hash_t hash = kEmptyHash;
+    Rc<DxvkResource> buffers;
+  };
+  std::vector<BoundOmm> boundOmms;
+
   // Keep a copy of the build info so we can validate BLAS update compatibility
   VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {};
   std::vector<uint32_t> primitiveCounts {};
@@ -906,6 +664,29 @@ struct PooledBlas : public RcObject {
   // unchanged, the GPU build can be skipped entirely.
   XXH64_hash_t contentHash = kEmptyHash;
 
+  // Number of UPDATE (refit) builds since this BLAS was last fully built.
+  // See rtx.maxBlasRefitsBeforeRebuild.
+  uint32_t refitCount = 0;
+
+  // The skinned pose (BlasEntry::skinnedPose) of the vertices the last build or refit read.
+  XXH64_hash_t builtPose = 0;
+
+  // rtx.compactStableBlas. frameLastBuilt: last BUILD or UPDATE written into this BLAS.
+  // uncompactedSize: non-zero once the content is a compacted copy (the build size it came from).
+  // A compacted BLAS has no room for a rebuild and is never refit; it is replaced instead.
+  uint32_t frameLastBuilt = kInvalidFrameIndex;
+  VkDeviceSize uncompactedSize = 0;
+  uint32_t compactionQueryFrame = kInvalidFrameIndex; // a size query is in flight
+  bool compactionDone = false;                        // queried since the last build (compacted or not worth it)
+  bool hasOmm = false;                                // merged bucket built with OMM instances
+
+  bool isCompacted() const { return uncompactedSize != 0; }
+  void noteBuilt(uint32_t frame) {
+    frameLastBuilt = frame;
+    compactionQueryFrame = kInvalidFrameIndex;
+    compactionDone = false;
+  }
+
   explicit PooledBlas();
   ~PooledBlas();
 };
@@ -918,7 +699,7 @@ struct BlasEntry {
   //  - For shader based games the data may contain various unsupported formats a game might deliver the data in. 
   //    That is converted and optimized in RtxGeometryUtils::interleaveGeometry. 
   //    Fixed function games always use supported buffer formats/encodings etc...
-  DrawCallState input; 
+  SceneDraw input;
   // modifiedGeometryData contains the same geometry as "input" but it (may) have been transformed (i.e.interleaved vertex data, 
   // converted to optimal vertex formats [we prefer float32], will always be a triangle list and could be skinned)
   // - Data is on GPU 
@@ -934,14 +715,60 @@ struct BlasEntry {
   // Frame when the vertex data of this geometry was last updated, used to detect static geometries
   uint32_t frameLastUpdated = kInvalidFrameIndex;
 
+  // Frames when any instance of this geometry last moved, or was hidden or shown from outside
+  // the draw path. A merged BLAS bakes its instances' transforms and membership, so such an
+  // instance dirties its whole bucket; the accel manager gives recently moved / toggled
+  // geometry its own BLAS instead (rtx.ownBlasForMovedInstancesFrames,
+  // rtx.ownBlasForToggledInstancesFrames).
+  uint32_t frameLastInstanceMoved = kInvalidFrameIndex;
+  uint32_t frameLastInstanceToggled = kInvalidFrameIndex;
+
+  // The entry holds deforming geometry its owner refits or rebuilds in place frame after
+  // frame (SceneManager::onSceneObjectUpdated, rebuildTopologyInPlace). The accel manager gives such an entry its own
+  // BLAS at once, and forces a full build (no refit) on frameTopologyChanged, the frame its geometry was rebuilt in place
+  // with other index / vertex counts or index data.
+  bool deforming = false;
+  uint32_t frameTopologyChanged = kInvalidFrameIndex;
+
+  // Skinned geometry: the bone hash of the last skinning dispatch into modifiedGeometryData, and the skinning batch
+  // that dispatch was recorded into (RtxGeometryUtils::pendingSkinningBatch). Read by the rtx.scene.selfCheckFrames
+  // skinning check.
+  XXH64_hash_t skinnedPose = 0;
+  uint64_t skinnedBatch = 0;
+
+  // AccelManager per-geometry BLAS grouping (rtx.incrementalBucketBookkeeping): the routing
+  // pass that last grouped this entry and its slot in that pass's group list.
+  uint64_t accelRoutePass = 0;
+  uint32_t accelRouteIndex = 0;
+
+  // rtx.ownBlasForChronicallyDirtyFrames: consecutive frames on which an instance of this
+  // geometry arrived dirty at the merged-BLAS router (re-cloned, relinked, re-keyed, refit), and
+  // the window in which the geometry then gets its own BLAS. The window opens on the frame after
+  // the streak reached the threshold, so every instance routed in one frame decides the same way.
+  uint32_t accelDirtyStreakFrame = kInvalidFrameIndex;
+  uint32_t accelDirtyStreak = 0;
+  uint32_t accelChronicSinceFrame = kInvalidFrameIndex;
+  uint32_t accelChronicUntilFrame = 0;
+
+  // Mover back-off: the last frameLastInstanceMoved the router saw, and the multiplier of
+  // rtx.ownBlasForMovedInstancesFrames (1..8) for this geometry.
+  uint32_t accelMoveSeenFrame = kInvalidFrameIndex;
+  uint32_t accelMoveHoldMult = 1;
+
+  // rtx.retainedPinSteadyEntries: SceneManager's pin generation when a retained entry drawing
+  // this geometry was pinned. A dynamic draw of pinned geometry wakes the pinned entries.
+  uint64_t retainedPinGeneration = 0;
+
   Rc<PooledBlas> dynamicBlas = nullptr;
 
   std::vector<VkAccelerationStructureGeometryKHR> buildGeometries;
   std::vector<VkAccelerationStructureBuildRangeInfoKHR> buildRanges;
 
+  AccelSizeCache buildSizeCache;
+
   BlasEntry() = default;
 
-  BlasEntry(const DrawCallState& input_);
+  BlasEntry(const SceneDraw& input_);
 
   void cacheMaterial(const LegacyMaterialData& newMaterial) {
     if (input.getMaterialData().getHash() != newMaterial.getHash()) {
@@ -1005,12 +832,9 @@ struct BlasEntry {
   }
 
 private:
-  // Hash set instead of vector: unlink path used to be O(N) (std::find then
-  // swap-and-pop), which became a hot spot when many same-geometry transient
-  // instances share one BlasEntry — end-of-frame GC of N instances ran in
-  // O(N²). Switching to a hash set makes unlink O(1) average. Insertion
-  // ordering doesn't matter for any current consumer (size / empty are the
-  // only read operations on this container).
+  // A hash set keeps unlink O(1) on average, since many same-geometry transient
+  // instances can share one BlasEntry and are all unlinked by end-of-frame GC.
+  // Insertion order does not matter: size and empty are the only reads.
   std::unordered_set<RtInstance*> m_linkedInstances;
   std::unordered_map<XXH64_hash_t, LegacyMaterialData> m_materials;
 };
@@ -1034,12 +858,6 @@ enum class RtxGeometryStatus {
   Ignored,
   RayTraced,
   Rasterized
-};
-
-struct DxvkRaytracingInstanceState {
-  Rc<DxvkBuffer> vsFixedFunctionCB;
-  Rc<DxvkBuffer> psSharedStateCB;
-  Rc<DxvkBuffer> vertexCaptureCB;
 };
 
 enum class RtxFramePassStage {
@@ -1073,6 +891,7 @@ enum class RtxFramePassStage {
   Composition,
   DLSS,
   DLSSRR,
+  DLSSNR,
   NIS,
   XeSS,
   FSR,

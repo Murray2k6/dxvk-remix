@@ -75,6 +75,7 @@ namespace dxvk {
     uint32_t firstIndexInType;                     // Index of first placeholder within its TLAS type array
     uint32_t tlasType;                             // Tlas::Type (Opaque, Unordered, SSS)
     uint32_t instanceBufferByteOffset;             // Absolute byte offset in m_vkInstanceBuffer (resolved before dispatch)
+    bool fromHost;                                 // Host (Remix API) instancing rather than a USD PointInstancer
   };
 
   class RtxPointInstancerSystem : public CommonDeviceObject {
@@ -142,9 +143,38 @@ namespace dxvk {
       args.minValue = 0.f;
       args.onChangeCallback = onFadeStartRadiusChanged);
 
+    RTX_OPTION("rtx.pointInstancer", bool, cullHostInstancers, false,
+      "Applies the distance culling above to instancing from the host through the Remix API (GPU-instanced draws) too, "
+      "not only to USD PointInstancer replacements. Culled instances disappear from the primary view, reflections and "
+      "shadows alike, and the TLAS time saved is small.");
+
+    RTX_OPTION("rtx.pointInstancer", bool, singleDispatch, true,
+      "Culls all PointInstancer batches of a frame with one compute dispatch over a shared transform buffer and batch "
+      "table, instead of one dispatch per batch. The output is the same.");
+
+    RTX_OPTION("rtx.pointInstancer", bool, skipUnchangedUploads, true,
+      "Skips uploading the PointInstancer transform buffer and batch table again when they match the previous frame's. "
+      "The output is the same.");
+
     // -- GPU resources ------------------------------------------------------
 
     Rc<DxvkBuffer> m_cb;            // Per-dispatch constant buffer
-    Rc<DxvkBuffer> m_transformsGpu; // Reused upload buffer for input transforms
+    Rc<DxvkBuffer> m_transformsGpu; // All batches' input transforms, concatenated
+    Rc<DxvkBuffer> m_batchesGpu;    // PointInstancerCullingBatch table
+    Rc<DxvkBuffer> m_threadBatchGpu;// Global thread index -> batch index
+
+    // -- Upload cache (rtx.pointInstancer.skipUnchangedUploads) ---------------
+
+    // Contents uploaded last. Compared by value: the host hands the runtime a new
+    // transform array (new shared_ptr) per draw per frame even when nothing moved.
+    std::vector<Matrix4> m_uploadedTransforms;
+    std::vector<PointInstancerCullingBatch> m_uploadedBatches;
+    uint32_t m_uploadedThreadCount = 0;
+
+    // Scratch, reused per frame
+    std::vector<PointInstancerCullingBatch> m_batchScratch;
+    std::vector<uint32_t> m_transformFirstScratch;
+    std::vector<Matrix4> m_transformScratch;
+    std::vector<uint32_t> m_threadBatchScratch;
   };
 }

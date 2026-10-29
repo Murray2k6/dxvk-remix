@@ -55,9 +55,12 @@ namespace bridge_util {
       NULL,          // use parent's current directory
       &siStartInfo,  // STARTUPINFO pointer
       &piProcInfo);  // receives PROCESS_INFORMATION
+    free(lpCommandLine);
     if (bFuncRetn == 0) {
-      printf("CreateProcess failed (%d)\n", GetLastError());
-      return INVALID_HANDLE_VALUE;
+      // NULL marks a failed launch. INVALID_HANDLE_VALUE would be this process's own pseudo handle.
+      launchError = GetLastError();
+      Logger::err(format_string("CreateProcess() failed with error code %lu for: %s", launchError, szCmdline));
+      return NULL;
     } else {
       processMainThreadId = GetThreadId(piProcInfo.hThread);
       CloseHandle(piProcInfo.hThread);
@@ -67,7 +70,7 @@ namespace bridge_util {
 
   void Process::releaseChildProcess() {
     // Ensure this process is around until the child process terminates
-    if (INVALID_HANDLE_VALUE != hProcess) {
+    if (hProcess) {
       UnregisterExitCallback();
 
       // Give the child process 3 seconds to terminate on its own before we kill it
@@ -78,7 +81,7 @@ namespace bridge_util {
       CloseHandle(hProcess);
     }
     // Also close the duplicate client process handle that we created for the server
-    if (INVALID_HANDLE_VALUE != hDuplicate) {
+    if (hDuplicate) {
       CloseHandle(hDuplicate);
     }
   }

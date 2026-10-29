@@ -57,10 +57,14 @@ namespace dxvk {
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT              extShaderAtomicFloat;
     VkPhysicalDeviceDiagnosticsConfigFeaturesNV               nvDeviceDiagnosticsConfig;
     VkPhysicalDeviceBufferDeviceAddressFeaturesKHR            khrBufferDeviceAddress;
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR   khrPipelineExecutableProperties;
 
     // NV-DXVK start: opacity micromap
     VkPhysicalDeviceSynchronization2FeaturesKHR               khrSynchronization2;
     // NV-DXVK end
+    VkPhysicalDeviceOpacityMicromapFeaturesEXT                extOpacityMicromap;
+    VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT          extMutableDescriptorType;
+    VkPhysicalDeviceShaderIntegerDotProductFeatures           khrShaderIntegerDotProduct;
   };
 
 }

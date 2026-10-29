@@ -28,6 +28,7 @@
 #include "rtx/concept/surface/eye.slangh"
 #include "rtx/pass/common_bindings.slangh"
 #include "rtx/utility/debug_view_indices.h"
+#include "rtx/concept/surface/surface_interaction_sccr.slangh"
 
 // Surface Interaction Constants
 
@@ -296,6 +297,7 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   const vec3 bary = uintToBarycentrics(rayInteraction.barycentricCoordinates);
 
   SurfaceInteraction surfaceInteraction;
+  sccrSurfaceInteractionClear(surfaceInteraction);
 
   // Calculate vertex position in world space
   // Note: World space positions needed to compute the texture gradients, a bit expensive but probably easier than transforming
@@ -368,6 +370,9 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
 #endif
 #endif
 
+  // The smooth base surface of the vertex normals for SCCR, 0 without them (sccrPhongEdgeCurvature).
+  vec4 sccrEdgeCurvature = vec4(0.0f);
+
   if (surface.normalBufferIndex == BINDING_INDEX_INVALID)
   {
     surfaceInteraction.geometryNormal = flippedTriangleNormal;
@@ -427,6 +432,7 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     normals[2] *= dot(normals[2], flippedTriangleNormal) >= float16_t(0.0) ? 1 : -1;
 
     const vec3 interpolatedNormal = safeNormalize(interpolateHitAttribute(normals, bary), triangleNormal);
+    sccrEdgeCurvature = sccrPhongEdgeCurvature(worldPositions, normals, flippedTriangleNormal);
 
 #ifdef GBUFFER_FEATURE_DEBUG_VIEW
 #if GBUFFER_FEATURE_DEBUG_VIEW
@@ -620,6 +626,9 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       }
 #endif
     }
+
+    // After the cascade remap, which rescales the texture coordinates.
+    sccrSurfaceBaseCreate(surfaceInteraction, texcoords, worldPositions, bary, sccrEdgeCurvature);
 
     // Compute texture gradients
     // Note: This is done here as it depends on the triangle normal and texture coordinates being calculated first

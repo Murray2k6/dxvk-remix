@@ -361,6 +361,12 @@ namespace dxvk::vk {
     VULKAN_FN(vkGetRayTracingShaderGroupStackSizeKHR);
     #endif
 
+    // Used by rtx.debug.logPipelineStats.
+    #ifdef VK_KHR_pipeline_executable_properties
+    VULKAN_FN(vkGetPipelineExecutablePropertiesKHR);
+    VULKAN_FN(vkGetPipelineExecutableStatisticsKHR);
+    #endif
+
     #ifdef VK_KHR_create_renderpass2
     VULKAN_FN(vkCreateRenderPass2KHR);
     VULKAN_FN(vkCmdBeginRenderPass2KHR);
@@ -379,6 +385,11 @@ namespace dxvk::vk {
     VULKAN_FN(vkGetSwapchainImagesKHR);
     VULKAN_FN(vkAcquireNextImageKHR);
     VULKAN_FN(vkQueuePresentKHR);
+    #endif
+
+    // Null unless VK_KHR_present_wait was enabled on the device
+    #ifdef VK_KHR_present_wait
+    VULKAN_FN(vkWaitForPresentKHR);
     #endif
 
     #ifdef VK_EXT_conditional_rendering
@@ -444,6 +455,14 @@ namespace dxvk::vk {
     VULKAN_FN(vkGetQueueCheckpointDataNV);
     #endif
     // NV-DXVK end
+
+    // Device-loss diagnostics. These are null unless the extension was enabled.
+    #ifdef VK_AMD_buffer_marker
+    VULKAN_FN(vkCmdWriteBufferMarkerAMD);
+    #endif
+    #ifdef VK_EXT_device_fault
+    VULKAN_FN(vkGetDeviceFaultInfoEXT);
+    #endif
 
     #ifdef VK_NVX_image_view_handle
     VULKAN_FN(vkGetImageViewHandleNVX);

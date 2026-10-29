@@ -38,6 +38,9 @@
 static const int kSurfaceRISType = 1;
 static const uint16_t kInvalidLightIdx = 0xffff;
 
+// Light BVH sampling, used by sampleLightRIS when rtx.lightSampling.mode = LightBVH.
+#include "rtx/algorithm/light_bvh.slangh"
+
 // Selects and samples from a light using RTXDI. Returns if the sample and the is valid or not
 // Note: Camera used only for resolution purposes in RTXDI offset calculations.
 bool sampleLightRTXDI(
@@ -48,7 +51,7 @@ bool sampleLightRTXDI(
 {
   // Load the reservoir for this pixel from RTXDI
 
-  const RTXDI_Reservoir reservoir = RAB_LoadReservoir(
+  RTXDI_Reservoir reservoir = RAB_LoadReservoir(
     pixelCoordinate, RTXDI_GetSpatialOutputPage());
 
   if (!RTXDI_IsValidReservoir(reservoir))
@@ -56,7 +59,19 @@ bool sampleLightRTXDI(
     return false;
   }
 
+  // Under sparse rendering without inactive-pixel reuse, inactive pixels retain reservoirs whose
+  // light index can be several renumbers out of date; resolve the stored index to the current
+  // frame via the reservoir's stable identity.
+  if (RAB_UseLightIdentityResolution())
+  {
+    if (!RAB_ResolveReservoirLightIndex(reservoir))
+    {
+      return false;
+    }
+  }
+
   // When sampling for a view model context, skip lights flagged as ignoreViewModel.
+  // Runs after identity resolution so the resolved light index is the one inspected.
   if ((customIndex & CUSTOM_INDEX_IS_VIEW_MODEL) != 0)
   {
     MemoryPolymorphicLight memoryPolymorphicLight = lights[reservoir.lightIdx];
@@ -328,8 +343,17 @@ bool sampleLightRIS(
   OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction,
   vec3 viewDirection,
   inout LightSample lightSample, inout float inverseSelectionPdf, inout uint16_t lightIndex,
-  uint customIndex = 0)
+  uint customIndex = 0,
+  uint lightBvhCandidateCount = 0)
 {
+  // Every non-RTXDI light selection (indirect NEE, fallback, subsurface) goes through here.
+  // A lightBvhCandidateCount of 0 selects the indirect candidate count.
+  if (cb.lightSamplingMode == lightSamplingModeLightBvh)
+  {
+    return sampleLightBvh(randomState, surfaceInteraction, opaqueSurfaceMaterialInteraction, viewDirection,
+                          lightBvhCandidateCount != 0 ? lightBvhCandidateCount : cb.lightBvhIndirectCandidateCount, lightSample, inverseSelectionPdf, lightIndex, customIndex);
+  }
+
   switch(kSurfaceRISType)
   {
   case 0:

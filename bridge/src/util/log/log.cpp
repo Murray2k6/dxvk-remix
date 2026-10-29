@@ -77,6 +77,32 @@ namespace bridge_util {
     return *logger;
   }
 
+  // A log file stops taking anything but errors at this size, and errors stop kErrorReserveBytes later.
+  static constexpr uint64_t kMaxLogBytes = 20ull << 20;
+  static constexpr uint64_t kErrorReserveBytes = 1ull << 20;
+
+#ifdef REMIX_BRIDGE_CLIENT
+  static constexpr DWORD kLogFileFlags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH;
+  static constexpr const char* kLineEnd = "\n";
+#else
+  static constexpr DWORD kLogFileFlags = FILE_ATTRIBUTE_NORMAL;
+  static constexpr const char* kLineEnd = "\r\n";
+#endif
+
+  // Opens a log file for appending, creating it when it does not exist.
+  // Other processes can read, rename and delete the file while it is open, but not write to it.
+  static HANDLE openForAppend(const std::filesystem::path& path) {
+    return CreateFileW(path.c_str(), FILE_APPEND_DATA | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                       NULL, OPEN_ALWAYS, kLogFileFlags, NULL);
+  }
+
+  // Returns true when a game integration rotates the logs in this folder itself.
+  // Its session.lock stands while the game runs, and its archive.pending while the *.prev.log files wait for their zip.
+  static bool logsRotatedByGame(const std::filesystem::path& folder) {
+    return GetFileAttributesW((folder / L"session.lock").c_str()) != INVALID_FILE_ATTRIBUTES ||
+           GetFileAttributesW((folder / L"archive.pending").c_str()) != INVALID_FILE_ATTRIBUTES;
+  }
+
   Logger::Logger(const LogLevel log_level) : m_level(log_level) {
     if (m_level != LogLevel::None) {
 
@@ -87,34 +113,62 @@ namespace bridge_util {
 #endif
       auto logPath = RtxFileSys::path(RtxFileSys::Logs);
       logPath /= logName;
-#ifdef REMIX_BRIDGE_CLIENT
-      uint32_t attempt = 0;
-      while (attempt < 4) {
-        m_hFile = CreateFileA(logPath.string().c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL,
-                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL |
-                            FILE_FLAG_WRITE_THROUGH, NULL);
-        if (m_hFile != INVALID_HANDLE_VALUE) {
-          break;
-        }
-        // Dump Win32 errors to debug output in DEBUG mode
-        emitMsg(LogLevel::Error, format_string("Log CreateFile() failed with %d", GetLastError()));
 
-        attempt++;
+      // The previous session's log is kept as <name>.prev.log, so a relaunch does not lose a crashed session.
+      // A game integration that rotates the logs itself has moved it already.
+      // The move replaces the previous file only when it succeeds, so a failed move keeps both files.
+      if (!logsRotatedByGame(logPath.parent_path())) {
+        auto prevPath = logPath;
+        prevPath.replace_extension(".prev.log");
+        MoveFileExW(logPath.wstring().c_str(), prevPath.wstring().c_str(), MOVEFILE_REPLACE_EXISTING);
       }
-#else
-      m_fileStream = std::ofstream(logPath);
-#endif
+
+      // An existing log is never truncated: a log that is still there goes on below a separator line.
+      // A log another process still writes to, such as a bridge server that outlived its game, is left to it,
+      // and this process writes <name>.<process id>.log instead.
+      const DWORD pid = GetCurrentProcessId();
+      std::string note;
+      HANDLE file = INVALID_HANDLE_VALUE;
+      for (uint32_t attempt = 0; attempt < 4 && file == INVALID_HANDLE_VALUE; attempt++) {
+        file = openForAppend(logPath);
+        if (file == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION) {
+          auto pidPath = logPath;
+          pidPath.replace_extension("." + std::to_string(pid) + ".log");
+          file = openForAppend(pidPath);
+          note = format_string("[Log] %s is still open in another process, so process %lu writes its log to %s in the same folder.",
+                               logPath.filename().string().c_str(), pid, pidPath.filename().string().c_str());
+        }
+        if (file == INVALID_HANDLE_VALUE) {
+          emitMsg(LogLevel::Error, format_string("Log CreateFile() failed with %d", GetLastError()));
+        }
+      }
+      if (file == INVALID_HANDLE_VALUE) {
+        return;
+      }
+      m_hFile = file;
+
+      LARGE_INTEGER size {};
+      if (GetFileSizeEx(file, &size) && size.QuadPart > 0) {
+        emitNote(LogLevel::Info, format_string("[Log] ---- Process %lu continues this log here. The lines above are from an earlier process. ----", pid));
+      }
+      if (!note.empty()) {
+        emitNote(LogLevel::Warn, note);
+      }
     }
   }
 
   Logger::~Logger() {
-#ifdef REMIX_BRIDGE_CLIENT
-    CloseHandle(m_hFile);
-#else
-    if (m_fileStream.is_open()) {
-      m_fileStream.close();
+    if (m_hFile != nullptr) {
+      CloseHandle(m_hFile);
     }
-#endif
+  }
+
+  void Logger::emitNote(const LogLevel level, const std::string& message) {
+    std::stringstream ss = formatMessage(level, message);
+    std::string line;
+    while (std::getline(ss, line, '\n')) {
+      emitLine(level, line);
+    }
   }
 
   void Logger::emitPreInitMsgs() {
@@ -184,20 +238,27 @@ namespace bridge_util {
 
   void Logger::emitLine(const LogLevel level, const std::string& line) {
     if (level >= m_level) {
-#ifdef REMIX_BRIDGE_CLIENT
-      static char c_line[4096];
-      int len = sprintf_s(c_line, "%s\n", line.c_str());
-#ifdef _DEBUG
-      OutputDebugStringA(c_line);
-#endif
-      if (m_hFile != INVALID_HANDLE_VALUE) {
-        WriteFile(m_hFile, c_line, len, NULL, NULL);
+      if (m_capReached) {
+        if (level < LogLevel::Error || m_bytesWritten >= kMaxLogBytes + kErrorReserveBytes) {
+          return;
+        }
+      } else if (m_bytesWritten >= kMaxLogBytes) {
+        m_capReached = true;
+        emitLine(LogLevel::Error, "err:   [Log] This log reached 20 MB. From here on only errors are written.");
+        if (level < LogLevel::Error) {
+          return;
+        }
       }
-#else
-      if (m_fileStream.is_open()) {
-        m_fileStream << line << std::endl;
-      }
+      const std::string text = line + kLineEnd;
+      m_bytesWritten += text.size();
+#if defined(REMIX_BRIDGE_CLIENT) && defined(_DEBUG)
+      OutputDebugStringA(text.c_str());
 #endif
+      // Each line goes to the file in one write, so a crash right after it does not lose it.
+      if (m_hFile != nullptr) {
+        DWORD written = 0;
+        WriteFile(m_hFile, text.data(), static_cast<DWORD>(text.size()), &written, NULL);
+      }
     }
   }
   

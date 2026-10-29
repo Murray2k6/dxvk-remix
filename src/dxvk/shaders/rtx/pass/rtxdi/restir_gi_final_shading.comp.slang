@@ -199,7 +199,7 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
       }
 
       // TODO: Why ignore SSS here?
-      VisibilityResult visibility = traceVisibilityRay<visibilityModeEnablePom | visibilityModeAccurateHitDistance>(minimalSurfaceInteraction,
+      VisibilityResult visibility = traceVisibilityRay<visibilityModeEnablePom | visibilityModeAccurateHitDistance | visibilityModePomIndirect>(minimalSurfaceInteraction,
         samplePosition, rayMask, portalID,
         geometryFlags.portalSpace, geometryFlags.pomOpaqueSurfaceEncountered, 0, coneSpreadAngle, tMaxFactor, geometryFlags.isViewModel, 
         false, primarySurfaceIndex, SharedTextureCoord[threadIndex], /*isThinOpaqueSubsurface*/ false, /*shadingNormal*/ vec3(0.0f), /*clearOpaqueHitAttenuation*/ !validateSamples);

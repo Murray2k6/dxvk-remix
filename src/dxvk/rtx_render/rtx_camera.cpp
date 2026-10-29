@@ -634,7 +634,8 @@ namespace dxvk
 
   bool RtCamera::update(
     uint32_t frameIdx, const Matrix4& newWorldToView, const Matrix4& newViewToProjection,
-    float fov, float aspectRatio, float nearPlane, float farPlane, bool isLHS, uint32_t flags) {
+    float fov, float aspectRatio, float nearPlane, float farPlane, bool isLHS, uint32_t flags,
+    const Matrix4d* preciseWorldToView) {
     if (m_frameLastTouched == frameIdx) {
       return false;
     }
@@ -665,7 +666,9 @@ namespace dxvk
     m_matCache[MatrixType::PreviousWorldToView] = m_matCache[MatrixType::WorldToView];
     m_matCache[MatrixType::PreviousViewToWorld] = m_matCache[MatrixType::ViewToWorld];
     m_matCache[MatrixType::UncorrectedPreviousViewToWorld] = m_matCache[MatrixType::ViewToWorld];
-    m_matCache[MatrixType::WorldToView] = freeCameraViewRelative() ? Matrix4d{ newWorldToView } : Matrix4d();
+    m_matCache[MatrixType::WorldToView] = freeCameraViewRelative()
+      ? (preciseWorldToView != nullptr ? *preciseWorldToView : Matrix4d{ newWorldToView })
+      : Matrix4d();
     m_matCache[MatrixType::ViewToWorld] = inverse(m_matCache[MatrixType::WorldToView]);
 
     // Setup Translated World/View Matrix Data
@@ -933,6 +936,7 @@ namespace dxvk
     camera.prevTranslatedWorldToView = prevTranslatedWorldToView;
     camera.prevTranslatedWorldToProjection = prevViewToProjection * prevTranslatedWorldToView;
 
+    camera.projectionToPrevProjection = prevViewToProjection * viewToPrevView * projectionToView;
     camera.projectionToPrevProjectionJittered = prevViewToProjectionJittered * viewToPrevView * projectionToViewJittered;
     
     camera.resolution = uvec2 { m_renderResolution[0], m_renderResolution[1] };

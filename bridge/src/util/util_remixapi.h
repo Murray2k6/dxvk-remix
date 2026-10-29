@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -81,6 +81,7 @@ struct Handle {
 using MaterialHandle = Handle<remixapi_MaterialHandle>;
 using MeshHandle = Handle<remixapi_MeshHandle>;
 using LightHandle = Handle<remixapi_LightHandle>;
+using TextureHandle = Handle<remixapi_TextureHandle>;
 
 struct AnyInfoPrototype {
   remixapi_StructType sType;

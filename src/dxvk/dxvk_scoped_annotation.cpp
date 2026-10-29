@@ -24,12 +24,21 @@
 #include "dxvk_scoped_annotation.h"
 #include "dxvk_context.h"
 #include "dxvk_device.h"
+#include "rtx_render/rtx_gpu_breadcrumbs.h"
 #include "client/TracyProfiler.hpp"
 
 // Global overload
 TRACY_OBJECT_MEMORY_PROFILING
 
 namespace dxvk {
+
+  namespace {
+    // Returns the context's exec command buffer, or VK_NULL_HANDLE between command lists.
+    VkCommandBuffer execCmdBuffer(const Rc<DxvkContext>& ctx) {
+      const Rc<DxvkCommandList>& cmd = ctx->getCommandList();
+      return cmd != nullptr ? cmd->getCmdBuffer(DxvkCmdBuffer::ExecBuffer) : VK_NULL_HANDLE;
+    }
+  }
 
   __ScopedAnnotation::__ScopedAnnotation(Rc<DxvkContext> ctx, const char* name) : m_ctx(ctx) {
     VkDebugUtilsLabelEXT info = {
@@ -39,9 +48,17 @@ namespace dxvk {
     // NV-DXVK start: Integrate Aftermath
     m_ctx->deviceDiagnosticCheckpoint(name);
     // NV-DXVK end
+
+    if (GpuBreadcrumbs* breadcrumbs = m_ctx->getDevice()->gpuBreadcrumbs()) {
+      m_breadcrumb = breadcrumbs->begin(execCmdBuffer(m_ctx), name);
+    }
   }
 
   __ScopedAnnotation::~__ScopedAnnotation() {
+    // The end marker goes into the command buffer the context records into now.
+    if (m_breadcrumb != 0) {
+      m_ctx->getDevice()->gpuBreadcrumbs()->end(execCmdBuffer(m_ctx), m_breadcrumb);
+    }
     m_ctx->endDebugLabel();
   }
 
@@ -59,9 +76,17 @@ namespace dxvk {
     if (m_device->extensions().nvDeviceDiagnosticCheckpoints) {
       m_device->vkd()->vkCmdSetCheckpointNV(m_cmdBuf, (const void*)name);
     }
+
+    if (GpuBreadcrumbs* breadcrumbs = m_device->gpuBreadcrumbs()) {
+      m_breadcrumb = breadcrumbs->begin(m_cmdBuf, name);
+    }
   }
 
   __ScopedQueueAnnotation::~__ScopedQueueAnnotation() {
+    if (m_breadcrumb != 0) {
+      m_device->gpuBreadcrumbs()->end(m_cmdBuf, m_breadcrumb);
+    }
+
     if (m_device->instance()->extensions().extDebugUtils) {
       m_device->vkd()->vkCmdEndDebugUtilsLabelEXT(m_cmdBuf);
     }

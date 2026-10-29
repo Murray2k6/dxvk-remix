@@ -302,8 +302,14 @@ namespace ImGui_ImplDxvk {
       const ImDrawList* cmd_list = draw_data->CmdLists[n];
       const size_t listVtxBytes = cmd_list->VtxBuffer.Size * sizeof(ImDrawVert);
       const size_t listIdxBytes = cmd_list->IdxBuffer.Size * sizeof(ImDrawIdx);
-      ctx->updateBuffer(g->buffers.vb, vbOffset, listVtxBytes, cmd_list->VtxBuffer.Data);
-      ctx->updateBuffer(g->buffers.ib, ibOffset, listIdxBytes, cmd_list->IdxBuffer.Data);
+
+      // A draw list can exceed the 64 KiB limit of vkCmdUpdateBuffer, so large lists go through a staging copy.
+      if (listVtxBytes != 0) {
+        ctx->writeToBuffer(g->buffers.vb, vbOffset, listVtxBytes, cmd_list->VtxBuffer.Data);
+      }
+      if (listIdxBytes != 0) {
+        ctx->writeToBuffer(g->buffers.ib, ibOffset, listIdxBytes, cmd_list->IdxBuffer.Data);
+      }
 
       vbOffset += listVtxBytes;
       ibOffset += listIdxBytes;

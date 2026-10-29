@@ -25,6 +25,7 @@
 #include <cassert>
 
 #include "imgui.h"
+#include "dxvk_imgui.h"
 #include "../rtx_render/rtx_options.h"
 #include "../rtx_render/rtx_bridge_message_channel.h"
 #include "../rtx_render/rtx_utils.h"
@@ -85,8 +86,9 @@ namespace dxvk {
 
       if (ImGui::Begin("Splash Message", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove)) {
         const auto keyBindDescriptor = buildKeyBindDescriptorStringForDisplay(RtxOptions::remixMenuKeyBinds());
-        std::string message = str::format("Welcome to RTX Remix. Use ", keyBindDescriptor, " to access the RTX Remix Menu and change settings. Closing in ", clampedSecondsRemaining);
-        ImGui::Text(message.c_str());
+        const std::string& productName = ImGUI::productName();
+        std::string message = str::format("Welcome to ", ImGUI::productNameWithVersion(), ". Use ", keyBindDescriptor, " to access the ", productName, " Menu and change settings. Closing in ", clampedSecondsRemaining);
+        ImGui::TextUnformatted(message.c_str());
       }
       ImGui::End();
 

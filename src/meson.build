@@ -30,6 +30,7 @@ endif
 
 if get_option('enable_d3d9')
   subdir('dxso')
+  subdir('frontends')
   subdir('d3d9')
 endif
 

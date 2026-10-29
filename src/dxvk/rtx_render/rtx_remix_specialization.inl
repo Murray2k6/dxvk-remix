@@ -78,6 +78,8 @@ namespace pnext::detail {
     remixapi_MaterialInfoTranslucentEXT,
     remixapi_MaterialInfoOpaqueEXT,
     remixapi_MaterialInfoOpaqueSubsurfaceEXT,
+    remixapi_MaterialInfoOpaqueSpecGlossEXT,
+    remixapi_MaterialInfoOpaqueAlbedoTintEXT,
     remixapi_LightInfoSphereEXT,
     remixapi_LightInfoRectEXT,
     remixapi_LightInfoDiskEXT,
@@ -87,6 +89,7 @@ namespace pnext::detail {
     remixapi_LightInfoUSDEXT,
     remixapi_LightInfo,
     remixapi_MeshInfo,
+    remixapi_MeshInfoRefreshGeometryEXT,
     remixapi_InstanceInfo,
     remixapi_InstanceInfoBoneTransformsEXT,
     remixapi_InstanceInfoBlendEXT,
@@ -94,8 +97,10 @@ namespace pnext::detail {
     remixapi_InstanceInfoParticleSystemEXT,
     remixapi_InstanceInfoParticleSystemLegacyEXT,
     remixapi_InstanceInfoGpuInstancingEXT,
+    remixapi_InstanceInfoMaterialOverrideEXT,
     remixapi_CameraInfo,
     remixapi_CameraInfoParameterizedEXT,
+    remixapi_CameraInfoFrameEventsEXT,
     remixapi_CameraMediumInfo,
     remixapi_TextureInfo
   >;
@@ -106,6 +111,8 @@ namespace pnext::detail {
   template<> constexpr auto ToEnum< remixapi_MaterialInfoTranslucentEXT     > = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_TRANSLUCENT_EXT;
   template<> constexpr auto ToEnum< remixapi_MaterialInfoOpaqueEXT          > = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
   template<> constexpr auto ToEnum< remixapi_MaterialInfoOpaqueSubsurfaceEXT> = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_SUBSURFACE_EXT;
+  template<> constexpr auto ToEnum< remixapi_MaterialInfoOpaqueSpecGlossEXT > = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_SPEC_GLOSS_EXT;
+  template<> constexpr auto ToEnum< remixapi_MaterialInfoOpaqueAlbedoTintEXT> = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_ALBEDO_TINT_EXT;
   template<> constexpr auto ToEnum< remixapi_LightInfoSphereEXT             > = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
   template<> constexpr auto ToEnum< remixapi_LightInfoRectEXT               > = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_RECT_EXT;
   template<> constexpr auto ToEnum< remixapi_LightInfoDiskEXT               > = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISK_EXT;
@@ -115,6 +122,7 @@ namespace pnext::detail {
   template<> constexpr auto ToEnum< remixapi_LightInfoUSDEXT                > = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_USD_EXT;
   template<> constexpr auto ToEnum< remixapi_LightInfo                      > = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
   template<> constexpr auto ToEnum< remixapi_MeshInfo                       > = REMIXAPI_STRUCT_TYPE_MESH_INFO;
+  template<> constexpr auto ToEnum< remixapi_MeshInfoRefreshGeometryEXT     > = REMIXAPI_STRUCT_TYPE_MESH_INFO_REFRESH_GEOMETRY_EXT;
   template<> constexpr auto ToEnum< remixapi_InstanceInfo                   > = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
   template<> constexpr auto ToEnum< remixapi_InstanceInfoBoneTransformsEXT  > = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
   template<> constexpr auto ToEnum< remixapi_InstanceInfoBlendEXT           > = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
@@ -122,8 +130,10 @@ namespace pnext::detail {
   template<> constexpr auto ToEnum< remixapi_InstanceInfoParticleSystemLegacyEXT > = REMIXAPI_STRUCT_TYPE_DEPRECATED_LEGACY_PARTICLE_SYSTEM;
   template<> constexpr auto ToEnum< remixapi_InstanceInfoParticleSystemEXT  > = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SYSTEM_EXT;
   template<> constexpr auto ToEnum< remixapi_InstanceInfoGpuInstancingEXT   > = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT;
+  template<> constexpr auto ToEnum< remixapi_InstanceInfoMaterialOverrideEXT> = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MATERIAL_OVERRIDE_EXT;
   template<> constexpr auto ToEnum< remixapi_CameraInfo                     > = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
   template<> constexpr auto ToEnum< remixapi_CameraInfoParameterizedEXT     > = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_PARAMETERIZED_EXT;
+  template<> constexpr auto ToEnum< remixapi_CameraInfoFrameEventsEXT       > = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_FRAME_EVENTS_EXT;
   template<> constexpr auto ToEnum< remixapi_CameraMediumInfo               > = REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_INFO;
   template<> constexpr auto ToEnum< remixapi_TextureInfo                    > = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
 
@@ -132,6 +142,8 @@ namespace pnext::detail {
   template<>           struct Root< remixapi_MaterialInfoTranslucentEXT     >{ using Type = remixapi_MaterialInfo;              };
   template<>           struct Root< remixapi_MaterialInfoOpaqueEXT          >{ using Type = remixapi_MaterialInfo;              };
   template<>           struct Root< remixapi_MaterialInfoOpaqueSubsurfaceEXT>{ using Type = remixapi_MaterialInfo;              };
+  template<>           struct Root< remixapi_MaterialInfoOpaqueSpecGlossEXT >{ using Type = remixapi_MaterialInfo;              };
+  template<>           struct Root< remixapi_MaterialInfoOpaqueAlbedoTintEXT>{ using Type = remixapi_MaterialInfo;              };
   template<>           struct Root< remixapi_LightInfoSphereEXT             >{ using Type = remixapi_LightInfo;                 };
   template<>           struct Root< remixapi_LightInfoRectEXT               >{ using Type = remixapi_LightInfo;                 };
   template<>           struct Root< remixapi_LightInfoDiskEXT               >{ using Type = remixapi_LightInfo;                 };
@@ -139,12 +151,15 @@ namespace pnext::detail {
   template<>           struct Root< remixapi_LightInfoDistantEXT            >{ using Type = remixapi_LightInfo;                 };
   template<>           struct Root< remixapi_LightInfoDomeEXT               >{ using Type = remixapi_LightInfo;                 };
   template<>           struct Root< remixapi_LightInfoUSDEXT                >{ using Type = remixapi_LightInfo;                 };
+  template<>           struct Root< remixapi_MeshInfoRefreshGeometryEXT    >{ using Type = remixapi_MeshInfo;                  };
   template<>           struct Root< remixapi_InstanceInfoBoneTransformsEXT  >{ using Type = remixapi_InstanceInfo;              };
   template<>           struct Root< remixapi_InstanceInfoBlendEXT           >{ using Type = remixapi_InstanceInfo;              };
   template<>           struct Root< remixapi_InstanceInfoObjectPickingEXT   >{ using Type = remixapi_InstanceInfo;              };
   template<>           struct Root< remixapi_InstanceInfoParticleSystemEXT  >{ using Type = remixapi_InstanceInfo;              };
   template<>           struct Root< remixapi_InstanceInfoParticleSystemLegacyEXT >{ using Type = remixapi_InstanceInfo;         };
   template<>           struct Root< remixapi_InstanceInfoGpuInstancingEXT   >{ using Type = remixapi_InstanceInfo;              };
+  template<>           struct Root< remixapi_InstanceInfoMaterialOverrideEXT>{ using Type = remixapi_InstanceInfo;              };
   template<>           struct Root< remixapi_CameraInfoParameterizedEXT     >{ using Type = remixapi_CameraInfo;                };
+  template<>           struct Root< remixapi_CameraInfoFrameEventsEXT       >{ using Type = remixapi_CameraInfo;                };
   // clang-format on
 }

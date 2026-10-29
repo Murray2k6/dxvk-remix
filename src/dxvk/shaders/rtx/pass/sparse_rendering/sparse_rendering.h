@@ -21,8 +21,6 @@
 */
 #pragma once
 
-#include "rtx/pass/nrc_args.h"
-
 enum class SparseRenderingMode : uint32_t {
   Off = 0,
   Uniform = 1,
@@ -37,24 +35,26 @@ enum class PerPixelRateNoiseSource : uint32_t {
 // Note: ensure 16B alignment
 struct SparseRenderingArgs
 {
-  NrcArgs nrcArgs;
-
   SparseRenderingMode mode;
   PerPixelRateNoiseSource perPixelRateNoiseSource;
-  float directPixelSamplingRate;
-  float indirectPixelSamplingRate;
+  float pixelSamplingRate;
+  uint resampledNrcTrainingPaths;
 
-  uint forceNrcTrainingPixelsActive;
   uint enableSparsePrimaryRayMissComposition;
   uint enableSparseSecondaryLighting;
   uint enableRtxdiReuseForInactivePixels;
-
   uint enableSparseVolumetricsPrimaryHit;
+
   uint enableSparseVolumetricsPrimaryMiss;
   uint enableSparsePrimarySpecularAlbedo;
-  uint pad0;
-
   // Dimensions of the active-pixel mask buffer in mask elements (ceil(resolution / blockSize)).
   uvec2 activePixelMaskExtent;
-  uvec2 pad1;
+
+  uint enableLightIdentityResolution;
+  // Set when the compaction pass also builds the global active-pixel list.
+  uint compactActivePixels;
+  // COMPACT_ACTIVE_PIXELS_LAUNCH_* bits of the passes launched over the active-pixel list this frame.
+  uint compactedLaunchMask;
+  // Number of entries the active-pixel list can hold.
+  uint activePixelListCapacity;
 };

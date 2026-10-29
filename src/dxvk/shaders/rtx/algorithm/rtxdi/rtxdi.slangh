@@ -4,7 +4,7 @@
 #include "rtxdi/Reservoir.slangh"
 #include "rtx/concept/surface_material/surface_material.slangh"
 #include "rtx/utility/geometry_flags.slangh"
-#include "RtxdiApplicationBridge.slangh"
+#include "rtx/algorithm/rtxdi/rtxdi_application_bridge_ext.slangh"
 #include "rtxdi/ResamplingFunctions.slangh"
 
 // RTXDI gradient pass needs to tell if an object is stationary or not.

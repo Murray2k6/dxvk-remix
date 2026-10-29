@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -20,6 +20,11 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #pragma once
+
+#ifdef VISIBILITY_CORE_MATERIAL
+// The core material records, for the translucent G-buffer decode below.
+#include "rtx/concept/surface_material/core_surface_material_binding.slangh"
+#endif
 
 // Translucent Surface Material Interaction Helper Functions
 
@@ -78,11 +83,23 @@ TranslucentSurfaceMaterialInteraction translucentSurfaceMaterialInteractionCreat
 
     // Take a second sample before taking the primary, so that we don't have to keep the secondary UV around.
     // Use a lod bias now and a different texcoord velocity to make it a second 'layer' of normals.
-    const vec2 secondaryUV = uvBias + uvSize *(frac(uvPreSpritesheet + cb.timeSinceStartSeconds * cb.translucentMaterialArgs.animatedWaterSecondaryNormalMotion));
+    // An optional UV scale for the secondary sample. It scales the raw (pre-frac) texcoord so a non-integer scale
+    // stays seamless across tile borders. Spritesheets keep the unscaled path.
+    const float secondaryScale = cb.translucentMaterialArgs.animatedWaterSecondaryNormalScale;
+    const bool scaleSecondary = secondaryScale != 1.0f && surface.spriteSheetCols <= 1 && surface.spriteSheetRows <= 1;
+    const vec2 secondaryBaseUV = scaleSecondary ? surfaceInteraction.textureCoordinates * secondaryScale : uvPreSpritesheet;
+    const vec2 secondaryUV = uvBias + uvSize *(frac(secondaryBaseUV + cb.timeSinceStartSeconds * cb.translucentMaterialArgs.animatedWaterSecondaryNormalMotion));
     const float lodBias = cb.translucentMaterialArgs.animatedWaterSecondaryNormalLodBias;
 
-    surfaceInteraction.textureCoordinates = secondaryUV;;
+    // The ray-cone footprint is in primary-UV units, so it is scaled with the texcoords for the secondary
+    // read to pick the matching mip, then restored for the primary read.
+    const float secondaryGradientScale = scaleSecondary ? secondaryScale : 1.0f;
+    surfaceInteraction.textureGradientX *= secondaryGradientScale;
+    surfaceInteraction.textureGradientY *= secondaryGradientScale;
+    surfaceInteraction.textureCoordinates = secondaryUV;
     secondNormalLoaded = surfaceMaterialInteractionTextureReadHelper(translucentSurfaceMaterial.normalTextureIndex, translucentSurfaceMaterial.samplerIndex, surfaceInteraction, secondNormalSample, lodBias);
+    surfaceInteraction.textureGradientX /= secondaryGradientScale;
+    surfaceInteraction.textureGradientY /= secondaryGradientScale;
     surfaceInteraction.textureCoordinates = primaryUV;
   }
 
@@ -174,7 +191,7 @@ TranslucentSurfaceMaterialInteraction translucentSurfaceMaterialInteractionCreat
   // Additionally, this logic is duplicated in creating a translucent surface material interaction from the G-Buffer, so remember to
   // update that logic as well if this logic is changed.
   translucentSurfaceMaterialInteraction.emissiveRadiance =
-    emissiveColor * translucentSurfaceMaterial.emissiveIntensity * uint16BitsToF32(cb.emissiveIntensity);
+    emissiveColor * translucentSurfaceMaterial.emissiveIntensity * uint16BitsToF32(cb.emissiveIntensity) * cb.preExposure;
 
   translucentSurfaceMaterialInteraction.sourceSurfaceMaterialIndex = translucentSurfaceMaterial.sourceSurfaceMaterialIndex;
   // Note: This could only be set when the emissive color is sourced from a texture, but we just do it always to simplify the encoding/decoding logic for now (as these ALU instructions
@@ -184,6 +201,10 @@ TranslucentSurfaceMaterialInteraction translucentSurfaceMaterialInteractionCreat
   translucentSurfaceMaterialInteraction.sourcePackedGammaEmissiveColor = colorToR5G6B5(linearToGammaFast(emissiveColor));
 
   translucentSurfaceMaterialInteraction.flags = translucentSurfaceMaterial.flags;
+
+#ifdef RAY_TRACING_PRIMARY_RAY
+  storeSamplerFeedback(translucentSurfaceMaterial.samplerFeedbackStamp, surfaceInteraction);
+#endif
 
   return translucentSurfaceMaterialInteraction;
 }
@@ -237,7 +258,12 @@ TranslucentSurfaceMaterialInteraction translucentSurfaceMaterialInteractionCreat
   // becomes a problem then perhaps upload a more "source" representation of transparent material params from the CPU rather than these
   // more derived representations (which is only done as we had space in the memory material to spare to avoid more complex GPU decoding)
   // and pass through the G-Buffer like we do for Opaque materials.
+#ifdef VISIBILITY_CORE_MATERIAL
+  // The same 36 B from the core record of the source surface, where class 1 keeps them verbatim.
+  const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = coreSurfaceMaterialTranslucentMemory(uint(sourceSurfaceMaterialIndex));
+#else
   const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[uint(sourceSurfaceMaterialIndex)];
+#endif
   const TranslucentSurfaceMaterial translucentSurfaceMaterial =
     translucentSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
 
@@ -261,7 +287,7 @@ TranslucentSurfaceMaterialInteraction translucentSurfaceMaterialInteractionCreat
   // Note: Re-derive emissive radiance in the same way translucent surface material interaction creation is done (should match
   // the implementation in the creation function).
   const vec3 emissiveRadiance =
-    emissiveColor * translucentSurfaceMaterial.emissiveIntensity * uint16BitsToF32(cb.emissiveIntensity);
+    emissiveColor * translucentSurfaceMaterial.emissiveIntensity * uint16BitsToF32(cb.emissiveIntensity) * cb.preExposure;
 
   translucentSurfaceMaterialInteraction.emissiveRadiance = emissiveRadiance;
 
@@ -858,10 +884,10 @@ SurfaceMaterialInteractionPSRSample translucentSurfaceMaterialInteractionCalcPSR
   SurfaceMaterialInteractionPSRSample materialPSRSample;
 
   materialPSRSample.performPSR = true;
-  materialPSRSample.useAlternateDisocclusionThreshold = 
-    cb.enableDLSSRR 
-    ? translucentSurfaceMaterialInteraction.isAnimatedWater
-    : translucentSurfaceMaterialInteraction.normalDetail > float(cb.psrrNormalDetailThreshold);
+  materialPSRSample.useAlternateDisocclusionThreshold =
+    cb.enableDLSSRR
+    ? (translucentSurfaceMaterialInteraction.isAnimatedWater && cb.invalidateHistoryForAnimatedWater)
+    : (translucentSurfaceMaterialInteraction.normalDetail > float(cb.psrrNormalDetailThreshold));
   materialPSRSample.inputDirection = inputDirection;
   materialPSRSample.attenuation = attenuation;
   materialPSRSample.vectorTransform = getReflectionQuaternion(microfacetNormal);
@@ -1073,9 +1099,9 @@ SurfaceMaterialInteractionPSRSample translucentSurfaceMaterialInteractionCalcPSR
 
   materialPSRSample.performPSR = true;
   materialPSRSample.useAlternateDisocclusionThreshold =
-    cb.enableDLSSRR 
-    ? translucentSurfaceMaterialInteraction.isAnimatedWater
-    : translucentSurfaceMaterialInteraction.normalDetail > float(cb.pstrNormalDetailThreshold);
+    cb.enableDLSSRR
+    ? (translucentSurfaceMaterialInteraction.isAnimatedWater && cb.invalidateHistoryForAnimatedWater)
+    : (translucentSurfaceMaterialInteraction.normalDetail > float(cb.pstrNormalDetailThreshold));
   materialPSRSample.inputDirection = inputDirection;
   materialPSRSample.attenuation = attenuation;
   materialPSRSample.vectorTransform = vectorTransform;

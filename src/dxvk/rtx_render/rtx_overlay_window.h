@@ -29,8 +29,7 @@
 
 namespace dxvk {
 
-// Forward decls so GameOverlay can friend the fork hook that needs access
-// to private m_hwnd state. See docs/fork-touchpoints.md.
+// Declared here so GameOverlay can befriend the hook, which uses m_hwnd.
 class GameOverlay;
 namespace fork_hooks {
   void overlayInputForward(
@@ -38,9 +37,6 @@ namespace fork_hooks {
 }
 
   class GameOverlay : public RcObject {
-    // Fork touchpoint: the overlay input-forward hook (keyboard + mouse)
-    // needs access to private m_hwnd. Tracked as an inline tweak in
-    // docs/fork-touchpoints.md.
     friend void fork_hooks::overlayInputForward(
       GameOverlay&, HWND, UINT, WPARAM, LPARAM);
   public:
@@ -56,15 +52,10 @@ namespace fork_hooks {
     void gameWndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
     LRESULT overlayWndProc(HWND, UINT, WPARAM, LPARAM);
 
-    // Recency check for raw-input delivery. Used by overlayInputForward to
-    // gate mouse forwarding via the game wnd proc fallback: when Path B
-    // (WM_INPUT on the overlay HWND) is actively delivering, Path A must
-    // skip mouse so two coord-systems don't fight for io.MousePos. When
-    // raw input stops (e.g., plugin HUD pulls focus and our raw-input
-    // registration goes silent), Path A picks up after the threshold lapses.
-    // Threshold deliberately generous (~100ms) — Path B fires concurrently
-    // with Path A on every real input event, so a tight window is fine and
-    // a longer one avoids false-positive "Path B dead" on sporadic activity.
+    // Whether raw input (Path B, WM_INPUT on the overlay window) arrived within kRawInputRecencyMs.
+    // overlayInputForward skips keyboard and mouse on the game WndProc fallback (Path A) while it did, so
+    // ImGui never gets an event twice. When raw input goes silent, such as when the plugin HUD takes focus,
+    // Path A picks up.
     bool isRawInputRecent() const {
       const uint64_t last = m_lastRawInputTickMs.load(std::memory_order_relaxed);
       if (last == 0) {

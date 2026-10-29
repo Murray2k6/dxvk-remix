@@ -25,10 +25,19 @@
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx.h"
 #include "rtx/pass/tonemap/tonemapping.h"
+#include "rtx_host_calibration.h"
 
-#include <rtx_shaders/auto_exposure.h>
-#include <rtx_shaders/auto_exposure_histogram.h>
+#include <rtx_shaders/auto_exposure_halo_meter.h>
+#include <rtx_shaders/auto_exposure_halo_resolve.h>
 #include "rtx_imgui.h"
+#include "rtx_context.h"
+#include "rtx_pre_exposure.h"
+#include "rtx_photometer.h"
+#include "rtx_numos.h"
+#include "numos/renderer.h"
+
+#include <algorithm>
+#include <cmath>
 #include "rtx_render/rtx_debug_view.h"
 
 #include "rtx/utility/debug_view_indices.h"
@@ -36,33 +45,37 @@
 namespace dxvk {
   // Defined within an unnamed namespace to ensure unique definition across binary
   namespace {
-    class AutoExposureHistogramShader : public ManagedShader {
-      SHADER_SOURCE(AutoExposureHistogramShader, VK_SHADER_STAGE_COMPUTE_BIT, auto_exposure_histogram)
+    // Halo Meter (halocedlaart Halo CE addon's Meter / MeterResolve, see the .comp.slang
+    // headers for provenance).
+    class AutoExposureHaloMeterShader : public ManagedShader {
+      SHADER_SOURCE(AutoExposureHaloMeterShader, VK_SHADER_STAGE_COMPUTE_BIT, auto_exposure_halo_meter)
 
-      PUSH_CONSTANTS(ToneMappingAutoExposureArgs)
+      PUSH_CONSTANTS(ToneMappingHaloMeterArgs)
 
       BEGIN_PARAMETER()
-        RW_TEXTURE2D(AUTO_EXPOSURE_COLOR_INPUT)
-        RW_TEXTURE1D(AUTO_EXPOSURE_HISTOGRAM_INPUT_OUTPUT)
+        RW_TEXTURE2D(AUTO_EXPOSURE_HALO_COLOR_INPUT)
+        TEXTURE2D(AUTO_EXPOSURE_HALO_ALBEDO_INPUT)
+        TEXTURE2D(AUTO_EXPOSURE_HALO_LINEAR_VIEW_Z_INPUT)
+        TEXTURE2D(AUTO_EXPOSURE_HALO_SHARED_FLAGS_INPUT)
+        RW_TEXTURE2D(AUTO_EXPOSURE_HALO_PARTIALS_INPUT_OUTPUT)
       END_PARAMETER()
     };
 
-    PREWARM_SHADER_PIPELINE(AutoExposureHistogramShader);
+    PREWARM_SHADER_PIPELINE(AutoExposureHaloMeterShader);
 
-    class AutoExposureShader : public ManagedShader
-    {
-      SHADER_SOURCE(AutoExposureShader, VK_SHADER_STAGE_COMPUTE_BIT, auto_exposure)
+    class AutoExposureHaloResolveShader : public ManagedShader {
+      SHADER_SOURCE(AutoExposureHaloResolveShader, VK_SHADER_STAGE_COMPUTE_BIT, auto_exposure_halo_resolve)
 
-      PUSH_CONSTANTS(ToneMappingAutoExposureArgs)
+      PUSH_CONSTANTS(ToneMappingHaloMeterArgs)
 
       BEGIN_PARAMETER()
-        RW_TEXTURE1D(AUTO_EXPOSURE_HISTOGRAM_INPUT_OUTPUT)
-        RW_TEXTURE1D(AUTO_EXPOSURE_EXPOSURE_INPUT_OUTPUT)
-        RW_TEXTURE2D(AUTO_EXPOSURE_DEBUG_VIEW_OUTPUT)
+        RW_TEXTURE2D(AUTO_EXPOSURE_HALO_PARTIALS_INPUT_OUTPUT)
+        RW_TEXTURE1D(AUTO_EXPOSURE_HALO_STATE_INPUT_OUTPUT)
+        RW_TEXTURE1D(AUTO_EXPOSURE_HALO_EXPOSURE_OUTPUT)
       END_PARAMETER()
     };
 
-    PREWARM_SHADER_PIPELINE(AutoExposureShader);
+    PREWARM_SHADER_PIPELINE(AutoExposureHaloResolveShader);
   }
 
   DxvkAutoExposure::DxvkAutoExposure(DxvkDevice* device)
@@ -72,16 +85,39 @@ namespace dxvk {
   DxvkAutoExposure::~DxvkAutoExposure()  {  }
 
   void DxvkAutoExposure::showImguiSettings() {
-    RemixGui::Checkbox("Perceptual Eye Adaptation", &enabledObject());
+    RemixGui::Checkbox("Auto Exposure", &enabledObject());
     if (enabled()) {
       ImGui::Indent();
-      RemixGui::DragFloat("Light Adapt Tau (s)", &lightAdaptTauObject(), 0.005f, 0.01f, 5.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
-      RemixGui::DragFloat("Dark Adapt Tau (s)",  &darkAdaptTauObject(),  0.01f,  0.05f, 10.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
-      RemixGui::DragFloat("Target Mid-Gray (Yf)", &targetAdaptedYfObject(), 0.001f, 0.01f, 2.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
-      RemixGui::DragFloat("Max Exposure (x)",     &maxExposureObject(),     0.1f,  1.0f, 64.0f, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
+      if (ImGui::Button("Preset: Addon-Faithful")) {
+        addonFaithfulObject().setDeferred(true);
+        maxEvObject().setDeferred(8.0f);
+      }
+      // Ranges are the addon's own slider ranges (addon.cpp).
+      RemixGui::DragFloat("Exposure Target",  &targetObject(),       0.001f, 0.02f,  0.6f, "%.3f",    ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Adaptation Speed", &speedObject(),        0.01f,  0.1f,  16.0f, "%.2f",    ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Center Weighting", &centreWeightObject(), 0.01f,  0.0f,   1.0f, "%.2f",    ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Exposure Floor",   &minEvObject(),        0.1f, -24.0f,   0.0f, "%.1f EV", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Exposure Ceiling", &maxEvObject(),        0.1f,   0.0f,  24.0f, "%.1f EV", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::Checkbox("Meter Lighting (divide albedo out)", &demodulateAlbedoObject());
+      RemixGui::Checkbox("Exclude View Model", &excludeViewModelObject());
+      RemixGui::Checkbox("Addon-Faithful Sky (no floor / hold)", &addonFaithfulObject());
+      ImGui::BeginDisabled(addonFaithful());
+      RemixGui::DragFloat("Sky Weight Max",       &skyWeightMaxObject(), 0.01f,  0.0f,   1.0f, "%.2f",    ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Sky Luminance Low",    &skyLumLowObject(),    0.001f, 0.0f,  10.0f, "%.4f",    ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Sky Luminance High",   &skyLumHighObject(),   0.001f, 0.0f,  10.0f, "%.4f",    ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Darkest Scene (Mean Floor)", &meanFloorEvObject(), 0.1f, -24.0f, 4.0f, "%.1f EV", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Min Scene Coverage",   &minCoverageObject(),  0.005f, 0.0f,   0.5f, "%.3f",    ImGuiSliderFlags_AlwaysClamp);
+      ImGui::EndDisabled();
+      RemixGui::DragFloat("Night Compensation",   &compensationNightStopsObject(), 0.05f, -8.0f, 8.0f, "%.2f stops", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::SetTooltipToLastWidgetOnHover("Exposure compensation curve: bias at night (scene EV100 at or below Night EV), "
+                                              "fading to 0 at Day EV. About -2 to -4 keeps a night darker than mid gray.");
+      RemixGui::DragFloat("Night EV",             &compensationNightEvObject(),    0.1f, -12.0f, 16.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Day EV",               &compensationDayEvObject(),      0.1f, -12.0f, 20.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+      ImGui::TextDisabled("Global Exposure (tonemapper) stays an EV offset on top of the meter.");
       RemixGui::Separator();
       ImGui::Unindent();
     }
+    PreExposure::showImguiSettings();
   }
 
   void DxvkAutoExposure::createResources(Rc<DxvkContext> ctx) {
@@ -112,81 +148,162 @@ namespace dxvk {
     desc.extent = VkExtent3D{ 1, 1, 1 };
 
     viewInfo.format = desc.format = VK_FORMAT_R32_SFLOAT;
-    viewInfo.usage = desc.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // Transfer source: PreExposure reads the exposure back (rtx_pre_exposure.cpp).
+    // The transfer stage and access make DXVK's barriers after clears and compute writes cover that copy.
+    viewInfo.usage = desc.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    desc.stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+    desc.access |= VK_ACCESS_TRANSFER_READ_BIT;
     m_exposure.image = device()->createImage(desc, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXRenderTarget, "autoexposure");
     m_exposure.view = device()->createImageView(m_exposure.image, viewInfo);
     ctx->changeImageLayout(m_exposure.image, VK_IMAGE_LAYOUT_GENERAL);
+    desc.stages &= ~VK_PIPELINE_STAGE_TRANSFER_BIT;
+    desc.access &= ~VK_ACCESS_TRANSFER_READ_BIT;
 
-    desc.extent = VkExtent3D { EXPOSURE_HISTOGRAM_SIZE, 1, 1 };
-    viewInfo.format = desc.format = VK_FORMAT_R32_UINT;
+    // Meter state: (adapted exposure, has-metered flag). The per-tile partials are sized lazily.
+    viewInfo.format = desc.format = VK_FORMAT_R32G32_SFLOAT;
     viewInfo.usage = desc.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    m_exposureHistogram.image = device()->createImage(desc, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXRenderTarget, "autoexposure histogram");
-    m_exposureHistogram.view = device()->createImageView(m_exposureHistogram.image, viewInfo);
-    ctx->changeImageLayout(m_exposureHistogram.image, VK_IMAGE_LAYOUT_GENERAL);
+    m_haloState.image = device()->createImage(desc, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXRenderTarget, "autoexposure halo meter state");
+    m_haloState.view = device()->createImageView(m_haloState.image, viewInfo);
+    ctx->changeImageLayout(m_haloState.image, VK_IMAGE_LAYOUT_GENERAL);
+    m_haloResetState = true;
   }
 
-  void DxvkAutoExposure::dispatchAutoExposure(
-    Rc<DxvkContext> ctx,
-    Rc<DxvkSampler> linearSampler,
-    const Resources::RaytracingOutput& rtOutput,
-    const float frameTimeMilliseconds) {
-
-    if (m_resetState || !enabled()) {
-      VkClearColorValue clearColor;
-      // Initial exposure scale = 1.0 so the first frame is unmodified.
-      clearColor.float32[0] = clearColor.float32[1] = clearColor.float32[2] = clearColor.float32[3] = 1.0f;
-
-      VkImageSubresourceRange subRange = {};
-      subRange.layerCount = 1;
-      subRange.levelCount = 1;
-      subRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-
-      ctx->clearColorImage(m_exposure.image, clearColor, subRange);
-
-      clearColor.uint32[0] = clearColor.uint32[1] = clearColor.uint32[2] = clearColor.uint32[3] = 0;
-      ctx->clearColorImage(m_exposureHistogram.image, clearColor, subRange);
-    }
-
-    if (!enabled()) {
+  void DxvkAutoExposure::createHaloPartials(Rc<DxvkContext> ctx, uint32_t groupsX, uint32_t groupsY) {
+    if (m_haloPartials.image != nullptr && m_haloPartialsX == groupsX && m_haloPartialsY == groupsY) {
       return;
     }
 
-    // Build push constants once; both passes use the same struct.
-    ToneMappingAutoExposureArgs pushArgs = {};
-    pushArgs.numPixels = rtOutput.m_finalOutputExtent.width * rtOutput.m_finalOutputExtent.height;
-    {
-      const float fallbackMs = RtxOptions::timeDeltaBetweenFrames() > 0.f ? RtxOptions::timeDeltaBetweenFrames() : 16.6f;
-      const float effectiveFrameTimeMs = frameTimeMilliseconds > 0.0f ? frameTimeMilliseconds : fallbackMs;
-      pushArgs.deltaTime = effectiveFrameTimeMs * 0.001f;
+    DxvkImageCreateInfo desc;
+    desc.type = VK_IMAGE_TYPE_2D;
+    desc.flags = 0;
+    desc.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    desc.numLayers = 1;
+    desc.mipLevels = 1;
+    desc.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    desc.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    desc.tiling = VK_IMAGE_TILING_OPTIMAL;
+    desc.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    desc.extent = VkExtent3D { groupsX, groupsY, 1 };
+    // (sum w*log, sum w, surface centre weight, total centre weight) per tile.
+    desc.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    desc.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+
+    DxvkImageViewCreateInfo viewInfo;
+    viewInfo.type = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.minLevel = 0;
+    viewInfo.numLevels = 1;
+    viewInfo.minLayer = 0;
+    viewInfo.numLayers = 1;
+    viewInfo.format = desc.format;
+    viewInfo.usage = desc.usage;
+
+    m_haloPartials.image = device()->createImage(desc, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXRenderTarget, "autoexposure halo meter partials");
+    m_haloPartials.view = device()->createImageView(m_haloPartials.image, viewInfo);
+    ctx->changeImageLayout(m_haloPartials.image, VK_IMAGE_LAYOUT_GENERAL);
+    m_haloPartialsX = groupsX;
+    m_haloPartialsY = groupsY;
+  }
+
+  void DxvkAutoExposure::dispatchHaloMeter(
+    Rc<DxvkContext> ctx,
+    const Resources::RaytracingOutput& rtOutput,
+    const float frameTimeMilliseconds) {
+    RtxContext* rtxCtx = static_cast<RtxContext*>(ctx.ptr());
+
+    // The addon snaps (instead of adapting) on its first frame and whenever the camera
+    // teleports (> 20 units in a frame); Remix's camera-cut detection is the analogue.
+    if (rtxCtx->getSceneManager().getCamera().isCameraCut()) {
+      m_haloResetState = true;
     }
-    pushArgs.lightAdaptTau      = lightAdaptTau();
-    pushArgs.darkAdaptTau       = darkAdaptTau();
-    pushArgs.targetAdaptedYf    = targetAdaptedYf();
-    pushArgs.maxExposure        = maxExposure();
-    pushArgs.debugMode = (ctx->getCommonObjects()->metaDebugView().debugViewIdx() == DEBUG_VIEW_EXPOSURE_HISTOGRAM);
+
+    VkImageSubresourceRange subRange = {};
+    subRange.layerCount = 1;
+    subRange.levelCount = 1;
+    subRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+
+    if (m_haloResetState) {
+      // Zero clears the has-metered flag too, so the resolve snaps this frame.
+      VkClearColorValue clearColor = {};
+      ctx->clearColorImage(m_haloState.image, clearColor, subRange);
+      m_haloResetState = false;
+    }
+
+    const VkExtent3D extent = rtOutput.m_finalOutputExtent;
+    const VkExtent3D groups = util::computeBlockCount(extent, VkExtent3D { AUTO_EXPOSURE_HALO_TILE, AUTO_EXPOSURE_HALO_TILE, 1 });
+    createHaloPartials(ctx, groups.width, groups.height);
+
+    NrdArgs primaryDirectNrdArgs;
+    NrdArgs primaryIndirectNrdArgs;
+    NrdArgs secondaryNrdArgs;
+    rtxCtx->getDenoiseArgs(primaryDirectNrdArgs, primaryIndirectNrdArgs, secondaryNrdArgs);
+
+    ToneMappingHaloMeterArgs args = {};
+    args.groupsX = groups.width;
+    args.groupsY = groups.height;
+    args.centreWeight = centreWeight();
+    args.target = target();
+    args.minEv = minEv();
+    args.maxEv = maxEv();
+    args.primaryMissLinearViewZ = primaryDirectNrdArgs.missLinearViewZ;
+    args.invPreExposure = PreExposure::inverse();
+    {
+      // Scene EV100 of the metered grey card: its luminance in cd/m^2 from the sky provider's calibration
+      // (NUMOS's lux per unit is also its cd/m^2 per radiance unit), 1 without one.
+      const numos::FrameOutputs* numosOutputs = device()->getCommon()->metaNumos().outputs();
+      const float candelaPerUnit = numosOutputs && numosOutputs->luxPerUnit > 0.0f ? numosOutputs->luxPerUnit : 1.0f;
+      args.evOffset = std::log2(candelaPerUnit * 100.0f / 12.5f);
+      args.compensationNightStops = compensationNightStops();
+      args.compensationNightEv = compensationNightEv();
+      args.compensationDayEv = compensationDayEv();
+    }
+    args.demodulateAlbedo = demodulateAlbedo() ? 1u : 0u;
+    args.excludeViewModel = excludeViewModel() ? 1u : 0u;
+    if (addonFaithful()) {
+      // The addon: sky at full weight whatever its brightness, no mean floor, no hold.
+      args.skyWeightMax = 1.0f;
+      args.skyLumLow = 0.0f;
+      args.skyLumHigh = 0.0f;   // high <= low => full weight
+      args.meanFloor = 0.0f;
+      args.minCoverage = 0.0f;
+    } else {
+      args.skyWeightMax = std::clamp(skyWeightMax(), 0.0f, 1.0f);
+      args.skyLumLow = std::max(skyLumLow(), 0.0f);
+      args.skyLumHigh = std::max(skyLumHigh(), 0.0f);
+      args.meanFloor = std::exp2(std::clamp(meanFloorEv(), -24.0f, 8.0f));
+      args.minCoverage = std::clamp(minCoverage(), 0.0f, 1.0f);
+    }
+    {
+      // The addon's stops-per-second speed as a per-frame fraction, 1 - exp(-dt * speed). dt is wall-clock
+      // time (1/60 s before the first measured frame), clamped to [0, 0.25] s so a hitch does not land the
+      // whole adaptation in one frame.
+      float dt = frameTimeMilliseconds > 0.0f ? frameTimeMilliseconds * 0.001f : (1.0f / 60.0f);
+      dt = std::clamp(dt, 0.0f, 0.25f);
+      const float speedValue = speed() > 0.0f ? speed() : 0.0f;
+      args.adaptation = 1.0f - std::exp(-dt * speedValue);
+    }
+
+    ctx->pushConstants(0, sizeof(args), &args);
 
     {
-      ScopedGpuProfileZone(ctx, "Histogram");
-      static_cast<RtxContext*>(ctx.ptr())->setFramePassStage(RtxFramePassStage::AutoExposure_Histogram);
-      ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
-
-      ctx->bindResourceView(AUTO_EXPOSURE_HISTOGRAM_INPUT_OUTPUT, m_exposureHistogram.view, nullptr);
-      ctx->bindResourceView(AUTO_EXPOSURE_COLOR_INPUT, rtOutput.m_finalOutput.view(Resources::AccessType::Read), nullptr);
-
-      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, AutoExposureHistogramShader::getShader());
-      const VkExtent3D workgroups = util::computeBlockCount(rtOutput.m_finalOutputExtent, VkExtent3D { 16, 16, 1 });
-      ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+      ScopedGpuProfileZone(ctx, "Halo Meter");
+      rtxCtx->setFramePassStage(RtxFramePassStage::AutoExposure_Histogram);
+      ctx->bindResourceView(AUTO_EXPOSURE_HALO_COLOR_INPUT, rtOutput.m_finalOutput.view(Resources::AccessType::Read), nullptr);
+      ctx->bindResourceView(AUTO_EXPOSURE_HALO_ALBEDO_INPUT, rtOutput.m_primaryAlbedo.view, nullptr);
+      ctx->bindResourceView(AUTO_EXPOSURE_HALO_LINEAR_VIEW_Z_INPUT, rtOutput.m_primaryLinearViewZ.view, nullptr);
+      ctx->bindResourceView(AUTO_EXPOSURE_HALO_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
+      ctx->bindResourceView(AUTO_EXPOSURE_HALO_PARTIALS_INPUT_OUTPUT, m_haloPartials.view, nullptr);
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, AutoExposureHaloMeterShader::getShader());
+      ctx->dispatch(groups.width, groups.height, 1);
     }
 
     {
-      ScopedGpuProfileZone(ctx, "Exposure");
-      static_cast<RtxContext*>(ctx.ptr())->setFramePassStage(RtxFramePassStage::AutoExposure_Exposure);
-      DebugView& debugView = ctx->getDevice()->getCommon()->metaDebugView();
-
-      ctx->bindResourceView(AUTO_EXPOSURE_HISTOGRAM_INPUT_OUTPUT, m_exposureHistogram.view, nullptr);
-      ctx->bindResourceView(AUTO_EXPOSURE_EXPOSURE_INPUT_OUTPUT, m_exposure.view, nullptr);
-      ctx->bindResourceView(AUTO_EXPOSURE_DEBUG_VIEW_OUTPUT, debugView.getDebugOutput(), nullptr);
-      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, AutoExposureShader::getShader());
+      ScopedGpuProfileZone(ctx, "Halo Meter Resolve");
+      rtxCtx->setFramePassStage(RtxFramePassStage::AutoExposure_Exposure);
+      ctx->bindResourceView(AUTO_EXPOSURE_HALO_PARTIALS_INPUT_OUTPUT, m_haloPartials.view, nullptr);
+      ctx->bindResourceView(AUTO_EXPOSURE_HALO_STATE_INPUT_OUTPUT, m_haloState.view, nullptr);
+      ctx->bindResourceView(AUTO_EXPOSURE_HALO_EXPOSURE_OUTPUT, m_exposure.view, nullptr);
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, AutoExposureHaloResolveShader::getShader());
       ctx->dispatch(1, 1, 1);
     }
   }
@@ -204,13 +321,33 @@ namespace dxvk {
 
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
-    // TODO : set reset on significant camera changes as well
-    if (m_exposureHistogram.image.ptr() == nullptr) {
+    if (m_exposure.image.ptr() == nullptr) {
       createResources(ctx);
       m_resetState = true;
     }
 
-    dispatchAutoExposure(ctx, linearSampler, rtOutput, frameTimeMilliseconds);
+    if (m_resetState || !enabled()) {
+      // Exposure scale 1.0, so a disabled or reset frame is unmodified.
+      VkClearColorValue clearColor;
+      clearColor.float32[0] = clearColor.float32[1] = clearColor.float32[2] = clearColor.float32[3] = 1.0f;
+
+      VkImageSubresourceRange subRange = {};
+      subRange.layerCount = 1;
+      subRange.levelCount = 1;
+      subRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+
+      ctx->clearColorImage(m_exposure.image, clearColor, subRange);
+
+      // The meter snaps on the next frame it runs, as the addon does after its state buffer is cleared.
+      m_haloResetState = true;
+    }
+
+    if (enabled()) {
+      dispatchHaloMeter(ctx, rtOutput, frameTimeMilliseconds);
+      PreExposure::queueExposureReadback(ctx.ptr(), m_exposure);
+    }
+    // The final output still holds the pre-tonemap image here.
+    Photometer::queueReadback(ctx.ptr(), rtOutput);
 
     m_resetState = false;
   }

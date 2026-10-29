@@ -4,6 +4,7 @@
 #include "d3d9_rtx_utils.h"
 #include "d3d9_state.h"
 #include "../dxvk/dxvk_buffer.h"
+#include "../dxvk/dxvk_perf_counters.h"
 #include "../dxvk/rtx_render/rtx_hashing.h"
 #include "../util/util_fastops.h"
 
@@ -20,10 +21,14 @@ namespace dxvk {
   }
 
   // NOTE: Intentionally leaving the legacy hashes out of here, because they are special (REMIX-656)
-  const std::map<HashComponents, VertexRegions::Type> componentToRegionMap = {
-    { HashComponents::VertexPosition,   VertexRegions::Position },
-    { HashComponents::VertexTexcoord,   VertexRegions::Texcoord },
-  };
+  // (Was a std::map looked up twice per component per draw on the geometry workers.)
+  inline bool componentToRegion(const HashComponents component, VertexRegions::Type& regionOut) {
+    switch (component) {
+    case HashComponents::VertexPosition: regionOut = VertexRegions::Position; return true;
+    case HashComponents::VertexTexcoord: regionOut = VertexRegions::Texcoord; return true;
+    default: return false;
+    }
+  }
 
   bool getVertexRegion(const RasterBuffer& buffer, const size_t vertexCount, HashQuery& outResult) {
     ScopedCpuProfileZone();
@@ -76,8 +81,10 @@ namespace dxvk {
 
     const HashRule& globalHashRule = RtxOptions::geometryHashGenerationRule();
 
-    // TODO (REMIX-658): Improve this by reducing allocation overhead of vector
-    std::vector<T> uniqueIndices(0);
+    // One vector per geometry worker thread, reused across draws. clear() + resize(n, 0) zero-fills it.
+    thread_local std::vector<T> tlsUniqueIndices;
+    std::vector<T>& uniqueIndices = tlsUniqueIndices;
+    uniqueIndices.clear();
     if constexpr (!std::is_same<T, NoIndices>::value) {
       assert((indexCount > 0 && indexBufferRef));
       deduplicateSortIndices(pIndexData, indexCount, maxIndexValue, uniqueIndices);
@@ -100,10 +107,15 @@ namespace dxvk {
     for (uint32_t i = 0; i < (uint32_t) HashComponents::Count; i++) {
       const HashComponents& component = (HashComponents) i;
 
-      if (globalHashRule.test(component) && componentToRegionMap.count(component) > 0) {
-        const VertexRegions::Type region = componentToRegionMap.at(component);
+      VertexRegions::Type region = VertexRegions::Position;
+      if (globalHashRule.test(component) && componentToRegion(component, region)) {
         hashesOut[component] = hashVertexRegionIndexed(vertexRegions[(uint32_t)region], uniqueIndices);
       }
+    }
+
+    // Don't keep a huge bin table alive on the worker after an unusually large draw.
+    if (uniqueIndices.capacity() > (size_t(1) << 22)) {
+      std::vector<T>().swap(uniqueIndices);
     }
 
     // TODO (REMIX-656): Remove this once we can transition content to new hash
@@ -124,8 +136,34 @@ namespace dxvk {
     }
   }
 
-  Future<GeometryHashes> D3D9Rtx::computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue) {
+  Future<GeometryHashes> D3D9Rtx::computeHash(RasterGeometry& geoData, const uint32_t maxIndexValue, const XXH64_hash_t memoizationKey) {
     ScopedCpuProfileZone();
+
+    // rtx.geometryHashMemoSelfCheckFrames: on a self-check frame a memo hit is re-hashed in full, and
+    // the worker compares the result with the memoized entry before replacing it.
+    bool selfCheck = false;
+
+    if (memoizationKey != 0) {
+      std::lock_guard<dxvk::mutex> lock(m_geometryHashCacheMutex);
+      auto it = m_geometryHashCache.find(memoizationKey);
+      if (it != m_geometryHashCache.end()) {
+        const uint32_t selfCheckFrames = geometryHashMemoSelfCheckFrames();
+        selfCheck = selfCheckFrames != 0 && (m_d3d9FrameIndex % selfCheckFrames) == 0;
+        if (!selfCheck) {
+          ++m_geometryHashCacheHits;
+          perf::countD3D9(perf::D3D9Ctr::MemoHits);
+
+          // The memoized hashes are returned as a ready Future, which takes no worker task slot.
+          return Future<GeometryHashes>::ready(GeometryHashes(it->second));
+        }
+        perf::countD3D9(perf::D3D9Ctr::MemoSelfCheckRuns);
+      } else {
+        ++m_geometryHashCacheMisses;
+        perf::countD3D9(perf::D3D9Ctr::MemoMisses);
+      }
+    } else {
+      perf::countD3D9(perf::D3D9Ctr::MemoIneligible);
+    }
 
     const uint32_t indexCount = geoData.indexCount;
     const uint32_t vertexCount = geoData.vertexCount;
@@ -160,8 +198,9 @@ namespace dxvk {
     if (m_parent->UseProgrammableVS() && useVertexCapture()) {
       if (RtxOptions::geometryHashGenerationRule().test(HashComponents::GeometryDescriptor)) {
         const D3D9ConstantSets& cb = m_parent->m_consts[DxsoProgramTypes::VertexShader];
-        auto& shaderByteCode = d3d9State().vertexShader->GetCommonShader()->GetBytecode();
-        vertexShaderHash = XXH3_64bits(shaderByteCode.data(), shaderByteCode.size());
+        const D3D9CommonShader* pVertexShader = d3d9State().vertexShader->GetCommonShader();
+        // Hashed once when the shader was created.
+        vertexShaderHash = pVertexShader->GetBytecodeHash();
         vertexShaderHash = XXH3_64bits_withSeed(&d3d9State().vsConsts.fConsts[0], cb.meta.maxConstIndexF * sizeof(float) * 4, vertexShaderHash);
         vertexShaderHash = XXH3_64bits_withSeed(&d3d9State().vsConsts.iConsts[0], cb.meta.maxConstIndexI * sizeof(int) * 4, vertexShaderHash);
         vertexShaderHash = XXH3_64bits_withSeed(&d3d9State().vsConsts.bConsts[0], cb.meta.maxConstIndexB * sizeof(uint32_t)/32, vertexShaderHash);
@@ -183,10 +222,10 @@ namespace dxvk {
       vertexLayoutHash = hashVertexLayout(geoData);
     }
 
-    return m_pGeometryWorkers->Schedule([vertexRegions, indexBufferRef = indexBufferRef.ptr(),
+    return m_pGeometryWorkers->ScheduleOrRun([this, memoizationKey, vertexRegions, indexBufferRef = indexBufferRef.ptr(),
                                  pIndexData, indexStride, indexDataSize, indexCount,
                                  maxIndexValue, vertexShaderHash, geometryDescriptorHash,
-                                 vertexLayoutHash]() -> GeometryHashes {
+                                 vertexLayoutHash, selfCheck]() -> GeometryHashes {
       ScopedCpuProfileZone();
 
       GeometryHashes hashes;
@@ -213,6 +252,42 @@ namespace dxvk {
 
       hashes.precombine();
 
+      if (memoizationKey != 0) {
+        std::lock_guard<dxvk::mutex> lock(m_geometryHashCacheMutex);
+        // Bounded so a scene that streams unique geometry indefinitely cannot grow this without
+        // limit. Clearing wholesale is acceptable because a miss only costs the hash we were
+        // computing anyway.
+        if (selfCheck) {
+          // The fresh hash must equal the memoized one; a mismatch means a buffer write that did not
+          // bump remixContentVersion (the memo would have served a stale hash). The entry is replaced below.
+          // Compare the hash components only: GeometryHashes::precombined[3/4] are left uninitialized when
+          // the legacy components are empty, so a whole-struct memcmp reports false mismatches.
+          auto it = m_geometryHashCache.find(memoizationKey);
+          if (it != m_geometryHashCache.end()) {
+            std::string differing;
+            for (uint32_t i = 0; i < (uint32_t) HashComponents::Count; i++) {
+              const HashComponents component = (HashComponents) i;
+              if (it->second[component] != hashes[component]) {
+                differing += str::format(differing.empty() ? "" : ", ", getHashComponentName(component), " ",
+                                         std::hex, it->second[component], " -> ", hashes[component]);
+              }
+            }
+            if (!differing.empty()) {
+              perf::countD3D9(perf::D3D9Ctr::MemoSelfCheckMismatches);
+              static std::atomic<uint32_t> s_mismatchLogs { 0 };
+              if (s_mismatchLogs.fetch_add(1, std::memory_order_relaxed) < 20) {
+                Logger::warn(str::format("[GeometryHashMemoCheck] memoized geometry hash is stale: key ", std::hex, memoizationKey,
+                                         " | ", differing, " (first 20 mismatches are logged)"));
+              }
+            }
+          }
+        }
+        if (m_geometryHashCache.size() >= kMaxGeometryHashCacheEntries) {
+          m_geometryHashCache.clear();
+        }
+        m_geometryHashCache[memoizationKey] = hashes;
+      }
+
       return hashes;
     });
   }
@@ -235,7 +310,7 @@ namespace dxvk {
     auto vertexBuffer = geoData.positionBuffer.buffer().ptr();
     vertexBuffer->incRef();
 
-    return m_pGeometryWorkers->Schedule([pVertexData, vertexCount, vertexStride, vertexBuffer]()->AxisAlignedBoundingBox {
+    return m_pGeometryWorkers->ScheduleOrRun([pVertexData, vertexCount, vertexStride, vertexBuffer]()->AxisAlignedBoundingBox {
       ScopedCpuProfileZone();
 
 #if defined(_M_ARM64) || defined(_M_ARM64EC)

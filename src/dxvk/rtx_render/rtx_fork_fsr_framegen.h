@@ -24,196 +24,138 @@
 #include "rtx_resources.h"
 #include "rtx_options.h"
 #include "rtx_common_object.h"
+#include "rtx_dlfg.h"
 
-#include "../dxvk_format.h"
 #include "../dxvk_include.h"
-#include "../util/rc/util_rc.h"
-#include "../util/rc/util_rc_ptr.h"
+#include "../dxvk_queue.h"
 #include "../../vulkan/vulkan_presenter.h"
 
 #include <vulkan/vulkan.h>
+#include <array>
 #include <cstdint>
-#include <atomic>
-
-// No FFX forward declarations here - FFX's ffxContext is "typedef void*"
-// We use void* directly in this header to avoid conflicts
+#include <mutex>
 
 namespace dxvk {
 
   class DxvkDevice;
   class DxvkContext;
-  class DxvkBarrierSet;
-  class RtCamera;
-  class DxvkImageView;
-  class DxvkFSRFGPresenter;
-
-  namespace vk {
-    struct PresenterDevice;
-    struct PresenterDesc;
-  }
 
   /**
-   * \brief FSR 3 Frame Generation
-   * 
-   * AMD FidelityFX Frame Generation implementation
+   * \brief FSR 3 frame generation through the FidelityFX Vulkan swapchain proxy.
+   *
+   * The renderer queues each frame's inputs with DxvkDevice::setupFrameInterpolation, as for DLSS-G. The
+   * presenter then records the prepare pass on the graphics queue, configures the frame and presents it through
+   * the proxy, all on the submission thread, so FFX always interpolates the frame it presents.
    */
   class DxvkFSRFrameGen : public CommonDeviceObject {
-    friend class DxvkFSRFGPresenter;
-
   public:
+
+    // Counters for the [FSRFG] log line and the dev menu.
+    struct Stats {
+      uint64_t presents = 0;            // Presents through the FFX proxy.
+      uint64_t interpolated = 0;        // Presents that also showed an interpolated frame.
+      uint64_t held = 0;                // Presents whose generated frame repeats the real one (reset dispatch).
+      uint64_t skipped = 0;             // Presents with no frame generation inputs.
+      uint64_t disabled = 0;            // Presents with frame generation configured off.
+      uint64_t resetsHistory = 0;       // Resets requested by the renderer (camera cut, resize, setting change).
+      uint64_t resetsGap = 0;           // Resets after a skipped frame.
+      float frameTimeMs = 0.0f;
+      float jitter[2] = { 0.0f, 0.0f };
+      uint32_t renderWidth = 0;
+      uint32_t renderHeight = 0;
+      uint32_t displayWidth = 0;
+      uint32_t displayHeight = 0;
+      bool depthInverted = false;
+      bool depthInfinite = false;
+      bool hudLess = false;
+      bool asyncWorkloads = false;
+      bool hdr = false;
+      VkFormat backBufferFormat = VK_FORMAT_UNDEFINED;
+    };
 
     explicit DxvkFSRFrameGen(DxvkDevice* device);
     virtual void onDestroy();
 
-    // True when this device can actually run FSR frame generation: the
-    // FidelityFX runtime is loadable, and the adapter gave us the separate
-    // present / image-acquire queues the FFX interpolation path requires.
-    // Instance method (not static) so it can inspect the device, mirroring
-    // DxvkDLFG::supportsDLFG.
+    // True when the FidelityFX runtime is loadable and the adapter has the separate present and
+    // image-acquire queues the FFX proxy needs.
     bool supportsFSRFrameGen() const;
-    
-    void setDisplaySize(uint2 displaySize);
 
-    /**
-     * \brief Sets explicit presentColor source for frame generation callback dispatch.
-     *
-     * This bypasses proxy swapchain color as FG input and lets Remix provide
-     * the intended interpolation source image.
-     */
-    void setFrameGenerationPresentColorSource(const Rc<DxvkImage>& presentColorSource);
+    // CS thread. Copies the Remix output into this frame's HUD-less image in the back buffer format.
+    // Returns null when the HUD is interpolated with the scene.
+    Rc<DxvkImage> copyHudLessColor(Rc<DxvkContext> ctx, const Rc<DxvkImage>& source);
 
-    /**
-     * \brief Configure frame generation for the current frame
-     * 
-     * Must be called each frame before prepareFrameGeneration.
-     * Sets up swapchain, frame ID, enabled state, and HUDLessColor.
-     * 
-     * \param backbuffer The rendered backbuffer (composite output) for HUDLessColor
-     */
-    void configureFrameGeneration(
-      VkSwapchainKHR swapchain,
-      uint64_t frameId,
-      bool enabled);
+    Stats getStats() const;
 
-    /**
-     * \brief Dispatch the frame generation prepare pass
-     * 
-     * Records commands to prepare data for frame interpolation.
-     * Call during the main rendering command buffer after compositing.
-     */
-    void prepareFrameGeneration(
-      Rc<DxvkContext> ctx,
-      DxvkBarrierSet& barriers,
-      const RtCamera& camera,
-      Rc<DxvkImageView> motionVectors,
-      Rc<DxvkImageView> depth,
-      bool viewModelActive,
-      bool resetHistory,
-      uint64_t frameId,
-      float deltaTimeMs);
-
-    /**
-     * \brief Wait for all presents to complete
-     * 
-     * Must be called before resize or shutdown.
-     */
-    void waitForPresents();
-
-    /**
-     * \brief Check if frame generation is initialized
-     */
-    bool isInitialized() const { return m_initialized; }
-
-    /**
-     * \brief Get swapchain context (for presenter)
-     */
-    void* getSwapChainContext() const { return m_swapChainContext; }
-
-    /**
-     * \brief Check if swapchain context is created
-     */
-    bool isSwapchainContextCreated() const { return m_swapchainContextCreated; }
-
-    /**
-     * \brief Get replaced Vulkan functions
-     */
-    PFN_vkAcquireNextImageKHR getReplacedAcquireNextImageKHR() const { return m_replacedAcquireNextImageKHR; }
-    PFN_vkQueuePresentKHR getReplacedQueuePresentKHR() const { return m_replacedQueuePresentKHR; }
-    PFN_vkGetSwapchainImagesKHR getReplacedGetSwapchainImagesKHR() const { return m_replacedGetSwapchainImagesKHR; }
-
-    // RTX_OPTION accessors
-    RTX_OPTION_ENV("rtx.fsrfg", bool, enable, false, "RTX_FSRFG_ENABLE", 
-      "Enables FSR 3 frame generation which generates interpolated frames to increase framerate.");
-
-    /**
-     * \brief Create swapchain proxy context
-     * 
-     * Creates FFX swapchain context which intercepts Vulkan swapchain calls.
-     * Must be called during swapchain creation.
-     */
-    void createSwapchainProxy(
-      VkPhysicalDevice physicalDevice,
-      VkDevice device,
-      VkSwapchainKHR* pSwapchain,
-      const VkSwapchainCreateInfoKHR* pCreateInfo);
-
-    /**
-     * \brief Create frame generation context
-     * 
-     * Creates FFX frame generation context for interpolation.
-     * Must be called after swapchain proxy is created.
-     */
-    void createFrameGenContext(
-      VkPhysicalDevice physicalDevice,
-      VkDevice device,
-      uint32_t displayWidth,
-      uint32_t displayHeight,
-      VkFormat backBufferFormat);
+    RTX_OPTION_ENV("rtx.fsrfg", bool, enable, false, "RTX_FSRFG_ENABLE",
+      "Enables FSR 3 frame generation, which inserts interpolated frames to raise the frame rate. Set "
+      "rtx.frameGenerationType instead of this option.");
+    RTX_OPTION("rtx.fsrfg", bool, interpolateHud, false,
+      "Interpolates the whole presented image, HUD included, instead of drawing the current HUD over the generated "
+      "frame. When off, every pixel that differs from the Remix output counts as HUD and repeats the real frame. Turn "
+      "it on when a game changes the whole image after Remix draws it, for example with a gamma ramp, a post-process "
+      "pass or a scaled back buffer.");
+    RTX_OPTION("rtx.fsrfg", bool, debugOverlay, false,
+      "Draws the FidelityFX frame generation debug overlay: tear lines, pacing lines and a red bar on frames generated after a reset.");
 
   private:
-    void destroyContexts();
-    bool registerPresentColorOverrideForFrame(const Rc<DxvkImage>& presentColorImage, uint64_t frameId);
-    bool consumePreparedFrameForPresent() { return m_preparedForPresent.exchange(false, std::memory_order_acq_rel); }
-    uint64_t getFrameGenFrameId() const { return m_frameId; }
+    friend class DxvkFSRFGPresenter;
 
-    // FFX contexts - using void* (FFX's ffxContext is typedef void*)
+    // Wraps the presenter's swapchain in the FFX proxy and creates the frame generation context.
+    // Returns false when the proxy could not be created. The swapchain is then unchanged.
+    bool createContexts(VkSwapchainKHR* pSwapchain, const vk::PresenterInfo& info, VkSurfaceKHR surface);
+    bool createFrameGenContext(const vk::PresenterInfo& info);
+    void destroyFrameGenContext();
+    void destroyContexts();
+    void waitForPresents();
+
+    // Submission thread, right before the proxy present: prepares and configures this frame.
+    void beginPresent(VkSwapchainKHR swapchain, const DxvkFrameInterpolationInfo& frame, bool enabled, const vk::PresenterInfo& info);
+    bool prepare(const DxvkFrameInterpolationInfo& frame, uint64_t frameId);
+    void logStats();
+
+    // Runs inside the proxy's present call, on the submission thread.
+    static uint32_t dispatchFrameGeneration(void* params, void* pUserCtx);
+
+    // FFX contexts. ffxContext is a void*.
     void* m_swapChainContext = nullptr;
     void* m_frameGenContext = nullptr;
-    
-    // Frame generation config stored as opaque data (allocated in cpp)
     void* m_frameGenConfig = nullptr;
 
-    // State tracking
-    bool m_initialized = false;
-    bool m_swapchainContextCreated = false;
-    bool m_frameGenContextCreated = false;
-    bool m_frameGenEnabled = false;
     bool m_asyncWorkloadsSupported = false;
-    Rc<DxvkImage> m_presentColorSource = nullptr;
-    
-    uint2 m_displaySize = { 0, 0 };      // Render resolution (input to upscaler)
-    uint2 m_swapchainSize = { 0, 0 };    // Swapchain/output resolution (for generationRect)
-    uint64_t m_frameId = 0;
-    std::atomic<bool> m_preparedForPresent = false;
+    bool m_depthInverted = false;
+    bool m_depthInfinite = false;
+    bool m_hdr = false;
+    VkExtent2D m_swapchainSize = { 0, 0 };
 
-    // Replaced Vulkan functions from swapchain proxy
     PFN_vkAcquireNextImageKHR m_replacedAcquireNextImageKHR = nullptr;
     PFN_vkQueuePresentKHR m_replacedQueuePresentKHR = nullptr;
     PFN_vkGetSwapchainImagesKHR m_replacedGetSwapchainImagesKHR = nullptr;
-    
-    // Swapchain handle (set by presenter)
-    VkSwapchainKHR m_swapchain = VK_NULL_HANDLE;
-    
-  public:
-    void setSwapchain(VkSwapchainKHR swapchain) { m_swapchain = swapchain; }
-    VkSwapchainKHR getSwapchain() const { return m_swapchain; }
+
+    // Submission thread state.
+    uint64_t m_lastFrameId = 0;
+    bool m_resetNext = true;
+    bool m_configuredEnabled = false;
+    bool m_presentingReset = false;
+    uint32_t m_consecutiveSkips = 0;
+    DxvkDLFGCommandListArray m_prepareCommandLists;
+
+    // The dev menu reads the stats from another thread.
+    mutable std::mutex m_statsMutex;
+    Stats m_stats;
+    Stats m_statsAtLastLog;
+
+    // Copies of the HUD-less image, one per frame in flight. The CS thread writes them and the proxy reads them.
+    // The presenter sets the format and size, and VK_FORMAT_UNDEFINED means no copy.
+    static constexpr uint32_t kHudLessRingSize = kDLFGMaxGPUFramesInFlight + 1;
+    std::mutex m_hudLessMutex;
+    std::array<Rc<DxvkImage>, kHudLessRingSize> m_hudLessRing;
+    uint32_t m_hudLessIndex = 0;
+    VkFormat m_hudLessFormat = VK_FORMAT_UNDEFINED;
+    VkExtent2D m_hudLessExtent = { 0, 0 };
   };
 
   /**
-   * \brief FSR 3 Frame Generation Presenter
-   * 
-   * Custom presenter that uses FFX swapchain proxy for FSR 3 Frame Generation.
-   * Similar to DxvkDLFGPresenter but uses AMD's FidelityFX SDK.
+   * \brief Presenter that presents through the FFX swapchain proxy.
    */
   class DxvkFSRFGPresenter : public vk::Presenter {
   public:
@@ -240,21 +182,19 @@ namespace dxvk {
       bool isDlfgPresenting,
       VkSetPresentConfigNV* presentMetering) override;
     VkResult recreateSwapChain(const vk::PresenterDesc& desc) override;
-    
-    // Override to use FFX SDK's replacement vkGetSwapchainImagesKHR which returns proxy images
-    VkResult getSwapImages(std::vector<VkImage>& images);
+
+    // The FFX proxy reads its images in SHADER_READ_ONLY_OPTIMAL at present and leaves them in it.
+    VkImageLayout presentLayout() const override {
+      return m_proxyActive ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    }
 
   private:
-    void createFFXContexts();
-    void updateSwapchainImagesToProxy(DxvkFSRFrameGen& fsrFrameGen, VkFormat format);
-    
+    void createProxy();
+    void releaseProxy();
+
     DxvkDevice* m_device;
-    Rc<DxvkContext> m_ctx;
-    VkSwapchainKHR m_fsrSwapchain = VK_NULL_HANDLE;
-    bool m_contextCreated = false;
-    bool m_recreatingSwapchain = false;  // Guard against re-entrant recreation
-    bool m_disableFsrFgForSession = false;
-    VkExtent2D m_currentExtent = { 0, 0 };  // Track current swapchain size
+    bool m_proxyActive = false;
+    bool m_disableForSession = false;
     vk::PresenterDesc m_cachedDesc = {};
   };
 

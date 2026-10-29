@@ -138,10 +138,17 @@ void main(uint2 threadIdx : SV_DispatchThreadID)
   const GpuParticle particle = Particles[particleIdx];
   
   // precache some values
-  const float2 size = particle.size(particleSystem, animationDataTex) * particleCb.sceneScale;
+  // The degenerate-particle guard below tests the authored size, not the world-space one.
+  const float2 authoredSize = particle.size(particleSystem, animationDataTex);
+  const float2 size = authoredSize * particleCb.sceneScale;
   const float4 color = particle.color(particleSystem, animationDataTex);
   
-  if(particle.isDead() || particle.isSleeping() || color.w < particleCb.resolveTransparencyThreshold || max(size.x, size.y) < 0.1f)
+  // Particle sizes are authored in centimetres, so testing the authored size keeps this guard
+  // independent of rtx.sceneScale. It is only a cheap pre-cull. The screen-space test below
+  // (particleCb.minParticleSize, in pixels) is the real visibility cull.
+  const float kMinimumAuthoredSize = 0.1f;  // centimetres == 1 mm
+  
+  if(particle.isDead() || particle.isSleeping() || color.w < particleCb.resolveTransparencyThreshold || max(authoredSize.x, authoredSize.y) < kMinimumAuthoredSize)
   {
     clearParticleVertices(threadIdx.x, particleSystem);
     return;
@@ -293,7 +300,10 @@ void main(uint2 threadIdx : SV_DispatchThreadID)
 
       // indices 0..3 -> tail
       // indices 4..7 -> head
-      float len = (i >= 4) ? (speed * particleSystem.desc.motionTrailMultiplier * particleCb.deltaTimeSecs) : 0;                                       
+      // The trail covers at most 1/30 s of motion. Otherwise streaks grow at low frame rates,
+      // and their overdraw lowers the frame rate further.
+      const float trailSeconds = min(particleCb.deltaTimeSecs, 1.0f / 30.0f);
+      float len = (i >= 4) ? (speed * particleSystem.desc.motionTrailMultiplier * trailSeconds) : 0;                                       
       
       float height = offset.y * size.y + len;
       

@@ -22,9 +22,6 @@
 #include "rtx/pass/temporal_aa/temporal_aa.h"
 #include "rtx/utility/geometry_flags.slangh"
 #include "rtx/utility/math.slangh"
-// NV-DXVK start: extract PQ helpers to shared utility header for reuse by the GT7 tonemap operator.
-#include "rtx/utility/pq.slangh"
-// NV-DXVK end
 
 layout(rgba16f, binding = TAA_INPUT)
 Texture2D<float4> InColorTexture;
@@ -54,10 +51,35 @@ ConstantBuffer<TemporalAaArgs> cb;
 groupshared float4 s_ColorsAndLengths[BUFFER_Y][BUFFER_X];
 groupshared float2 s_MotionVectors[BUFFER_Y][BUFFER_X];
 
-// NV-DXVK start: PQ constants + PQDecode/PQEncode moved to rtx/utility/pq.slangh (see #include above).
-// NV-DXVK end
+// Perceptual Quantizer Transform: https://en.wikipedia.org/wiki/Perceptual_quantizer
+// Implementation: https://github.com/NVIDIAGameWorks/donut/blob/main/shaders/passes/taa_cs.hlsl
+static const float pq_m1 = 0.1593017578125;
+static const float pq_m2 = 78.84375;
+static const float pq_c1 = 0.8359375;
+static const float pq_c2 = 18.8515625;
+static const float pq_c3 = 18.6875;
 
 #define SHARED_MEM_OPT 1
+
+float3 PQDecode(const float3 image, const float3 pqC)
+{
+  float3 Np = pow(max(image, 0.0), 1.0 / pq_m2);
+  float3 L = Np - pq_c1;
+  L = L / (pq_c2 - pq_c3 * Np);
+  L = pow(max(L, 0.0), 1.0 / pq_m1);
+
+  return L * pqC; // returns cd/m^2
+}
+
+float3 PQEncode(float3 image, const float3 invPqC)
+{
+  float3 L = image * invPqC;
+  float3 Lm = pow(max(L, 0.0), pq_m1);
+  float3 N = (pq_c1 + pq_c2 * Lm) / (1.0 + pq_c3 * Lm);
+  image = pow(N, pq_m2);
+
+  return saturate(image);
+}
 
 float2 OutputToInput(const int2 pixelPos, const float2 inputOverOutputViewSize)
 {
@@ -218,9 +240,13 @@ void main(
   float3 resultPQ = 0.0f;
   if (all(sourcePos >= 0) && all(sourcePos < cb.imageSizeOutput))
   {
-    const float3 historyColor = cb.isTaaUpscale ?
+    float3 historyColor = cb.isTaaUpscale ?
       BicubicSampleCatmullRom(InFeedbackColorTexture, LinearSampler, sourcePos, (float2)cb.invImageSizeOutput) :
       InFeedbackColorTexture.SampleLevel(LinearSampler, sourcePos, 0).rgb;
+    // A pre-exposure step (rtx_pre_exposure.h): bring the history to this frame's scale. Uniform branch.
+    if (cb.historyRatio != 1.0f) {
+      historyColor = PQEncode(PQDecode(historyColor, cb.maximumRadiance) * cb.historyRatio, cb.invMaximumRadiance);
+    }
     const float3 historyColorClamped = min(colorMax, max(colorMin, historyColor));
 
     const float motionWeight = smoothstep(0, 1, length(longestMotionVector));

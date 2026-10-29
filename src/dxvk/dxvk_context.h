@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -41,6 +41,16 @@ namespace dxvk {
    * recorded.
    */
   class DxvkContext : public RcObject {
+    // The staging ring is recreated whole (a fresh host-visible allocation) whenever a frame's
+    // uploads run past its end, which at 4 MB happens every frame or two in a path-traced scene.
+    // The cost lands on whichever pass asks for staging next.
+    //
+    // Raising this is not free. DxvkStagingBuffer::alloc picks a dedicated allocation via
+    // `2 * alignedSize > m_size`, so the size also sets the threshold above which an upload stops
+    // sharing the ring (2 MB at 4 MB). Each wrap allocates a fresh full-size buffer while the
+    // previous one stays pinned by the in-flight command list, which lengthens the window in which
+    // D3D9SwapChainEx::Present holds the device lock across waitForSubmission. Any Remix API thread
+    // calling in then spins on RecursiveSpinlock and pegs a core.
     constexpr static VkDeviceSize StagingBufferSize = 4ull << 20;
   public:
     
@@ -851,6 +861,18 @@ namespace dxvk {
             uint32_t                  height,
             uint32_t                  depth);
 
+    // NV-DXVK start: Indirect ray dispatch support
+    /**
+     * \brief Starts raytracing jobs with the ray counts sourced from a buffer
+     *
+     * \param [in] argBuffer Buffer holding a VkTraceRaysIndirectCommandKHR
+     * \param [in] argOffset Byte offset of the command within the buffer
+     */
+    void traceRaysIndirect(
+      const Rc<DxvkBuffer>&           argBuffer,
+            VkDeviceSize              argOffset);
+    // NV-DXVK end
+
     /**
      * \brief Transforms image subresource layouts
      * 
@@ -1089,6 +1111,10 @@ namespace dxvk {
             VkPipelineBindPoint pipeline,
             uint32_t            index,
             uint32_t            value);
+
+    // A bind point's specialization constants as a whole, so a caller can restore them after overriding some.
+    const DxvkScInfo& getSpecConstantsInfo(VkPipelineBindPoint pipeline) const;
+    void setSpecConstantsInfo(VkPipelineBindPoint pipeline, const DxvkScInfo& newSpecConstantInfo);
     
     /**
      * \brief Sets barrier control flags

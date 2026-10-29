@@ -12,9 +12,25 @@ namespace dxvk {
   class DxvkBuffer;
   class DxvkDevice;
   class DxvkImage;
+  class DxvkImageView;
 }
 
 struct IDXGIVkInteropDevice;
+
+// NV-DXVK start: Private in-module image handoff
+// hostContext: the immediate context Remix records into when the API is
+// hosted on this D3D11 device. A texture owned by that context shares its
+// command stream, so only pending initial uploads need submitting.
+// pDeferInitFlush (optional, in/out): in = the caller will submit those
+// uploads itself, on the command stream, before anything samples the view;
+// out = whether this call left them to the caller.
+MIDL_INTERFACE("5b0e7f14-3c2a-4f7e-9a61-2d8e4c9b7a13")
+IDXGIRemixTexture : public IUnknown {
+  virtual HRESULT STDMETHODCALLTYPE PrepareRemixView(
+    VkDevice expectedDevice, DXGI_FORMAT format, void* hostContext,
+    dxvk::Rc<dxvk::DxvkImageView>* view, BOOL* pDeferInitFlush) = 0;
+};
+// NV-DXVK end
 
 
 /**

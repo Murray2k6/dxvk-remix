@@ -34,6 +34,14 @@ ConstantBuffer<PointInstancerCullingConstants> cb;
 layout(binding = POINT_INSTANCER_CULLING_BINDING_TRANSFORMS_INPUT)
 StructuredBuffer<float4x4> inputTransforms;
 
+// Input: the frame's batch table
+layout(binding = POINT_INSTANCER_CULLING_BINDING_BATCHES)
+StructuredBuffer<PointInstancerCullingBatch> batches;
+
+// Input: global thread index -> batch index
+layout(binding = POINT_INSTANCER_CULLING_BINDING_THREAD_BATCH)
+StructuredBuffer<uint> threadBatch;
+
 // Output: direct write into the TLAS VkAccelerationStructureInstanceKHR buffer
 layout(binding = POINT_INSTANCER_CULLING_BINDING_INSTANCE_BUFFER)
 RWByteAddressBuffer instanceBuffer;

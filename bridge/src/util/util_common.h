@@ -25,10 +25,6 @@
 #include <stdint.h>
 #include <type_traits>
 
-// This setting enables sending lock data row by row instead of one big data
-// chunk at once.Note that volumes will still be sent one slice at a time.
-#define SEND_ALL_LOCK_DATA_AT_ONCE
-
 // The next two settings enable and configure logging of server calls that take
 // longer to process than the given timeout value in milliseconds. Useful for
 // troubleshooting issues with calls that trigger a timeout or cause the
@@ -54,12 +50,6 @@
 // processing. Due to high call volume this will likely have a significant impact
 // on performance and should only be used if needed!
 //#define ENABLE_WAIT_FOR_COMMAND_TRACE
-
-// This enables the alternate circular queue implementation that uses semaphores
-// for synchronization, and performed slower in testing than the implementation
-// using atomic counters. There shouldn't be any need to use this, but leaving
-// it in the code for now just in case.
-//#define USE_BLOCKING_QUEUE
 
 #ifdef WIN32 
 #ifdef _DEBUG

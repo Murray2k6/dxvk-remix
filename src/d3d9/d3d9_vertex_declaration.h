@@ -5,6 +5,8 @@
 
 #include <vector>
 
+#include "../util/xxHash/xxhash.h"
+
 namespace dxvk {
 
   enum class D3D9VertexDeclFlag {
@@ -66,6 +68,11 @@ namespace dxvk {
       return m_texcoordMask;
     }
 
+    // D3D9 v2: XXH3 of the elements, set by Classify. Declarations are immutable.
+    XXH64_hash_t GetRemixElementsHash() const {
+      return m_remixElementsHash;
+    }
+
   private:
 
     void Classify();
@@ -77,6 +84,8 @@ namespace dxvk {
     DWORD                          m_fvf;
 
     uint32_t                       m_texcoordMask = 0;
+
+    XXH64_hash_t                   m_remixElementsHash = 0;
 
     // The size of Stream 0. That's all we care about.
     uint32_t                       m_size = 0;

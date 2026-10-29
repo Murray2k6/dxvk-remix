@@ -41,36 +41,6 @@ SssDiffusionProfileResult createEmptySssDiffusionProfileResult()
   return sssDiffusionProfileResult;
 }
 
-// fork — 2026-06-27: cloud-on-terrain shadow fold for SSS NEE.
-// The opaque diffuse NEE path folds the per-pixel cloud transmittance onto the
-// atmosphere sun's radiance in integrator_direct/indirect (the
-// `atmosphereCloudShadowed` real-light fold). SSS samples its own lights
-// internally — diffusion-profile disk samples, transmission, and single
-// scattering — so without this mirror the SSS terms stay fully sunlit under
-// heavy cloud while the surrounding opaque diffuse correctly goes dark, making
-// skin/wax/foliage read as if still in direct sun. Apply the identical fold to
-// each internally-sampled light.
-// Depends on sampleCloudGroundShadow_OptionB from atmosphere_common.slangh,
-// which integrator_direct.slangh includes before this header.
-void sssApplyAtmosphereCloudShadow(inout LightSample lightSample, uint16_t lightIdx, vec3 surfacePos)
-{
-  if (cb.skyMode != 1 || cb.atmosphereArgs.cloudVoxelShadowsEnable == 0u || lightIdx == kInvalidLightIdx)
-  {
-    return;
-  }
-
-  const DecodedPolymorphicLight cloudShadowLight = decodePolymorphicLight(lights[lightIdx]);
-  if (!cloudShadowLight.atmosphereCloudShadowed)
-  {
-    return;
-  }
-
-  const vec3 dirToSun = normalize(lightSample.position - surfacePos);
-  const float cloudT = sampleCloudGroundShadow_OptionB(
-      surfacePos, dirToSun, cb.atmosphereArgs, cb.isZUp != 0);
-  lightSample.radiance *= pow(cloudT, cb.atmosphereArgs.cloudShadowFactorStrength);
-}
-
 SssTracingResult traceSssRay(
   const Ray sssSampleRay,
   const uint8_t rayMask,
@@ -140,8 +110,12 @@ SssDiffusionProfileResult evalSssDiffusionProfile(
   RTXCR_SubsurfaceMaterialData subsurfaceMaterialData = RTXCR_CreateDefaultSubsurfaceMaterialData();
   subsurfaceMaterialData.transmissionColor = float3(subsurfaceMaterial.volumetricAttenuationCoefficient);
   subsurfaceMaterialData.scatteringColor = float3(subsurfaceMaterial.singleScatteringAlbedo);
+  // For diffusion-profile materials, measurementDistance is a reused field containing the radius scale,
+  // rather than a physical measurement distance; increasing it produces deeper subsurface scattering.
   subsurfaceMaterialData.scale = subsurfaceMaterial.measurementDistance * cb.sssArgs.diffusionProfileScale;
   subsurfaceMaterialData.g = subsurfaceMaterial.volumetricAnisotropy;
+
+  const float maxSampleRadius = float(subsurfaceMaterial.maxSampleRadius) * cb.metersToWorldUnitScale;
 
   /// Create interaction
 
@@ -164,7 +138,7 @@ SssDiffusionProfileResult evalSssDiffusionProfile(
     RTXCR_SubsurfaceSample subsurfaceSample;
     RTXCR_EvalBurleyDiffusionProfile(subsurfaceMaterialData,
                                      subsurfaceInteraction,
-                                     subsurfaceMaterial.maxSampleRadius,
+                                     maxSampleRadius,
                                      cb.enableSssTransmission && cb.enableTransmissionDiffusionProfileCorrection,
                                      rand2,
                                      subsurfaceSample);
@@ -173,7 +147,7 @@ SssDiffusionProfileResult evalSssDiffusionProfile(
     Ray sssSampleRay;
     sssSampleRay.origin = subsurfaceSample.samplePosition;
     sssSampleRay.direction = -diskNormalWorldSpace; // Shooting a ray from sample disk towards the surface
-    sssSampleRay.tMax = max(subsurfaceMaterial.maxSampleRadius * subsurfaceMaterialData.scale * 2.0f, 0.1f);
+    sssSampleRay.tMax = max(maxSampleRadius * 2.0f, 0.1f);
 
     const SssTracingResult sssTracingResult = traceSssRay(sssSampleRay, OBJECT_MASK_OPAQUE, RAY_FLAG_CULL_BACK_FACING_TRIANGLES);
 
@@ -202,16 +176,13 @@ SssDiffusionProfileResult evalSssDiffusionProfile(
     bool risLightSampleValid = false;
     uint8_t sampledTransportPortalIndex = invalidRayPortalIndex;
     uint16_t lightIdx = kInvalidLightIdx;
-    // Fork: synthetic customIndex for view-model filtering.
-    uint customIndex = geometryFlags.isViewModel ? CUSTOM_INDEX_IS_VIEW_MODEL : 0;
-
     if (cb.enableRtxdi && geometryFlags.primarySelectedIntegrationSurface && sampleInsideScreen)
     {
       // Select and sample a light for NEE via RTXDI
       rtxdiLightSampleValid = sampleLightRTXDI(
         samplePixelCoordinate,
         sssTracingResult.sssMinimalSurfaceInteraction,
-        sssLightSample, inverseSelectionPdf, sampledTransportPortalIndex, lightIdx, customIndex);
+        sssLightSample, inverseSelectionPdf, sampledTransportPortalIndex, lightIdx);
     }
     else
     {
@@ -219,7 +190,7 @@ SssDiffusionProfileResult evalSssDiffusionProfile(
       risLightSampleValid = sampleLightRIS(
         randomState,
         sssTracingResult.sssMinimalSurfaceInteraction, opaqueSurfaceMaterialInteraction, minimalRayInteraction.viewDirection,
-        sssLightSample, inverseSelectionPdf, lightIdx, customIndex);
+        sssLightSample, inverseSelectionPdf, lightIdx);
     }
 
     if ((!rtxdiLightSampleValid && !risLightSampleValid) || all(sssLightSample.radiance == 0.0f))
@@ -237,9 +208,6 @@ SssDiffusionProfileResult evalSssDiffusionProfile(
         rtxcrMaterialDebugView(samplePixelCoordinate, vec4(0, 1, 0, 0));
       }
     }
-
-    // fork: fold cloud-on-terrain shadow onto the SSS light (mirror of the opaque NEE fold).
-    sssApplyAtmosphereCloudShadow(sssLightSample, lightIdx, sssTracingResult.sssMinimalSurfaceInteraction.position);
 
     /// Visibility Check
 
@@ -361,23 +329,18 @@ float3 evalSingleScatteringTransmission(
       LightSample transmissionLightSample;
       float inverseSelectionPdf = 0.0f;
       uint16_t lightIdx = kInvalidLightIdx;
-      // Create synthetic customIndex for view model filtering.
-      uint customIndex = geometryFlags.isViewModel ? CUSTOM_INDEX_IS_VIEW_MODEL : 0;
       // Select and sample a light for NEE via RIS
       // SST TODO: NEE
       const bool risLightSampleValid = sampleLightRIS(
         randomState,
         transmissionTracingResult.sssMinimalSurfaceInteraction, opaqueSurfaceMaterialInteraction,
         minimalRayInteraction.viewDirection,
-        transmissionLightSample, inverseSelectionPdf, lightIdx, customIndex);
+        transmissionLightSample, inverseSelectionPdf, lightIdx);
 
       if (!risLightSampleValid)
       {
         continue;
       }
-
-      // fork: fold cloud-on-terrain shadow onto the back-surface SSS light.
-      sssApplyAtmosphereCloudShadow(transmissionLightSample, lightIdx, transmissionTracingResult.sssMinimalSurfaceInteraction.position);
 
       /// Visibility Check
 
@@ -464,22 +427,17 @@ float3 evalSingleScatteringTransmission(
       LightSample singleScatteringLightSample;
       float singleScatteringInverseSelectionPdf = 0.0f;
       uint16_t singleScatteringLightIdx = kInvalidLightIdx;
-      // Create synthetic customIndex for view model filtering.
-      uint customIndex = geometryFlags.isViewModel ? CUSTOM_INDEX_IS_VIEW_MODEL : 0;
       // SST TODO: NEE
       const bool risLightSampleValid = sampleLightRIS(
         randomState,
         singleScatteringTracingResult.sssMinimalSurfaceInteraction, opaqueSurfaceMaterialInteraction,
         minimalRayInteraction.viewDirection,
-        singleScatteringLightSample, singleScatteringInverseSelectionPdf, singleScatteringLightIdx, customIndex);
+        singleScatteringLightSample, singleScatteringInverseSelectionPdf, singleScatteringLightIdx);
 
       if (!risLightSampleValid)
       {
         continue;
       }
-
-      // fork: fold cloud-on-terrain shadow onto the single-scattering SSS light.
-      sssApplyAtmosphereCloudShadow(singleScatteringLightSample, singleScatteringLightIdx, singleScatteringTracingResult.sssMinimalSurfaceInteraction.position);
 
       /// Visibility Check
 

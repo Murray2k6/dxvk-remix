@@ -6,7 +6,7 @@ dxgi_common_src = [
   '../dxgi/dxgi_swapchain.cpp',
 ]
 
-d3d10_src = [
+d3d10_src = files([
   '../d3d10/d3d10_blend.cpp',
   '../d3d10/d3d10_buffer.cpp',
   '../d3d10/d3d10_depth_stencil.cpp',
@@ -21,9 +21,9 @@ d3d10_src = [
   '../d3d10/d3d10_view_dsv.cpp',
   '../d3d10/d3d10_view_rtv.cpp',
   '../d3d10/d3d10_view_srv.cpp',
-]
+])
 
-d3d11_src = [
+d3d11_src = files([
   'd3d11_annotation.cpp',
   'd3d11_blend.cpp',
   'd3d11_buffer.cpp',
@@ -58,22 +58,21 @@ d3d11_src = [
   'd3d11_view_rtv.cpp',
   'd3d11_view_srv.cpp',
   'd3d11_view_uav.cpp',
-]
+])
 
 d3d11_shaders = files([
   'shaders/d3d11_video_blit_frag.frag',
   'shaders/d3d11_video_blit_vert.vert',
 ])
 
-d3d11_dll = shared_library('d3d11'+dll_ext, dxgi_common_src + d3d11_src + d3d10_src,
-    glsl_generator.process(d3d11_shaders), d3d11_res,
-  name_prefix         : '',
-  dependencies        : [ lib_dxgi, dxbc_dep, dxvk_dep ],
-  include_directories : dxvk_include_path,
-  install             : true,
-  vs_module_defs      : 'd3d11'+def_spec_ext,
-  override_options    : ['cpp_std='+dxvk_cpp_std])
+# The D3D11 sources are compiled into the unified module (see
+# src/d3d9/meson.build), not into a DLL of their own. Two DLLs that each
+# statically link libdxvk get a private copy of every global in it, so they
+# could never share a DxvkDevice -- which is the whole point of building this
+# frontend. What ships as d3d11.dll is an export forwarder.
+d3d11_compiled_shaders = glsl_generator.process(d3d11_shaders)
 
-d3d11_dep = declare_dependency(
-  link_with           : [ d3d11_dll ],
-  include_directories : [ dxvk_include_path ])
+d3d11_dll = shared_library('d3d11'+dll_ext, files('d3d11_forward.cpp'),
+  name_prefix         : '',
+  install             : true,
+  override_options    : ['cpp_std='+dxvk_cpp_std])

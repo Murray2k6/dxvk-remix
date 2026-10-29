@@ -21,6 +21,8 @@
 */
 #pragma once
 
+#include <optional>
+
 #include "../util/rc/util_rc_ptr.h"
 #include "rtx_types.h"
 #include "rtx_geometry_utils.h"
@@ -30,6 +32,7 @@
 #include <vector>
 #include <list>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace dxvk {
   class DxvkContext;
@@ -37,6 +40,7 @@ namespace dxvk {
   class DxvkBarrierSet;
   class RtInstance;
   class InstanceManager;
+  class SceneManager;
   struct InstanceEventHandler;
 
   struct OpacityMicromapOptions {
@@ -48,6 +52,17 @@ namespace dxvk {
     RTX_OPTION("rtx.opacityMicromap", bool, enableBakingArrays, true, "Enables baking of opacity textures into Opacity Micromap arrays per triangle.");
     RTX_OPTION("rtx.opacityMicromap", bool, enableBuilding, true, "Enables building of Opacity Micromap arrays.");
     RTX_OPTION("rtx.opacityMicromap", bool, enableResetEveryFrame, false, "Debug: resets Opacity Micromap runtime data every frame. ");
+    RTX_OPTION("rtx.opacityMicromap", bool, rebakeOnTextureChange, true,
+               "Rebakes an opacity micromap when the opacity texture it was baked from changes under the same texture "
+               "hash, for example when a host replaces a streamed low-resolution placeholder in place "
+               "(rtx.hostImport.enableInPlaceTextureReplace). Without this, the micromap keeps the placeholder's "
+               "cutout, which shows as blocky holes.");
+    RTX_OPTION("rtx.opacityMicromap", int, maxTextureChangeRebakesPerFrame, 64,
+               "The most opacity micromaps rtx.opacityMicromap.rebakeOnTextureChange drops for rebaking per frame.");
+    RTX_OPTION("rtx.opacityMicromap", bool, rerequestLostMicromaps, true,
+               "When an instance finds that its registered opacity micromap is no longer cached (evicted, dropped for a "
+               "rebake, or destroyed with another instance that shared it), registers it again. Without this, such an "
+               "instance traces without a micromap until it is recreated.");
 
 
     struct Cache {
@@ -71,6 +86,10 @@ namespace dxvk {
                  "Opacity Micromaps unused longer than this can be evicted when freeing up memory for new Opacity Micromaps.");
       RTX_OPTION("rtx.opacityMicromap.cache", bool, hashInstanceIndexOnly, false,
                  "Uses instance index as an Opacity Micromap hash.");
+      RTX_OPTION("rtx.opacityMicromap.cache", bool, keepMergedBlasMicromapsInUse, true,
+                 "Counts an opacity micromap held by a merged BLAS in the scene as in use, so the cache only evicts "
+                 "micromaps nothing draws with. Otherwise a static merged BLAS, which binds its micromaps only when "
+                 "rebuilt, can have them evicted while it is in view.");
 
     };
 
@@ -110,7 +129,13 @@ namespace dxvk {
       RTX_OPTION("rtx.opacityMicromap.building", bool, allow2StateOpacityMicromaps, true, "Allows generation of two state Opacity Micromaps.");
       RTX_OPTION("rtx.opacityMicromap.building", bool, force2StateOpacityMicromaps, false, "Forces generation of two state Opacity Micromaps.");
       RTX_OPTION("rtx.opacityMicromap.building", int, subdivisionLevel, 8, "Opacity Micromap subdivision level per triangle. ");
-      // Set to 0 as higher values cause bullet decals on a glass panels to miss parts in Portal RTX
+      RTX_OPTION("rtx.opacityMicromap.building", bool, adaptiveSubdivision, true,
+                 "Picks each mesh's subdivision level from its texel density, up to rtx.opacityMicromap.building.subdivisionLevel.\n"
+                 "The level is the lowest one at which micro-triangles are at most one opacity texel across on triangles\n"
+                 "holding 95% of the mesh's texel area, and at least 3. Each level less needs a quarter of the memory\n"
+                 "and bake work, so many more meshes fit the Opacity Micromap budget. Rays still alpha-test every\n"
+                 "micro-triangle the bake marks unknown, so the image does not change.");
+      // Set to 0 as higher values cause bullet decals on glass panels to miss parts
       RTX_OPTION("rtx.opacityMicromap.building", float, decalsMinResolveTransparencyThreshold, 0.f, "Min resolve transparency threshold for decals.");
 
       // Parameterized to <1% FPS overhead on 4090
@@ -260,6 +285,7 @@ namespace dxvk {
 
     Rc<DxvkOpacityMicromap> blasOmmBuffers;
     bool useVertexAndTextureOperations = false;
+    // The manager's traced-frame index (OpacityMicromapManager::m_tracedFrameIndex) of the last use.
     uint32_t lastUseFrameIndex = kInvalidFrameIndex;
     uint16_t subdivisionLevel = UINT16_MAX;
     uint32_t numTriangles = UINT32_MAX;
@@ -284,10 +310,42 @@ namespace dxvk {
     VkDeviceSize blasOmmBuffersDeviceSize = 0;
     VkDeviceSize arrayBufferDeviceSize = 0;
 
+    // rtx.opacityMicromap.rebakeOnTextureChange: the texture-table slots and image views (by cookie,
+    // so nothing is kept alive) the array was baked from; 0 = not recorded / no texture.
+    uint32_t bakedOpacityTextureIndex = UINT32_MAX;
+    uint32_t bakedSecondaryOpacityTextureIndex = UINT32_MAX;
+    uint64_t bakedOpacityViewCookie = 0;
+    uint64_t bakedSecondaryOpacityViewCookie = 0;
+    uint32_t bakedOpacityWidth = 0;   // mip-0 extent of the view baked from
+    uint32_t bakedOpacityHeight = 0;
+    uint32_t bakedSecondaryOpacityWidth = 0;
+    uint32_t bakedSecondaryOpacityHeight = 0;
+    // Texture identity (TextureRef::getImageHash) behind each slot at bake time: a slot that now holds
+    // another texture was reused, which says nothing about the texture this array was baked from.
+    XXH64_hash_t bakedOpacityImageHash = 0;
+    XXH64_hash_t bakedSecondaryOpacityImageHash = 0;
+    // Set when a BLAS first binds this micromap ([D3d9Alpha] builtNeverBound).
+    bool everBound = false;
+
+    // Opacity micromap compaction. Written by the compact pass when baking
+    // finished; the build waits for the mixed-triangle count (compactCounter, host visible).
+    Rc<DxvkBuffer> compactIndexBuffer;    // uint32 per triangle: special or compact index
+    Rc<DxvkBuffer> compactTriangleArray;  // VkMicromapTriangleEXT per mixed triangle (upper bound: numTriangles)
+    Rc<DxvkBuffer> compactCounter;
+    uint32_t compactDispatchFrame = 0;
+
+    // rtx.alphaBake.softwareOmm. The software store: numTriangles index words (special
+    // index or mixed slot) followed by wordsPerTriangle data words per mixed triangle, in one buffer with a slot in the
+    // scene's bindless raw-buffer table (acquired when a surface first uses it).
+    Rc<DxvkBuffer> softStore;
+    uint32_t softNumMixed = 0;
+    uint32_t softBindlessIndex = UINT32_MAX;
+    uint32_t softBindlessFrame = 0;  // the slot is in the bindless table from the next frame on
+
     OpacityMicromapCacheItem();
-    OpacityMicromapCacheItem(DxvkDevice& device, OpacityMicromapCacheState _cacheState, const uint32_t subdivisionLevel, const bool enableVertexAndTextureOperations,     
+    OpacityMicromapCacheItem(DxvkDevice& device, OpacityMicromapCacheState _cacheState, const uint32_t subdivisionLevel, const bool enableVertexAndTextureOperations,
                              uint32_t currentFrameIndex, std::list<XXH64_hash_t>::iterator _mostRecentlyUsedListIter, std::list<XXH64_hash_t>::iterator _cacheStateListIter,
-                             const OmmRequest& ommRequest);
+                             const OmmRequest& ommRequest, bool software = false);
     OpacityMicromapCacheItem(const OpacityMicromapCacheItem& src) 
     : cacheState(src.cacheState)
     , blasOmmBuffers(src.blasOmmBuffers)
@@ -297,7 +355,26 @@ namespace dxvk {
     , ommFormat(src.ommFormat)
     , leastRecentlyUsedListIter(src.leastRecentlyUsedListIter)
     , cacheStateListIter(src.cacheStateListIter)
-    , isUnprocessedCacheStateListIterValid(src.isUnprocessedCacheStateListIterValid) { }
+    , isUnprocessedCacheStateListIterValid(src.isUnprocessedCacheStateListIterValid)
+    , bakedOpacityTextureIndex(src.bakedOpacityTextureIndex)
+    , bakedSecondaryOpacityTextureIndex(src.bakedSecondaryOpacityTextureIndex)
+    , bakedOpacityViewCookie(src.bakedOpacityViewCookie)
+    , bakedSecondaryOpacityViewCookie(src.bakedSecondaryOpacityViewCookie)
+    , bakedOpacityWidth(src.bakedOpacityWidth)
+    , bakedOpacityHeight(src.bakedOpacityHeight)
+    , bakedSecondaryOpacityWidth(src.bakedSecondaryOpacityWidth)
+    , bakedSecondaryOpacityHeight(src.bakedSecondaryOpacityHeight)
+    , bakedOpacityImageHash(src.bakedOpacityImageHash)
+    , bakedSecondaryOpacityImageHash(src.bakedSecondaryOpacityImageHash)
+    , everBound(src.everBound)
+    , compactIndexBuffer(src.compactIndexBuffer)
+    , compactTriangleArray(src.compactTriangleArray)
+    , compactCounter(src.compactCounter)
+    , compactDispatchFrame(src.compactDispatchFrame)
+    , softStore(src.softStore)
+    , softNumMixed(src.softNumMixed)
+    , softBindlessIndex(src.softBindlessIndex)
+    , softBindlessFrame(src.softBindlessFrame) { }
 
     VkDeviceSize getDeviceSize() const;
 
@@ -347,6 +424,10 @@ namespace dxvk {
     bool isOmmBuildRequested(uint32_t currentGeneration) const {
       return ommBuildRequested && ommRegistrationGeneration == currentGeneration;
     }
+    // Whether the instance is linked to a micromap request, in any generation.
+    bool isOmmBuildRequestedAnyGeneration() const { return ommBuildRequested; }
+    // Whether the request waits for the texel footprints, which only an instance-update event computes.
+    bool waitsForTexelFootprints() const { return needsToCalculateNumTexelsPerMicroTriangle; }
     void resetCopiedRequestState() {
       ommRegistrationGeneration = 0;
       ommRetryAfterFrame = 0;
@@ -355,6 +436,8 @@ namespace dxvk {
     }
   private:
     XXH64_hash_t ommSrcHash = kEmptyHash;
+    // The triangle count of the geometry ommSrcHash was computed from.
+    uint32_t ommSrcNumTriangles = 0;
     uint32_t ommRegistrationGeneration = 0;
     uint32_t ommEligibilityGeneration = UINT32_MAX;  // Generation when eligibility was last evaluated
     uint32_t ommRetryAfterFrame = 0;                 // Skip processing until this frame is reached
@@ -375,10 +458,38 @@ namespace dxvk {
       DependenciesUnavailable
     };
 
-    explicit OpacityMicromapManager(DxvkDevice* device);
+    // software: rtx.alphaBake.softwareOmm. Fixed for the manager's lifetime, so the scene manager
+    // creates a new manager when the mode changes.
+    explicit OpacityMicromapManager(DxvkDevice* device, bool software = false);
     ~OpacityMicromapManager();
 
     void onDestroy();
+
+    bool isSoftware() const { return m_software; }
+    // Once per frame after AccelManager::mergeInstancesIntoBlas (surface slots assigned): releases queued bindless slots,
+    // acquires slots for stores surfaces use, uploads the per-surface table and logs [SoftOmm]. Software mode only.
+    void updateSoftwareTable(Rc<DxvkContext> ctx, SceneManager& scene);
+    // Releases every bindless slot the manager holds (scene clear, before the manager is destroyed).
+    void releaseSoftwareSlots(SceneManager& scene);
+    // Bindless raw-buffer index of the per-surface table (uint2 per surface slot, see software_omm.slangh), UINT32_MAX = none
+    // this frame.
+    uint32_t getSoftwareTableIndex() const;
+    // rtx.alphaBake.softwareOmmSelfTest, once per frame whether or not a manager
+    // exists: dispatches the bary2index self-test when the option is switched on and logs the result when it is back.
+    static void softwareOmmSelfTestFrame(Rc<DxvkContext> ctx);
+
+    // Size of the OMM build scratch buffer currently held (counted as acceleration-structure memory).
+    VkDeviceSize getScratchBufferBytes() const {
+      return m_scratchBuffer != nullptr ? m_scratchBuffer->info().size : 0;
+    }
+
+    // OMM cache memory in use and its current budget (rtx.vramBudget log and dev menu).
+    VkDeviceSize getCacheBytesUsed() const { return m_memoryManager.getUsed(); }
+    VkDeviceSize getCacheBudgetBytes() const { return m_memoryManager.getBudget(); }
+
+    // Evicts, at the next onFrameStart, every cached micromap not used for at least minAgeFrames traced frames.
+    // The VRAM budget calls it when the scene changes, so the old scene's micromaps do not pin memory.
+    void requestTrim(uint32_t minAgeFrames) { m_trimMinAgeFrames = std::max(minAgeFrames, 1u); }
 
     // Calculates hash that distinguishes source data used for Opacity Micromap generation
     static XXH64_hash_t calculateSourceHash(XXH64_hash_t geometryHash, XXH64_hash_t materialHash, const RtSurface::AlphaState& alphaState);
@@ -392,6 +503,15 @@ namespace dxvk {
     // Returns kEmptyHash otherwise
     XXH64_hash_t tryBindOpacityMicromap(Rc<DxvkContext> ctx, const RtInstance& instance, uint32_t billboardIndex, 
                                         VkAccelerationStructureGeometryKHR& targetGeometry, const InstanceManager& instanceManager);
+    // rtx.parallelDynamicBlasPass: the request tryBindOpacityMicromap would build and bind, built
+    // ahead of time (read-only, so from any thread), or nothing where it would return first; and
+    // tryBindOpacityMicromap taking that request instead of building it.
+    std::optional<OmmRequest> prepareOpacityMicromapBind(const RtInstance& instance, uint32_t billboardIndex,
+                                                         const InstanceManager& instanceManager) const;
+    XXH64_hash_t tryBindPreparedOpacityMicromap(Rc<DxvkContext> ctx, const RtInstance& instance,
+                                                const std::optional<OmmRequest>& prepared, uint32_t billboardIndex,
+                                                VkAccelerationStructureGeometryKHR& targetGeometry,
+                                                const InstanceManager& instanceManager);
 
     // Called once per frame to build pending Opacity Micromap items in Opacity Micromap Manager
     void buildOpacityMicromaps(Rc<DxvkContext> ctx, const std::vector<TextureRef>& textures, uint32_t lastCameraCutFrameId);
@@ -429,10 +549,35 @@ namespace dxvk {
     static bool usesOpacityMicromap(const RtInstance& instance);
     static bool usesSplitBillboardOpacityMicromap(const RtInstance& instance);
     static bool useStagingNumTexelsPerMicroTriangleObject(const RtInstance& instance);
+    // Whether onInstanceUpdated has any work for this instance on the preserve path (the texel
+    // calculation it drives). False means the callback would return without changing anything.
+    static bool needsPreserveUpdate(const RtInstance& instance);
     static XXH64_hash_t getOpacityMicromapHash(const RtInstance& instance);
+
+    // rtx.opacityMicromap.bindSharedBlas. Whether one micromap is valid for every instance
+    // of a per-geometry BLAS they share. The micromap is baked into the BLAS, so it is applied to all of them:
+    // that is only the same result as a per-instance micromap when every instance uses micromaps and would request
+    // the very same one (equal OMM source hash: material, alpha state, texture stage ops, tFactor alpha, texture
+    // transform, texcoords, indices, triangle count and format), and only 4-state ones are accepted (unknown
+    // micro-triangles keep the exact alpha test).
+    enum class SharedBlasOmm : uint8_t {
+      NoUsers,      // no instance uses micromaps (or micromaps unavailable): nothing to bind
+      Compatible,   // all instances request the same 4-state micromap
+      MixedUsers,   // some instances use micromaps, others do not
+      HashMismatch, // instances request different micromaps
+      TwoState      // same micromap, but 2-state: not bound (it would drop unknown texels from the alpha test)
+    };
+    SharedBlasOmm checkSharedBlasOmm(const std::vector<RtInstance*>& instances, const InstanceManager& instanceManager) const;
+    // Built micromaps that no BLAS has bound yet (walks the cache; logging only).
+    uint32_t countBuiltNeverBound() const;
 
     // Internal use only
     void onInstanceUnlinked(const RtInstance& instance);
+
+    // The instance's geometry was rebuilt in place with other triangles, or for another object
+    // (SceneManager::onSceneObjectUpdated). Its source hash, requests and staged texel footprints describe the old
+    // geometry, so they are dropped, and the instance is evaluated again as a new candidate.
+    void onInstanceTopologyChanged(const RtInstance& instance);
 
     // Processes OMM candidates that are pending registration.  By the time
     // this runs, onInstanceUpdated has already culled ineligible instances, so
@@ -442,6 +587,18 @@ namespace dxvk {
     // Returns true if any OMMs transitioned to the Built state this frame,
     // meaning affected BLASes should be rebuilt to bind them.
     bool hasNewlyBuiltOmms() const { return m_hasNewlyBuiltOmms; }
+    // The micromap bound by the last tryBind*OpacityMicromap call (null if it bound nothing).
+    const Rc<DxvkResource>& getLastBoundOmmBuffers() const { return m_lastBoundOmmBuffers; }
+    // rtx.accelIncrementalSelfCheckFrames ([OmmBindingCheck]): whether this micromap is still the
+    // cache's live micromap for this source hash.
+    bool isLiveOmm(XXH64_hash_t ommSrcHash, const DxvkResource* buffers) const;
+
+    // Moves the source hashes of OMMs that became bindable since the last call (built, or
+    // newly associated with an instance while already built) into `out` (rtx.limitOmmRebindToNewOmms).
+    void takeNewlyBindableOmmHashes(std::unordered_set<XXH64_hash_t>& out) {
+      out.insert(m_newlyBindableOmmHashes.begin(), m_newlyBindableOmmHashes.end());
+      m_newlyBindableOmmHashes.clear();
+    }
 
     // Returns true if OMM option changes require all BLASes to be rebuilt
     // (e.g. binding or building options toggled).  Cleared after reading.
@@ -458,7 +615,46 @@ namespace dxvk {
     // Generation counter bumped on clear().  Used by isOmmBuildRequested() to
     // invalidate stale retain-mode flags after cache resets.
     uint32_t getOmmGeneration() const { return m_ommGeneration; }
+
+    // rtx.profile.detailedLogging
+    uint32_t getMicroTrianglesBakedThisFrame() const { return m_numMicroTrianglesBaked; }
+    uint32_t getMicroTrianglesBuiltThisFrame() const { return m_numMicroTrianglesBuilt; }
+    size_t getCacheItemCount() const { return m_ommCache.size(); }
+    size_t getBlacklistedCount() const { return m_blackListedList.size(); }
+    size_t getUnprocessedCount() const { return m_unprocessedList.size(); }
+    // 0 = the instance has no cached OMM source, 1 = its OMM is pending (queued, baking, baked), 2 = built/ready.
+    int getOmmReadiness(const RtInstance& instance) const;
+    // Whether the instance is still a micromap candidate that may ask for a micromap: it is not opaque, and either its
+    // eligibility is not evaluated yet or it is an eligible user whose request is not registered.
+    // An ineligible, blacklisted or registered instance is no longer one.
+    bool waitsForOmmRequest(const RtInstance& instance) const;
+    bool isOmmCandidate(const RtInstance& instance) const {
+      return m_ommCandidates.find(const_cast<RtInstance*>(&instance)) != m_ommCandidates.end();
+    }
+
+    // rtx.opacityMicromap.cache.keepMergedBlasMicromapsInUse: marks the micromap held by a BLAS
+    // under this hash as used this frame, if it is still the cache's live one.
+    void touchBoundOmm(XXH64_hash_t ommSrcHash, const DxvkResource* buffers);
+
+    // [OmmChurn] counters since the last call (rtx perf log).
+    struct ChurnStats {
+      uint32_t textureChangeRebakes = 0;  // rtx.opacityMicromap.rebakeOnTextureChange drops
+      uint32_t slotReusedSkips = 0;       // baked slot now holds another texture: not a change, kept
+      uint32_t sameExtentSkips = 0;       // same texture, new view of the same size (copy-on-write): kept
+      uint32_t lostRerequests = 0;        // rtx.opacityMicromap.rerequestLostMicromaps
+      uint32_t evictions = 0;             // LRU evictions
+      uint32_t evictedYoungerThan900 = 0; // evictions forced by a budget decrease
+      uint32_t mergedTouches = 0;         // keepMergedBlasMicromapsInUse refreshes
+    };
+    ChurnStats takeChurnStats() {
+      const ChurnStats s = m_churn;
+      m_churn = {};
+      return s;
+    }
   private:
+    ChurnStats m_churn;
+    // rtx.opacityMicromap.rebakeOnTextureChange: drops micromaps whose opacity texture changed.
+    void dropMicromapsOfChangedTextures(const std::vector<TextureRef>& textures);
     typedef fast_unordered_cache<OpacityMicromapCacheItem> OpacityMicromapCache;
 
     struct InstanceOmmRequests {
@@ -485,6 +681,7 @@ namespace dxvk {
     friend class CachedSourceData;
 
     XXH64_hash_t bindOpacityMicromap(Rc<DxvkContext> ctx, const RtInstance& instance, uint32_t billboardIndex, VkAccelerationStructureGeometryKHR& targetGeometry, const InstanceManager& instanceManager);
+    XXH64_hash_t bindOpacityMicromapWithRequest(Rc<DxvkContext> ctx, const OmmRequest& ommRequest, VkAccelerationStructureGeometryKHR& targetGeometry);
 
     void generateInstanceOmmRequests(RtInstance& instance, const InstanceManager& instanceManager, std::vector<OmmRequest>& ommRequests);
 
@@ -513,17 +710,25 @@ namespace dxvk {
       //       They must not be used outside of the function as they are not kept up-to-date for all outcomes
       uint32_t numTrianglesCalculated = 0;
       uint32_t numTrianglesWithinTexelBudget = 0;
+
+      // rtx.opacityMicromap.building.adaptiveSubdivision. A first pass over the triangles adds each triangle's texel
+      // area to the bin of the level it needs; `result` is then computed for subdivisionLevel.
+      static constexpr uint32_t kNumLevelBins = 13;
+      uint32_t numTrianglesScanned = 0;
+      double texelAreaPerLevel[kNumLevelBins] = {};
+      uint16_t subdivisionLevel = UINT16_MAX;
     };
 
     static uint32_t calculateNumTexelsPerMicroTriangle(Vector2 triangleTexcoords[3], float rcpNumMicroTrianglesAlongEdge, Vector2 textureResolution);
     void calculateNumTexelsPerMicroTriangle(NumTexelsPerMicroTriangleCalculationData& numTexelsPerMicroTriangle, const RtInstance& instance, const uint32_t numTriangles);
     void calculateNumTexelsPerMicroTriangle(const RtInstance& instance);
-    OmmResult getNumTexelsPerMicroTriangle(const RtInstance& instance, NumTexelsPerMicroTriangle** numTexelsPerMicroTriangle);
+    OmmResult getNumTexelsPerMicroTriangle(const RtInstance& instance, NumTexelsPerMicroTriangle** numTexelsPerMicroTriangle,
+                                           uint16_t* subdivisionLevel = nullptr);
 
     // Called whenever a new instance has been added to the database
     void onInstanceAdded(const RtInstance& instance);
     // Called whenever instance metadata is updated
-    void onInstanceUpdated(const RtInstance& instance, const DrawCallState& drawCall, const MaterialData* material, const bool hasTransformChanged, const bool hasVerticesChanged, const bool isFirstUpdateThisFrame);
+    void onInstanceUpdated(const RtInstance& instance, const SceneDraw& drawCall, const MaterialData* material, const bool hasTransformChanged, const bool hasVerticesChanged, const bool isFirstUpdateThisFrame);
     // Called whenever an instance has been removed from the database
     void onInstanceDestroyed(const RtInstance& instance);
 
@@ -570,7 +775,31 @@ namespace dxvk {
       uint16_t numFramesRequested = 0;
       uint16_t numTimesRequested = 0;
       uint32_t lastRequestFrameId = kInvalidFrameIndex;
+      uint32_t advanceTick = 0; // m_statsTick when numFramesRequested was last advanced
     };
+    // Frames counted into numFramesRequested: the retain-mode auto-advance ("one more frame
+    // requested" per onFrameStart). rtx.ommIncrementalBookkeeping applies it when an entry is read
+    // instead of walking every entry each frame; the count is the same.
+    uint32_t m_statsTick = 0;
+    void advanceRequestStatistics(OMMBuildRequestStatistics& stats, uint32_t currentFrameIndex) {
+      if (stats.lastRequestFrameId == kInvalidFrameIndex) {
+        stats.advanceTick = m_statsTick; // new: the caller counts its first frame
+        return;
+      }
+      if (stats.advanceTick != m_statsTick) {
+        const uint32_t frames = m_statsTick - stats.advanceTick;
+        stats.numFramesRequested = uint16_t(std::min<uint32_t>(UINT16_MAX, uint32_t(stats.numFramesRequested) + frames));
+        stats.lastRequestFrameId = currentFrameIndex;
+        stats.advanceTick = m_statsTick;
+      }
+    }
+    // rtx.ommIncrementalBookkeeping: processOmmCandidates collects its candidates from
+    // m_ommCandidates (new instances are added to it as they are created) instead of walking the
+    // whole instance table; the walk still runs on the first frame and after a generation change,
+    // when every instance's eligibility is stale.
+    bool m_ommCandidatesFullScanPending = true;
+    bool m_ommIncrementalActive = false;
+    uint32_t m_ommCandidateCheckMismatches = 0;
 
     uint32_t m_numMicroTrianglesBaked = 0;    // Per frame
     uint32_t m_numMicroTrianglesBuilt = 0;    // Per frame
@@ -581,6 +810,13 @@ namespace dxvk {
     fast_unordered_cache<OMMBuildRequestStatistics> m_ommBuildRequestStatistics;
 
     VkDeviceSize m_amountOfMemoryMissing = 0;    // Records how much memory was missing in a frame
+    uint32_t m_trimMinAgeFrames = 0;             // Pending requestTrim. 0 = none.
+    // Frames that traced the scene: advanced by onFrameStart once per device frame that builds the
+    // acceleration structures. Micromap use and eviction ages count these, so frames the host rasterises
+    // without ray tracing age nothing, and the micromaps the scene's BLASes hold are still young when
+    // tracing resumes.
+    uint32_t m_tracedFrameIndex = 0;
+    uint32_t m_tracedFrameDeviceFrame = kInvalidFrameIndex;  // the device frame that last advanced it
     OpacityMicromapMemoryManager m_memoryManager;
     bool m_hasEnoughMemoryToPotentiallyGenerateAnOmm = true; // A quick check to avoid unnecessary computations when there's not enough free budget to handle more OMMs
     Rc<DxvkBuffer> m_scratchBuffer;
@@ -591,6 +827,7 @@ namespace dxvk {
     int m_prevConservativeEstimationMaxTexelTapsPerMicroTriangle = OpacityMicromapOptions::Building::ConservativeEstimation::maxTexelTapsPerMicroTriangle();
     float m_prevConservativeEstimationMinValidOMMTrianglesInMeshPercentage = OpacityMicromapOptions::Building::ConservativeEstimation::minValidOMMTrianglesInMeshPercentage();
     int m_prevBuildingSubdivisionLevel = OpacityMicromapOptions::Building::subdivisionLevel();
+    bool m_prevBuildingAdaptiveSubdivision = OpacityMicromapOptions::Building::adaptiveSubdivision();
     bool m_prevBuildingEnableVertexAndTextureOperations = OpacityMicromapOptions::Building::enableVertexAndTextureOperations();
 
     uint32_t m_numTrianglesToCalculateForNumTexelsPerMicroTriangle = 
@@ -603,6 +840,12 @@ namespace dxvk {
     fast_unordered_cache<NumTexelsPerMicroTriangleCalculationData> m_numTexelsPerMicroTriangle;
     std::vector<const RtInstance*> m_instancesToDestroy;
 
+    // [OmmTopology]: instances whose geometry changed under their source hash, and texel footprint tables a bake found
+    // smaller than its triangles, since the last line.
+    uint32_t m_topologyResets = 0;
+    uint32_t m_staleTexelTables = 0;
+    uint32_t m_topologyLogFrame = 0;
+
     // Retain-mode: instances whose OMM registration was rejected by a temporary
     // condition (filter age/count, texture residency).  Retried each frame via
     // processOmmCandidates().
@@ -612,6 +855,10 @@ namespace dxvk {
     // the Built state.  The accel manager uses this to force a scene rebuild so
     // the newly-built OMMs get bound to BLASes.
     bool m_hasNewlyBuiltOmms = false;
+    Rc<DxvkResource> m_lastBoundOmmBuffers;
+    // Source hashes behind m_hasNewlyBuiltOmms, kept until the accel manager takes them
+    // (rtx.limitOmmRebindToNewOmms). Unlike the flag, not reset at frame start.
+    std::unordered_set<XXH64_hash_t> m_newlyBindableOmmHashes;
 
     // Set when OMM option changes require all BLASes to be rebuilt.
     bool m_needsBlasRebuild = false;
@@ -627,6 +874,128 @@ namespace dxvk {
     bool m_prevEnableBinding = OpacityMicromapOptions::enableBinding();
     bool m_prevEnableBuilding = OpacityMicromapOptions::enableBuilding();
     bool m_prevEnableBakingArrays = OpacityMicromapOptions::enableBakingArrays();
+
+    // rtx.alphaBake.census. A census window is one host-visible counter
+    // buffer plus the host-side size of each micromap counted into it (one slot per micromap);
+    // closed windows are read back once the GPU is done with them.
+    struct CensusSlot {
+      uint32_t numTriangles = 0;
+      uint32_t bytesPerTriangle = 0;
+    };
+    struct CensusWindow {
+      Rc<DxvkBuffer> counters;
+      std::vector<CensusSlot> slots;
+      uint32_t openedFrame = 0;
+      uint32_t closedFrame = 0;
+      // rtx.alphaBake.censusMicroStates: created on the window's first micro-state
+      // dispatch; microMicromaps of its slots were counted into it.
+      Rc<DxvkBuffer> microCounters;
+      uint32_t microMicromaps = 0;
+    };
+    // Micro-triangle state totals: [class: 0 uniform / 1 mixed][format: 0 4-state / 1 2-state][subdivision level].
+    struct MicroCensusBin {
+      uint64_t microTriangles[4] = {}; // T / O / UT / UO
+      uint64_t triangles = 0;
+      uint64_t shares[4] = {};         // sum over triangles of each state's share of the triangle, 1.0 = 65536
+    };
+    struct MicroCensusTotals {
+      MicroCensusBin bins[2][2][16];
+      uint64_t micromaps = 0;
+    };
+    MicroCensusTotals m_microCensusCumulative;
+    static std::string formatMicroCensus(const MicroCensusTotals& x);
+    static std::string formatMicroCensusSplit(const MicroCensusTotals& x);
+    struct CensusTotals {
+      uint64_t triangles[3] = {};        // transparent / opaque / mixed
+      uint64_t micromaps = 0;
+      uint64_t micromapsAllOpaque = 0;
+      uint64_t micromapsAllTransparent = 0;
+      uint64_t micromapsUniformOnly = 0; // no mixed triangle, both classes present
+      uint64_t arrayBytes = 0;
+      uint64_t uniformArrayBytes = 0;    // array bytes of uniform triangles
+      uint32_t skipped = 0;              // micromaps whose per-triangle size is not a multiple of 4 bytes
+    };
+    static constexpr uint32_t kCensusSlots = 1024;
+    static constexpr uint32_t kCensusWindowFrames = 300;
+    CensusWindow m_censusOpen;
+    std::vector<CensusWindow> m_censusClosed;
+    CensusTotals m_censusCumulative;
+    uint32_t m_censusSkippedOpen = 0;
+    void censusMicromap(Rc<DxvkContext> ctx, const OpacityMicromapCacheItem& ommCacheItem, uint32_t numTriangles,
+                        uint32_t bytesPerTriangle);
+    void censusFrameStart(uint32_t currentFrameIndex);
+
+    // Opacity micromap compaction.
+    struct CompactStats {
+      uint64_t micromaps = 0;
+      uint64_t triangles = 0;
+      uint64_t mixedTriangles = 0;
+      uint64_t budgetBytesReleased = 0;
+      uint64_t micromapsPerLevel[13] = {};
+    };
+    CompactStats m_compactStats;
+    uint32_t m_compactLogFrame = 0;
+    bool dispatchCompact(Rc<DxvkContext> ctx, OpacityMicromapCacheItem& ommCacheItem, uint32_t numTriangles,
+                         uint32_t bytesPerTriangle);
+
+    // rtx.alphaBake.softwareOmm.
+    bool m_software = false;
+    // Instead of buildOpacityMicromapsInternal: packs finished, compacted arrays into software stores.
+    void buildSoftwareOmmsInternal(Rc<DxvkContext> ctx, uint32_t& maxMicroTrianglesToBuild);
+    OmmResult buildSoftwareOmm(Rc<DxvkContext> ctx, XXH64_hash_t ommSrcHash, OpacityMicromapCacheItem& ommCacheItem);
+    // Hands an item's bindless slot to the release queue (destroyOmmData, clear).
+    void queueSoftwareSlotRelease(OpacityMicromapCacheItem& ommCacheItem);
+    // rtx.opacityMicromap.rerequestLostMicromaps for an instance whose registered micromap is no longer in the cache.
+    void rerequestLostMicromap(const RtInstance& instance, XXH64_hash_t ommSrcHash);
+    std::vector<uint32_t> m_softSlotsToRelease;
+    // Per instance: the source hash of a fresh request (as a hardware bind builds it), recomputed when the instance is
+    // updated outside the preserve path.
+    struct SoftInstanceHash {
+      XXH64_hash_t hash = kEmptyHash;
+      uint32_t frameLastUpdated = UINT32_MAX;
+    };
+    std::unordered_map<const RtInstance*, SoftInstanceHash> m_softInstanceHashes;
+    // Per-surface table: uint2 per surface slot (x: bindless + 1 | level << 16 | 2-state << 20, y: first data word).
+    std::vector<uint32_t> m_softTable;
+    std::vector<uint32_t> m_softUploadedTable;
+    Rc<DxvkBuffer> m_softTableBuffer;
+    uint32_t m_softTableBindlessIndex = UINT32_MAX;
+    uint32_t m_softTableAcquireFrame = 0;
+    uint32_t m_softTableFrame = UINT32_MAX;  // frame of the last table update
+    bool m_softTableUsable = false;
+    // [SoftOmm] statistics
+    struct SoftStats {
+      uint64_t storesBuilt = 0;
+      uint64_t triangles = 0;
+      uint64_t mixedTriangles = 0;
+      uint64_t storeBytes = 0;
+      uint64_t budgetBytesReleased = 0;
+      uint64_t failed = 0;
+    };
+    SoftStats m_softStats;
+    uint32_t m_softLogFrame = 0;
+    struct SoftFrameCounts {
+      uint32_t ommSurfaces = 0;      // surface slots whose instance uses micromaps
+      uint32_t withData = 0;         // table entries written
+      uint32_t pending = 0;          // micromap not ready yet (unprocessed, baking, baked)
+      uint32_t missing = 0;          // no cache item for the instance's request
+      uint32_t indexOffset = 0;      // split (billboard) geometry slot, not supported
+      uint32_t noSlot = 0;           // no bindless room / slot acquired this frame
+      uint32_t mismatch = 0;         // cache item triangle count differs from the geometry
+    };
+    SoftFrameCounts m_softFrame;
+    // rtx.alphaBake.softwareOmmCounters, read back from the LightSamplingStats buffer.
+    void softwareCountersFrame(Rc<DxvkContext> ctx, uint32_t frame);
+    bool m_softCountersActive = false;
+    bool m_softCounterPending = false;
+    Rc<DxvkBuffer> m_softCounterReadback;
+    uint32_t m_softCounterCopyFrame = 0;
+    uint32_t m_softCounterLastCopyFrame = 0;
+    uint32_t m_softCounterPendingFrames = 0;
+    uint32_t m_softCounterWindowStart = 0;
+    uint32_t m_softCounterWindowFrames = 0;
+    // SOFT_OMM_COUNTER_SLOTS + SOFT_OMM_RESOLVE_COUNTER_SLOTS + SOFT_OMM_TRAVERSAL_COUNTER_SLOTS
+    uint64_t m_softCounterTotals[4 * 5 + 3 * 3 + 4 * 5] = {};
 
     // Need to give access to CachedSourceData to be able to purge m_numTexelsPerMicroTriangleStaging
     friend class CachedSourceData;

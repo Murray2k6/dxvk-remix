@@ -23,6 +23,7 @@
 
 #include "d3d9_device_base.h"
 
+#include "config/global_options.h"
 #include "util_common.h"
 #include "util_scopedlock.h"
 
@@ -32,15 +33,6 @@ template<bool EnableSync>
 class Direct3DDevice9Ex_LSS: public BaseDirect3DDevice9Ex_LSS {
 
 #ifdef WITH_MULTITHREADED_DEVICE
-  // Using a std::recursive_mutex at the moment. On a 3GHz Threadripper system measured
-  // ~22ns for lock/unlock sequence with no contention.
-  typedef std::conditional_t<EnableSync, std::recursive_mutex, bridge_util::nop_sync> LockType;
-
-  // TODO: The lock is global because currently the bridge and the transport queues
-  // are NOT thread-safe.This mutex can be made device-local or completely removed
-  // when the bridge has been made thread-safe.
-  inline static LockType s_globalLock;
-
 public:
   void lock() override {
     lockImpl();
@@ -49,12 +41,44 @@ public:
     unlockImpl();
   }
   void lockImpl() {
-    s_globalLock.lock();
+    if constexpr (EnableSync) {
+      bridge_util::getClientBridgeMutex().lock();
+    }
   }
   void unlockImpl() {
-    s_globalLock.unlock();
+    if constexpr (EnableSync) {
+      bridge_util::getClientBridgeMutex().unlock();
+    }
   }
 #endif
+
+private:
+  // Takes the client bridge mutex for one call when the call needs it, and nothing otherwise.
+  // A call that waits for a server response (sendAllServerResponses) always needs it.
+  // On a thread-safe device a call that changes the device state or the redundancy filter (SentState) also needs it:
+  // the state, the filter and the command then form one step.
+  // The writer channel has its own mutex, so a draw that leaves both alone needs no further lock.
+  template<bool kDeviceState>
+  class CallLock: public bridge_util::NonCopyable {
+  public:
+    CallLock()
+      : m_locked((EnableSync && kDeviceState) || GlobalOptions::getSendAllServerResponses()) {
+      if (m_locked) {
+        bridge_util::getClientBridgeMutex().lock();
+      }
+    }
+
+    ~CallLock() {
+      if (m_locked) {
+        bridge_util::getClientBridgeMutex().unlock();
+      }
+    }
+
+  private:
+    const bool m_locked;
+  };
+  using SetterLock = CallLock<true>;
+  using DrawLock = CallLock<false>;
 
 protected:
   // Releases the internal objects, if any.

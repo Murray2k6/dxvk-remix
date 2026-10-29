@@ -24,6 +24,7 @@
 #include <cassert>
 
 #include "rtx.h"
+#include "rtx_pre_exposure.h"
 #include "rtx_context.h"
 #include "rtx_options.h"
 #include "rtx/pass/tonemap/tonemapping.h"
@@ -76,6 +77,7 @@ namespace dxvk {
     }
   }
 
+  template<>
   NVSDK_NGX_PerfQuality_Value DxvkDLSS::profileToQuality(DLSSProfile profile) {
     NVSDK_NGX_PerfQuality_Value perfQuality = NVSDK_NGX_PerfQuality_Value_Balanced;
     switch (profile)
@@ -151,7 +153,7 @@ namespace dxvk {
     // Update our requested profile
     mProfile = profile;
 
-    const NVSDK_NGX_PerfQuality_Value perfQuality = profileToQuality(mActualProfile);
+    const NVSDK_NGX_PerfQuality_Value perfQuality = profileToQuality<NVSDK_NGX_PerfQuality_Value>(mActualProfile);
     if (!m_dlssContext) {
       m_dlssContext = m_device->getCommon()->metaNGXContext().createDLSSContext();
     }
@@ -201,8 +203,10 @@ namespace dxvk {
     ctx->setFramePassStage(RtxFramePassStage::DLSS);
 
     bool dlssAutoExposure = useDlssAutoExposure();
-    mRecreate |= (mAutoExposure != dlssAutoExposure);
+    mRecreate |= (mAutoExposure != dlssAutoExposure)
+      || m_prevPreset != preset();
     mAutoExposure = dlssAutoExposure;
+    m_prevPreset = preset();
 
     if (mRecreate) {
       initializeDLSS(ctx);
@@ -292,8 +296,10 @@ namespace dxvk {
 
       NGXDLSSContext::NGXSettings settings;
       settings.resetAccumulation = resetHistory;
-      settings.antiGhost = mBiasCurrentColorEnabled;
-      settings.preExposure = mPreExposure;
+      settings.antiGhost = mBiasCurrentColorEnabled || device()->getCommon()->metaNumos().writesUpscalerBiasMask();
+      // The input is pre-exposed by P (rtx_pre_exposure.h); NGX divides it out, so its history stays consistent
+      // across a step. The exposure texture stays physical (Unreal's convention).
+      settings.preExposure = mPreExposure * PreExposure::get();
       settings.jitterOffset[0] = jitterOffset[0];
       settings.jitterOffset[1] = jitterOffset[1];
       settings.motionVectorScale[0] = motionVectorScale[0];
@@ -335,8 +341,23 @@ namespace dxvk {
 
     // Note: Use "actual profile" here not the set profile as this value should have any auto profiles resolved to an actual DLSS profile which is
     // required for initializing DLSS.
-    const NVSDK_NGX_PerfQuality_Value perfQuality = profileToQuality(mActualProfile);
+    const NVSDK_NGX_PerfQuality_Value perfQuality = profileToQuality<NVSDK_NGX_PerfQuality_Value>(mActualProfile);
 
-    m_dlssContext->initialize(renderContext, mInputSize, mDLSSOutputSize, mIsHDR, mInverseDepth, mAutoExposure, false, perfQuality);
+    // DLSSPreset enum values match the NGX preset enum, so a direct cast is valid.
+    // Fall back to the default preset for any unexpected/out-of-range value.
+    NVSDK_NGX_DLSS_Hint_Render_Preset dlssPreset;
+    switch (preset()) {
+    case DLSSPreset::J:
+    case DLSSPreset::K:
+    case DLSSPreset::L:
+    case DLSSPreset::M:
+      dlssPreset = static_cast<NVSDK_NGX_DLSS_Hint_Render_Preset>(preset());
+      break;
+    default:
+      dlssPreset = NVSDK_NGX_DLSS_Hint_Render_Preset_Default;
+      break;
+    }
+
+    m_dlssContext->initialize(renderContext, mInputSize, mDLSSOutputSize, mIsHDR, mInverseDepth, mAutoExposure, false, dlssPreset, perfQuality);
   }
 }

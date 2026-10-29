@@ -1,3 +1,5 @@
+#include <chrono>
+
 #include "../util/util_time.h"
 
 #include "dxvk_device.h"
@@ -5,6 +7,7 @@
 #include "dxvk_pipemanager.h"
 #include "dxvk_spec_const.h"
 #include "dxvk_state_cache.h"
+#include "rtx_render/rtx_pipeline_stats.h"
 
 namespace dxvk {
 
@@ -63,23 +66,26 @@ namespace dxvk {
   VkPipeline DxvkGraphicsPipeline::getPipelineHandle(
     const DxvkGraphicsPipelineStateInfo& state,
     const DxvkRenderPass*                renderPass) {
-    DxvkGraphicsPipelineInstance* instance = nullptr;
+    // The handle is read under the lock because another thread's createInstance can reallocate the instance list.
+    VkPipeline pipeline = VK_NULL_HANDLE;
 
     { std::lock_guard<sync::Spinlock> lock(m_mutex);
-    
-      instance = this->findInstance(state, renderPass);
-      
+
+      DxvkGraphicsPipelineInstance* instance = this->findInstance(state, renderPass);
+
       if (instance)
         return instance->pipeline();
-      
+
       instance = this->createInstance(state, renderPass);
+      if (instance)
+        pipeline = instance->pipeline();
     }
-    
-    if (!instance)
+
+    if (!pipeline)
       return VK_NULL_HANDLE;
 
     this->writePipelineStateToCache(state, renderPass->format());
-    return instance->pipeline();
+    return pipeline;
   }
 
 
@@ -382,7 +388,7 @@ namespace dxvk {
     VkGraphicsPipelineCreateInfo info;
     info.sType                    = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     info.pNext                    = nullptr;
-    info.flags                    = 0;
+    info.flags                    = RtxPipelineStats::captureFlags(); // 0 unless rtx.debug.logPipelineStats
     info.stageCount               = stages.size();
     info.pStages                  = stages.data();
     info.pVertexInputState        = &viInfo;
@@ -409,12 +415,46 @@ namespace dxvk {
     if (Logger::logLevel() <= LogLevel::Debug)
       t0 = dxvk::high_resolution_clock::now();
     
+    // Creation feedback (core in Vulkan 1.3): whether the pipeline cache served it.
+    VkPipelineCreationFeedback feedback = {};
+    VkPipelineCreationFeedbackCreateInfo feedbackInfo = { VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO };
+    feedbackInfo.pPipelineCreationFeedback = &feedback;
+    if (m_pipeMgr->m_cache->feedbackSupported()) {
+      feedbackInfo.pNext = info.pNext;
+      info.pNext = &feedbackInfo;
+    }
+
     VkPipeline pipeline = VK_NULL_HANDLE;
+    const auto cacheLock = m_pipeMgr->m_cache->lockForCreate();
+    const auto createStart = std::chrono::steady_clock::now();
     if (m_vkd->vkCreateGraphicsPipelines(m_vkd->device(),
           m_pipeMgr->m_cache->handle(), 1, &info, nullptr, &pipeline) != VK_SUCCESS) {
       Logger::err("DxvkGraphicsPipeline: Failed to compile pipeline");
       this->logPipelineState(LogLevel::Error, state);
       return VK_NULL_HANDLE;
+    }
+
+    // Graphics pipelines are logged only when they compile after the startup prewarm.
+    RtxPipelineStats::logCreation(m_pipeMgr->m_cache.ptr(), "graphics",
+      str::format(m_shaders.vs != nullptr ? m_shaders.vs->debugName() : std::string("none"), "+",
+                  m_shaders.fs != nullptr ? m_shaders.fs->debugName() : std::string("none")),
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStart).count(),
+      (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) == 0 ? -1
+        : (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0 ? 1 : 0,
+      false, false);
+
+    // Creation has completed on this thread. Named by its shader set, so the many
+    // render-state variants of one shader combination are logged once.
+    if (unlikely(info.flags & VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR)) {
+      std::string name;
+      for (const DxvkShader* shader : { m_shaders.vs.ptr(), m_shaders.tcs.ptr(), m_shaders.tes.ptr(), m_shaders.gs.ptr(), m_shaders.fs.ptr() }) {
+        if (shader != nullptr) {
+          if (!name.empty())
+            name += "+";
+          name += RtxPipelineStats::shaderName(shader);
+        }
+      }
+      RtxPipelineStats::logPipeline(*m_vkd, pipeline, name);
     }
     
     if (Logger::logLevel() <= LogLevel::Debug) {

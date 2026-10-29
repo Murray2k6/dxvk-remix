@@ -343,6 +343,11 @@ namespace dxvk {
     DxvkExt khrSynchronization2               = { VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,                  DxvkExtMode::Optional };
     DxvkExt extOpacityMicromap                = { VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME,                   DxvkExtMode::Optional };
 
+    // XeSS creates descriptor set layouts with mutable descriptors and, where the GPU has them,
+    // shaders with packed 8-bit dot products.
+    DxvkExt extMutableDescriptorType          = { VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME,            DxvkExtMode::Optional };
+    DxvkExt khrShaderIntegerDotProduct        = { VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME,         DxvkExtMode::Optional };
+
     // NV-DXVK start: Integrate Reflex
     DxvkExt nvLowLatency                      = { "VK_NV_low_latency",                                      DxvkExtMode::Optional };
     // NV-DXVK end
@@ -364,6 +369,20 @@ namespace dxvk {
     // NV-DXVK start:
     DxvkExt extShaderAtomicFloat              = { VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,                DxvkExtMode::Optional };
     // NV-DXVK end
+
+    // rtx.present.presentWaitPacing. Enabled only as a pair, and only when
+    // the driver reports both the presentId and presentWait features.
+    DxvkExt khrPresentId                      = { VK_KHR_PRESENT_ID_EXTENSION_NAME,                         DxvkExtMode::Optional };
+    DxvkExt khrPresentWait                    = { VK_KHR_PRESENT_WAIT_EXTENSION_NAME,                       DxvkExtMode::Optional };
+
+    // rtx.debug.logPipelineStats. Disabled unless the option is on at device
+    // creation and the driver reports the pipelineExecutableInfo feature; DxvkAdapter then makes it Optional.
+    DxvkExt khrPipelineExecutableProperties   = { VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME,     DxvkExtMode::Disabled };
+
+    // Device-loss diagnostics (GpuBreadcrumbs). Disabled unless DxvkAdapter makes them Optional,
+    // which it does on GPUs other than NVIDIA.
+    DxvkExt amdBufferMarker                   = { VK_AMD_BUFFER_MARKER_EXTENSION_NAME,                      DxvkExtMode::Disabled };
+    DxvkExt extDeviceFault                    = { VK_EXT_DEVICE_FAULT_EXTENSION_NAME,                       DxvkExtMode::Disabled };
   };
   
   /**
@@ -378,6 +397,8 @@ namespace dxvk {
     DxvkExt khrSurface                      = { VK_KHR_SURFACE_EXTENSION_NAME,                          DxvkExtMode::Required };
     DxvkExt khrDeviceProperties2            = { VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, DxvkExtMode::Required };
     DxvkExt khrDebugReport                  = { VK_EXT_DEBUG_REPORT_EXTENSION_NAME,                     DxvkExtMode::Required };
+    // HDR10 output (rtx.tonemap.hdr.enable): the ST.2084 swapchain color space.
+    DxvkExt extSwapchainColorSpace          = { VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME,            DxvkExtMode::Optional };
     // NV-DXVK start: DLFG integration
     DxvkExt khrExternalMemoryCapabilities   = { VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,     DxvkExtMode::Optional };
     DxvkExt khrExternalSemaphoreCapabilities = { VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME, DxvkExtMode::Optional };

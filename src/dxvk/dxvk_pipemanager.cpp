@@ -20,6 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "dxvk_device.h"
+#include "dxvk_objects.h"
 #include "dxvk_pipemanager.h"
 #include "dxvk_state_cache.h"
 
@@ -29,7 +30,7 @@ namespace dxvk {
           DxvkDevice*         device,
           DxvkRenderPassPool* passManager)
   : m_device    (device),
-    m_cache     (new DxvkPipelineCache(device->vkd())) {
+    m_cache     (new DxvkPipelineCache(device)) {
     std::string useStateCache = env::getEnvVar("DXVK_STATE_CACHE");
     
     if (useStateCache != "0" && device->config().enableStateCache)
@@ -53,10 +54,16 @@ namespace dxvk {
     if (pair != m_computePipelines.end())
       return &pair->second;
     
+    // Remix shaders use no specialization constants. Whichever path creates the pipeline object first (the
+    // prewarm worker or the context), it keeps one instance, so a later binding state never compiles another.
+    DxvkComputePipelineShaders key = shaders;
+    if (key.cs->isRemixShader())
+      key.forceNoSpecConstants = true;
+
     auto iter = m_computePipelines.emplace(
       std::piecewise_construct,
-      std::tuple(shaders),
-      std::tuple(this, shaders));
+      std::tuple(key),
+      std::tuple(this, key));
     return &iter.first->second;
   }
   
@@ -104,6 +111,9 @@ namespace dxvk {
 // NV-DXVK start
     bool                          isRemixShader) {
 // NV-DXVK end
+    if (isRemixShader)
+      shader->markRemixShader();
+
     if (m_stateCache != nullptr)
 // NV-DXVK start
       m_stateCache->registerShader(shader, isRemixShader);
@@ -116,6 +126,13 @@ namespace dxvk {
   }
   void DxvkPipelineManager::registerRaytracingShaders(
     const DxvkRaytracingPipelineShaders& shaders) {
+    // A pipeline that is compiled already needs no worker item (the prewarm registers its set again after an option change).
+    { std::lock_guard<dxvk::mutex> lock(m_mutex);
+      auto pair = m_raytracingPipelines.find(shaders);
+      if (pair != m_raytracingPipelines.end() && pair->second.isCompiled())
+        return;
+    }
+
     if (m_stateCache != nullptr)
       m_stateCache->registerRaytracingShaders(shaders);
     else {
@@ -143,6 +160,14 @@ namespace dxvk {
   }
 
 // NV-DXVK start
+  uint32_t DxvkPipelineManager::remixShaderSlowCompileCount() const {
+    return m_stateCache != nullptr ? m_stateCache->remixShaderSlowCompileCount() : 0;
+  }
+
+  uint32_t DxvkPipelineManager::remixShaderQueuedCount() const {
+    return m_stateCache != nullptr ? m_stateCache->remixShaderQueuedCount() : 0;
+  }
+
   uint32_t DxvkPipelineManager::remixShaderCompilationCount() const {
     return m_stateCache != nullptr ? m_stateCache->remixShaderCompilationCount() : 0;
   }
@@ -153,5 +178,16 @@ namespace dxvk {
     if (m_stateCache != nullptr)
       m_stateCache->stopWorkerThreads();
   }
-  
+
 }
+
+// NV-DXVK start
+// See declaration in dxvk_pipemanager.h.
+uint32_t remixinternal_GetShaderCompilationCount() {
+  dxvk::DxvkDevice* pDevice = dxvk::g_dxvkDeviceNative;
+  if (pDevice == nullptr) {
+    return UINT32_MAX;
+  }
+  return pDevice->getCommon()->pipelineManager().remixShaderCompilationCount();
+}
+// NV-DXVK end

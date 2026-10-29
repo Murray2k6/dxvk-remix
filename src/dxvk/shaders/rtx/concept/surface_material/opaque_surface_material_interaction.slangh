@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -39,6 +39,20 @@ static const float roughnessThreshold = float(0.001f);
 #define OPAQUE_MATERIAL_USE_BOUNDED_VNDF_SAMPLING 1
 
 // Opaque Surface Material Interaction Helper Functions
+
+// NV-DXVK start: Replaced materials retain the standard Fresnel response on every shading path.
+float opaqueSurfaceMaterialInteractionGetSpecularLevel(OpaqueSurfaceMaterialInteraction material)
+{
+  return (material.flags & OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_USE_LEGACY_DEFAULTS) != 0 ?
+    cb.opaqueMaterialArgs.legacySpecularLevel : 1.0f;
+}
+
+float opaqueSurfaceMaterialInteractionGetFresnelGrazing(OpaqueSurfaceMaterialInteraction material)
+{
+  return (material.flags & OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_USE_LEGACY_DEFAULTS) != 0 ?
+    cb.opaqueMaterialArgs.legacyFresnelGrazing : 1.0f;
+}
+// NV-DXVK end
 
 #ifdef OPAQUE_MATERIAL_USE_POM
 // Parallax Occlusion Mapping Helper Functions
@@ -255,14 +269,20 @@ float pomGetNumSamples(float3 direction)
   return lerp(maxSamples, minSamples, abs(direction.z));
 }
 
+#include "rtx/concept/surface_material/pom_sccr.slangh"
+
 float3 pomCalculateTexcoord(
   OpaqueSurfaceMaterial opaqueSurfaceMaterial,
   SurfaceInteraction surfaceInteraction,
   float3 viewDir,
   inout uint iterations)
 {
-  float totalHeight = opaqueSurfaceMaterial.displaceIn + opaqueSurfaceMaterial.displaceOut;
-  float neutralHeight = opaqueSurfaceMaterial.displaceIn / totalHeight;
+  if (cb.pomMode == DisplacementMode::SCCR) {
+    return sccrCalculateTexcoord(opaqueSurfaceMaterial, surfaceInteraction, viewDir, iterations);
+  }
+  // The sign bit of displaceIn marks a height texture with a cone channel (SCCR), so its magnitude is the depth.
+  float totalHeight = abs(opaqueSurfaceMaterial.displaceIn) + opaqueSurfaceMaterial.displaceOut;
+  float neutralHeight = abs(opaqueSurfaceMaterial.displaceIn) / totalHeight;
   // TODO if the ray origin is below the displaceOut height, bad results happen.
   // need to account for that case.
   float3 direction = -float3(viewDir.xy, viewDir.z / totalHeight);
@@ -307,14 +327,22 @@ float3 pomCalculateTexcoord(
   return float3(surfaceInteraction.textureCoordinates, 1.f);
 }
 
+// depthScale (the world-unit depth scale of the primary march, sccrDepthScale) and shadowFootprintUv (the footprint of a
+// coarse indirect-light query, sccrIndirectShadowFootprint, or kSccrFullShadow for full detail) are read in SCCR mode
+// only.
 float pomSampleVisibility(
   OpaqueSurfaceMaterial opaqueSurfaceMaterial,
   float2 texcoord,
-  float3 rayDirection)
+  float3 rayDirection,
+  float depthScale = 1.0f,
+  float shadowFootprintUv = kSccrFullShadow)
 {
+  if (cb.pomMode == DisplacementMode::SCCR) {
+    return sccrSampleVisibility(opaqueSurfaceMaterial, texcoord, rayDirection, depthScale, shadowFootprintUv);
+  }
   // Don't actually care about neutral height here - this function just checks if a ray from a texcoord successfully exits
   // the geometry described by the heightmap.  Doesn't (currently) matter how high that geometry is relative to the original surface.
-  float totalHeight = opaqueSurfaceMaterial.displaceIn + opaqueSurfaceMaterial.displaceOut;
+  float totalHeight = abs(opaqueSurfaceMaterial.displaceIn) + opaqueSurfaceMaterial.displaceOut;
   // NOTE: pomTraceRay could be used here, but testing found it was more expensive and had worse artifacts when
   // doing visibility testing.
   float2 currTexcoord = texcoord;
@@ -340,21 +368,69 @@ float pomSampleVisibility(
   return saturate(visibility);
 }
 
-float opaqueSurfaceMaterialInteractionCalcHeightThroughput(
+// pomCoords is SharedTextureCoord (sccrSharedTextureCoord): the texture coordinates in xy, and in SCCR mode the primary
+// hit's UV-to-world scale and triangle normal (or a shell marker) in zw, so the self-shadow march uses the primary
+// march's depth and frame. The other modes read xy only.
+// shadowFootprintUv is read in SCCR mode only: sccrIndirectShadowFootprint for indirect-light queries, kSccrFullShadow
+// (full detail) otherwise.
+// surfaceIndex is the G-buffer surface pomCoords belongs to (SharedSurfaceIndex), or SURFACE_INDEX_INVALID when it is
+// unknown. A shell pixel's self-shadow marches through the shell's prisms (sccrShellShadowVisibility).
+// hasShellExit, shellExitPosition and shellExitNormal (world space) say where the light ray of a shell pixel's
+// full-detail march left the shell through the mesh surface, so the caller may start its scene shadow ray there.
+// hasShellExit is false otherwise.
+float opaqueSurfaceMaterialInteractionCalcHeightThroughputShell(
   MinimalSurfaceInteraction minimalSurfaceInteraction,
   vec3 rayDirection,
   OpaqueSurfaceMaterial opaqueSurfaceMaterial,
-  float2 texcoord)
+  float4 pomCoords,
+  float shadowFootprintUv,
+  uint surfaceIndex,
+  out bool hasShellExit,
+  out vec3 shellExitPosition,
+  out vec3 shellExitNormal)
 {
+  hasShellExit = false;
+  shellExitPosition = vec3(0.0f);
+  shellExitNormal = vec3(0.0f);
   // rebuild tangent space
   const f16mat3 worldToTangent = f16mat3(
     minimalSurfaceInteraction.geometryTangent,
     minimalSurfaceInteraction.geometryBitangent,
     minimalSurfaceInteraction.geometryNormal);
   const vec3 lightDirTangentSpace = normalize(mul(worldToTangent, rayDirection));
-  return pomSampleVisibility(opaqueSurfaceMaterial, texcoord, lightDirTangentSpace);
+  if (cb.pomMode == DisplacementMode::SCCR) {
+    // Shell pixels march from the relief point (direct light) or take the carved triangle's frame and shell depth
+    // (indirect light).
+    float shellVisibility;
+    if (sccrShellShadowVisibility(minimalSurfaceInteraction, rayDirection, opaqueSurfaceMaterial, pomCoords,
+                                  shadowFootprintUv, surfaceIndex, lightDirTangentSpace, shellVisibility,
+                                  hasShellExit, shellExitPosition, shellExitNormal)) {
+      return shellVisibility;
+    }
+    return pomSampleVisibility(
+      opaqueSurfaceMaterial, pomCoords.xy,
+      sccrShadowLightDir(minimalSurfaceInteraction, rayDirection, pomCoords, lightDirTangentSpace),
+      sccrDepthScale(pomCoords.z), shadowFootprintUv);
+  }
+  return pomSampleVisibility(opaqueSurfaceMaterial, pomCoords.xy, lightDirTangentSpace);
 }
-#endif
+
+float opaqueSurfaceMaterialInteractionCalcHeightThroughput(
+  MinimalSurfaceInteraction minimalSurfaceInteraction,
+  vec3 rayDirection,
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  float4 pomCoords,
+  float shadowFootprintUv = kSccrFullShadow,
+  uint surfaceIndex = SURFACE_INDEX_INVALID)
+{
+  bool hasShellExit;
+  vec3 shellExitPosition;
+  vec3 shellExitNormal;
+  return opaqueSurfaceMaterialInteractionCalcHeightThroughputShell(
+    minimalSurfaceInteraction, rayDirection, opaqueSurfaceMaterial, pomCoords, shadowFootprintUv, surfaceIndex,
+    hasShellExit, shellExitPosition, shellExitNormal);
+}
+#endif // OPAQUE_MATERIAL_USE_POM
 
 SubsurfaceMaterialInteraction subsurfaceMaterialInteractionCreate(
   SubsurfaceMaterial subsurfaceMaterial,
@@ -388,7 +464,17 @@ SubsurfaceMaterialInteraction subsurfaceMaterialInteractionCreate(
     // Note: It's common to use diffuse albedo color as SSS transmission color, Remix assumes all textures are not using sRGB formats, so we follow the assumption here.
     if (isDiffusionProfile)
     {
-      transmittanceColor = gammaToLinear(transmittanceColor);
+      // rtx.subsurface.transmittanceFollowsAlbedo. An sRGB view is already linear, and the albedo tint (skin tone)
+      // applies here too, because this texture carries the whole diffuse colour under SSS.
+      if ((subsurfaceMaterial.flags & SURFACE_MATERIAL_EXTENSION_FLAG_TRANSMITTANCE_SRGB) == 0)
+      {
+        transmittanceColor = gammaToLinear(transmittanceColor);
+      }
+      if ((subsurfaceMaterial.flags & SURFACE_MATERIAL_EXTENSION_FLAG_TRANSMITTANCE_TINT) != 0 &&
+          (subsurfaceMaterial.flags & SURFACE_MATERIAL_EXTENSION_FLAG_ALBEDO_TINT) != 0)
+      {
+        transmittanceColor.rgb *= gammaToLinear(vec3(subsurfaceMaterial.albedoTint));
+      }
     }
   }
   else
@@ -533,12 +619,180 @@ void overrideMaterialInteractionForEye(
     opaqueSurfaceMaterialInteraction.anisotropicRoughness
   );
   opaqueSurfaceMaterialInteraction.albedo           = albedoToAdjustedAlbedo(eyeAlbedo, eyeMetallic, eyeOpacity);
-  opaqueSurfaceMaterialInteraction.baseReflectivity = calcBaseReflectivity(eyeAlbedo, eyeMetallic, eyeOpacity);
+  // NV-DXVK start: Material-scoped Fresnel controls.
+  opaqueSurfaceMaterialInteraction.baseReflectivity = calcBaseReflectivity(eyeAlbedo, eyeMetallic, eyeOpacity,
+    opaqueSurfaceMaterialInteractionGetSpecularLevel(opaqueSurfaceMaterialInteraction));
+  // NV-DXVK end
   opaqueSurfaceMaterialInteraction.opacity          = eyeOpacity;
 
+  // Pre-exposure (rtx_pre_exposure.h): every radiance source is stored x cb.preExposure.
   opaqueSurfaceMaterialInteraction.emissiveRadiance =
     irisSample.rgb * irisSample.a *
-    opaqueSurfaceMaterial.emissiveIntensity;
+    opaqueSurfaceMaterial.emissiveIntensity * cb.preExposure;
+}
+
+// The albedo/opacity load and the texture operations of opaqueSurfaceMaterialInteractionCreate, shared with
+// opaqueSurfaceMaterialInteractionCalcOpacity so both run the same code.
+
+void opaqueSurfaceMaterialLoadAlbedoOpacity(
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  bool thinFilmEnabled,
+  bool albedoOpacityLoaded,
+  vec4 albedoOpacitySample,
+  out vec3 albedo,
+  out float opacity,
+  out float thinFilmThickness)
+{
+  albedo = opaqueSurfaceMaterial.albedoOpacityConstant.rgb;
+  opacity = opaqueSurfaceMaterial.albedoOpacityConstant.a;
+  thinFilmThickness = float(0.0f);
+
+  // Note: Set thin film thickness constant fallback only if the thin film is enabled as a non-zero value here is responsible for indicating
+  // if the thin film is in use by later code.
+  if (thinFilmEnabled)
+  {
+    thinFilmThickness = opaqueSurfaceMaterial.thinFilmThicknessConstant;
+  }
+
+  if (albedoOpacityLoaded)
+  {
+    albedo = albedoOpacitySample.rgb;
+
+    // The per-material albedo tint from the surface material extension entry (remixapi_MaterialInfoOpaqueAlbedoTintEXT).
+    // It multiplies the texture's encoded values in gamma space, before gammaToLinear below, which gives the same result
+    // as a host multiplying 8-bit texels. An sRGB texture is already linear here, so the tint is linearized to match.
+    // Alpha is untouched.
+    if (opaqueSurfaceMaterial.subsurfaceMaterialIndex != SURFACE_INDEX_INVALID)
+    {
+      const SubsurfaceMaterial extensionMaterial =
+        subsurfaceMaterialCreate(surfaceMaterialExtensions[opaqueSurfaceMaterial.subsurfaceMaterialIndex]);
+      if (extensionMaterial.flags & SURFACE_MATERIAL_EXTENSION_FLAG_ALBEDO_TINT)
+      {
+        vec3 albedoTint = vec3(extensionMaterial.albedoTint);
+        if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_TEXTURE_IS_SRGB)
+        {
+          albedoTint = gammaToLinear(albedoTint);
+        }
+        albedo *= albedoTint;
+      }
+    }
+
+    // Note: Thin film thickness and opacity deriving their values from the alpha channel are mutually exclusive, set the appropriate
+    // one based on the specified flags, and set the opposing variable to a default value (the "default" value must match how the material is decoded from the
+    // GBuffer as well). Ideally we'd want to simply fall back on the existing opacity/thin film thickness constants instead, but we currently do not have a
+    // way of encoding these values in the GBuffer, so a code constant must be used instead. Finally, thinFilmEnabled does not need to be checked here as the
+    // alpha as thin film thickness flag is only set on the CPU if the use thin film flag is true.
+    // Also, the alpha channel of the texture should always be linear even if it is using a sRGB encoding (as the alpha channel in such encodings remains linear),
+    // so no special compensation has to be done here (unlike the albedo which may need to have software gamma correction skipped when reading from sRGB textures).
+    if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALPHA_IS_THIN_FILM_THICKNESS)
+    {
+      thinFilmThickness = albedoOpacitySample.a;
+      opacity = float(1.0f);
+    }
+    else
+    {
+      opacity = albedoOpacitySample.a;
+      thinFilmThickness = float(0.0f);
+    }
+  }
+}
+
+void opaqueSurfaceMaterialApplyTextureOperations(
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  Surface surface,
+  inout SurfaceInteraction surfaceInteraction,
+  inout vec3 albedo,
+  inout vec3 emissiveColor,
+  inout float opacity,
+  inout float emissiveBlendOverrideInfluence)
+{
+  vec4 tFactor = unorm4x8ToFloat4x32(surface.tFactor).bgra;
+
+  // WAR for REMIX-1573: texture ops for opacity should happen during baking and be skipped here for baked terrain,
+  // but right now the opacity is not 1 in the baked texture where it is expected to be and thus texture ops
+  // are required to blend the layer contributions properly
+#if 0
+  if (applyTextureOperations)
+#endif
+  {
+    if (surface.isVertexColorBakedLighting) {
+      // "Normalize" vertex color to remove lighting contribution in different vertices.
+      // We assume the diffuse term contributes most lighting. Therefore, vertex color = diffuseColor * (N*L).
+      // By dividing the vertex color by its largest component, the result is irrelavant to N*L, but proportional to the
+      // original diffuse color, which is more desired.
+      // In practice, we add an adjustable blending factor to avoid extreme cases.
+      surfaceInteraction.vertexColor.rgb = max(surfaceInteraction.vertexColor.rgb, vec3(1.0 / 255.0));
+      float maxColor = max(surfaceInteraction.vertexColor.r, max(surfaceInteraction.vertexColor.g, surfaceInteraction.vertexColor.b));
+      surfaceInteraction.vertexColor.rgb /= maxColor;
+      surfaceInteraction.vertexColor.rgb = mix(vec3(1), surfaceInteraction.vertexColor.rgb, float(cb.vertexColorStrength));
+    }
+
+    // Fixed function texture stage setting
+    vec3 textureArg1 = vec3(1.0), textureArg2 = vec3(1.0);
+    chooseTextureArgument(textureArg1, surface.textureColorArg1Source, albedo, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
+    chooseTextureArgument(textureArg2, surface.textureColorArg2Source, albedo, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
+    chooseTextureOperationColor(albedo, surface.textureColorOperation, textureArg1, textureArg2);
+    if (surface.isTextureFactorBlend) {
+      albedo *= tFactor.rgb;
+    }
+
+    // Fixed function texture stage setting (emissive)
+    chooseTextureArgument(textureArg1, surface.textureColorArg1Source, emissiveColor, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
+    chooseTextureArgument(textureArg2, surface.textureColorArg2Source, emissiveColor, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
+    chooseTextureOperationColor(emissiveColor, surface.textureColorOperation, textureArg1, textureArg2);
+    if (surface.isTextureFactorBlend) {
+      emissiveColor *= tFactor.rgb;
+    }
+
+    // Adjust opacity via texture operations.
+    // Fixed function texture stage state for alpha channel
+
+    float textureAlphaArg1, textureAlphaArg2;
+    chooseTextureArgument(textureAlphaArg1, surface.textureAlphaArg1Source, opacity, surfaceInteraction.vertexColor.a, tFactor.a, opacity);
+    chooseTextureArgument(textureAlphaArg2, surface.textureAlphaArg2Source, opacity, surfaceInteraction.vertexColor.a, tFactor.a, float(1.0f));
+    chooseTextureOperationAlpha(opacity, surface.textureAlphaOperation, textureAlphaArg1, textureAlphaArg2);
+
+    // Ensure we perform these opacity calculations after the texture operations have been applied to abledo and alpha.
+    calcOpaqueSurfaceMaterialOpacity(
+      albedo, opacity, surface, opacity, emissiveBlendOverrideInfluence, cb.wboitEnabled);
+  }
+
+  if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IGNORE_ALPHA_CHANNEL)
+  {
+    opacity = 1.f;
+  }
+}
+
+// Returns the opacity opaqueSurfaceMaterialInteractionCreate would return, from the albedo/opacity texture alone,
+// with the same read (texture coordinates, gradients, hair-card LOD bias), albedo tint, texture operations, alpha
+// test and blend emulation, and ignore-alpha flag. It is not valid for parallax (POM moves the texture coordinates)
+// or eyes (which override the opacity), and the caller excludes those. The surface interaction is taken by value,
+// because the texture operations normalize its vertex colour in place and the caller's copy must stay untouched for
+// a later full evaluation. It has no side effects, and sampler feedback is the caller's to write.
+float opaqueSurfaceMaterialInteractionCalcOpacity(
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  Surface surface,
+  SurfaceInteraction surfaceInteraction)
+{
+  const bool thinFilmEnabled = opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_USE_THIN_FILM_LAYER;
+  const bool isHairCardMaterial = opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IS_HAIR_CARD;
+  const float materialLodBias = isHairCardMaterial ? cb.hairCardMipBias : 0.0f;
+
+  vec4 albedoOpacitySample;
+  const bool albedoOpacityLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.albedoOpacityTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, albedoOpacitySample, materialLodBias);
+
+  vec3 albedo;
+  float opacity;
+  float thinFilmThickness;
+  opaqueSurfaceMaterialLoadAlbedoOpacity(opaqueSurfaceMaterial, thinFilmEnabled, albedoOpacityLoaded, albedoOpacitySample,
+    albedo, opacity, thinFilmThickness);
+
+  vec3 emissiveColor = vec3(0.0f);
+  float emissiveBlendOverrideInfluence = float(1.0f);
+  opaqueSurfaceMaterialApplyTextureOperations(opaqueSurfaceMaterial, surface, surfaceInteraction,
+    albedo, emissiveColor, opacity, emissiveBlendOverrideInfluence);
+
+  return opacity;
 }
 
 // Opaque Surface Material Interaction Functions
@@ -551,7 +805,10 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 {
   OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction;
   // Note: need initialize the flags explicitely to get rid of garbage data.
-  opaqueSurfaceMaterialInteraction.flags = 0;
+  // NV-DXVK start: The existing interaction flag mask preserves this bit through G-buffer serialization.
+  opaqueSurfaceMaterialInteraction.flags = (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_USE_LEGACY_DEFAULTS) != 0 ?
+    OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_USE_LEGACY_DEFAULTS : 0;
+  // NV-DXVK end
 
   // Create a tangent to world space matrix for future calculations
 
@@ -561,26 +818,47 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // it has been directly enabled by the material itself.
   const bool thinFilmEnabled = opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_USE_THIN_FILM_LAYER;
   const bool isHairCardMaterial = opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IS_HAIR_CARD;
+  const bool normalIsTangentXY = opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NORMAL_TANGENT_XY;
   const float materialLodBias = isHairCardMaterial ? cb.hairCardMipBias : 0.0f;
 
   opaqueSurfaceMaterialInteraction.flags |= thinFilmEnabled ? OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_USE_THIN_FILM_LAYER : 0;
 
 #ifdef OPAQUE_MATERIAL_USE_POM
-  if (cb.pomMode != DisplacementMode::Off && opaqueSurfaceMaterial.hasValidDisplacement())
+  // The SCCR shell march already placed the texture coordinates, re-framed the interaction and set the depth offset
+  // (sccrShellResolve, called by resolveVertex in the G-buffer passes).
+  if (surfaceInteraction.pomShellDone)
   {
-    const mat3 worldToTexture = inverse(transpose(mat3(surfaceInteraction.rawTangent, surfaceInteraction.rawBitangent, surfaceInteraction.geometryNormal)));
+    opaqueSurfaceMaterialInteraction.flags |= OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE;
+  }
+  else if (cb.pomMode != DisplacementMode::Off && opaqueSurfaceMaterial.hasValidDisplacement())
+  {
+    // pomParallaxFrameNormal is the geometry normal, except with SCCR's stable frame (the triangle normal).
+    const mat3 worldToTexture = inverse(transpose(mat3(surfaceInteraction.rawTangent, surfaceInteraction.rawBitangent, pomParallaxFrameNormal(surfaceInteraction))));
     // TextureGradient x might be along the same direction as the view ray?  make a debug view that shows the dot product between textureGradient.x and viewDirTangentSpace?
 
-    vec3 viewDirTextureSpace = normalize(mul(worldToTexture, minimalRayInteraction.viewDirection));
+    // The unnormalised direction's length converts march depth to distance along the ray (SCCR depth offset).
+    const vec3 viewDirFrame = mul(worldToTexture, minimalRayInteraction.viewDirection);
+    vec3 viewDirTextureSpace = normalize(viewDirFrame);
     // Note: -1.f * TextureGradientX has the same x,y direction as viewDirTextureSpace, but calculating the correct z value is non-obvious.
     // Could potentially remove the need for the worldToTexture transform if a faster way to calculate that z value is found.
     
     uint iterations = 0; // unused
-    const vec2 pomTextureCoordinates = pomCalculateTexcoord(
+    const float3 pomHit = pomCalculateTexcoord(
         opaqueSurfaceMaterial,
         surfaceInteraction,
         viewDirTextureSpace,
-        iterations).xy;
+        iterations);
+    const vec2 pomTextureCoordinates = pomHit.xy;
+
+#if defined(RAY_TRACING_PRIMARY_RAY)
+    // Depth and motion vectors at the SCCR relief point (geometry_resolver.slangh). Computed before the texture
+    // coordinates move, since the march's start depends on the mesh's own.
+    if (cb.pomMode == DisplacementMode::SCCR && cb.pomSccrDepthOffset)
+    {
+      surfaceInteraction.pomDepthOffset = sccrDepthOffset(
+        opaqueSurfaceMaterial, surfaceInteraction, viewDirTextureSpace, length(viewDirFrame), pomHit.z);
+    }
+#endif
 
     // WAR for REMIX-3709 - POM sometimes produces NaNs.
     surfaceInteraction.textureCoordinates = sanitize(pomTextureCoordinates, surfaceInteraction.textureCoordinates);
@@ -635,10 +913,10 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   
   // Load Albedo/Opacity
 
-  vec3 albedo = opaqueSurfaceMaterial.albedoOpacityConstant.rgb;
-  float opacity = opaqueSurfaceMaterial.albedoOpacityConstant.a;
+  vec3 albedo;
+  float opacity;
   float emissiveBlendOverrideInfluence = float(1.0f);
-  float thinFilmThickness = float(0.0f);
+  float thinFilmThickness;
 
   // Baked terrain is the only surface using cascaded view positions, so key off of that
   const bool isBakedTerrain = surface.texcoordGenerationMode == uint(TexGenMode::CascadedViewPositions);
@@ -646,35 +924,8 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // Texture operations have already been applied during terrain baking, so skip them for baked terrain surfaces
   const bool applyTextureOperations = !isBakedTerrain;
 
-  // Note: Set thin film thickness constant fallback only if the thin film is enabled as a non-zero value here is responsible for indicating
-  // if the thin film is in use by later code.
-  if (thinFilmEnabled)
-  {
-    thinFilmThickness = opaqueSurfaceMaterial.thinFilmThicknessConstant;
-  }
-
-  if (albedoOpacityLoaded)
-  {
-    albedo = albedoOpacitySample.rgb;
-
-    // Note: Thin film thickness and opacity deriving their values from the alpha channel are mutually exclusive, set the appropriate
-    // one based on the specified flags, and set the opposing variable to a default value (the "default" value must match how the material is decoded from the
-    // GBuffer as well). Ideally we'd want to simply fall back on the existing opacity/thin film thickness constants instead, but we currently do not have a
-    // way of encoding these values in the GBuffer, so a code constant must be used instead. Finally, thinFilmEnabled does not need to be checked here as the
-    // alpha as thin film thickness flag is only set on the CPU if the use thin film flag is true.
-    // Also, the alpha channel of the texture should always be linear even if it is using a sRGB encoding (as the alpha channel in such encodings remains linear),
-    // so no special compensation has to be done here (unlike the albedo which may need to have software gamma correction skipped when reading from sRGB textures).
-    if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALPHA_IS_THIN_FILM_THICKNESS)
-    {
-      thinFilmThickness = albedoOpacitySample.a;
-      opacity = float(1.0f);
-    }
-    else
-    {
-      opacity = albedoOpacitySample.a;
-      thinFilmThickness = float(0.0f);
-    }
-  }
+  opaqueSurfaceMaterialLoadAlbedoOpacity(opaqueSurfaceMaterial, thinFilmEnabled, albedoOpacityLoaded, albedoOpacitySample,
+    albedo, opacity, thinFilmThickness);
 
 #if defined(RAY_TRACING_PRIMARY_RAY)
   if (cb.debugView == DEBUG_VIEW_RAW_ALBEDO) 
@@ -691,66 +942,13 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
 #endif
 
-  vec4 tFactor = unorm4x8ToFloat4x32(surface.tFactor).bgra;
-
-  // WAR for REMIX-1573: texture ops for opacity should happen during baking and be skipped here for baked terrain,
-  // but right now the opacity is not 1 in the baked texture where it is expected to be and thus texture ops
-  // are required to blend the layer contributions properly 
-#if 0
-  if (applyTextureOperations) 
-#endif
-  {
-    if (surface.isVertexColorBakedLighting) {
-      // "Normalize" vertex color to remove lighting contribution in different vertices.
-      // We assume the diffuse term contributes most lighting. Therefore, vertex color = diffuseColor * (N*L).
-      // By dividing the vertex color by its largest component, the result is irrelavant to N*L, but proportional to the 
-      // original diffuse color, which is more desired.
-      // In practice, we add an adjustable blending factor to avoid extreme cases.
-      surfaceInteraction.vertexColor.rgb = max(surfaceInteraction.vertexColor.rgb, vec3(1.0 / 255.0));
-      float maxColor = max(surfaceInteraction.vertexColor.r, max(surfaceInteraction.vertexColor.g, surfaceInteraction.vertexColor.b));
-      surfaceInteraction.vertexColor.rgb /= maxColor;
-      surfaceInteraction.vertexColor.rgb = mix(vec3(1), surfaceInteraction.vertexColor.rgb, float(cb.vertexColorStrength));
-    }
-
-    // Fixed function texture stage setting
-    vec3 textureArg1 = vec3(1.0), textureArg2 = vec3(1.0);
-    chooseTextureArgument(textureArg1, surface.textureColorArg1Source, albedo, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureArgument(textureArg2, surface.textureColorArg2Source, albedo, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureOperationColor(albedo, surface.textureColorOperation, textureArg1, textureArg2);
-    if (surface.isTextureFactorBlend) {
-      albedo *= tFactor.rgb;
-    }
-
-    // Fixed function texture stage setting (emissive)
-    chooseTextureArgument(textureArg1, surface.textureColorArg1Source, emissiveColor, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureArgument(textureArg2, surface.textureColorArg2Source, emissiveColor, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureOperationColor(emissiveColor, surface.textureColorOperation, textureArg1, textureArg2);
-    if (surface.isTextureFactorBlend) {
-      emissiveColor *= tFactor.rgb;
-    }
-    
-    // Adjust opacity via texture operations.
-    // Fixed function texture stage state for alpha channel
-
-    float textureAlphaArg1, textureAlphaArg2;
-    chooseTextureArgument(textureAlphaArg1, surface.textureAlphaArg1Source, opacity, surfaceInteraction.vertexColor.a, tFactor.a, opacity);
-    chooseTextureArgument(textureAlphaArg2, surface.textureAlphaArg2Source, opacity, surfaceInteraction.vertexColor.a, tFactor.a, float(1.0f));
-    chooseTextureOperationAlpha(opacity, surface.textureAlphaOperation, textureAlphaArg1, textureAlphaArg2);
-    
-    // Ensure we perform these opacity calculations after the texture operations have been applied to abledo and alpha.
-    calcOpaqueSurfaceMaterialOpacity(
-      albedo, opacity, surface, opacity, emissiveBlendOverrideInfluence, cb.wboitEnabled);
-  }
-
-  if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IGNORE_ALPHA_CHANNEL)
-  {
-    opacity = 1.f;
-  }
+  opaqueSurfaceMaterialApplyTextureOperations(opaqueSurfaceMaterial, surface, surfaceInteraction,
+    albedo, emissiveColor, opacity, emissiveBlendOverrideInfluence);
   
   // Note: Gamma correct albedo input (be it from a constant or a texture). Textures using a UNORM format do not have their
   // sRGB->linear conversion done by the sampler, so we do it here in software. When the albedo comes from a texture that uses
   // an sRGB VkFormat however, the sampler hardware already linearized it on read, so applying gammaToLinear again would double
-  // linearize it (darkening the result); OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_TEXTURE_IS_SRGB (set on the CPU) marks that case.
+  // linearize it and darken the result. OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_TEXTURE_IS_SRGB (set on the CPU) marks that case.
   // The albedo constant is always gamma-encoded, so this only skips when the texture was actually the source.
   const bool albedoAlreadyLinear = albedoOpacityLoaded && (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_TEXTURE_IS_SRGB);
   if (!albedoAlreadyLinear)
@@ -794,7 +992,9 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     else // Decode encoded normal sample
     {
       // Note: Using f16 from texture to decode from is fine as the original texture is only 8 bits of precision.
-      tangentNormal = unsignedOctahedralToHemisphereDirection(vec2(normalSample.xy), cb.opaqueMaterialArgs.normalIntensity);
+      tangentNormal = normalIsTangentXY
+        ? unsignedTangentXYToHemisphereDirection(vec2(normalSample.xy), cb.opaqueMaterialArgs.normalIntensity)
+        : unsignedOctahedralToHemisphereDirection(vec2(normalSample.xy), cb.opaqueMaterialArgs.normalIntensity);
     }
     
     const f16mat3 tangentToWorld = transpose(worldToTangent);
@@ -815,7 +1015,9 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
     if (secondNormalLoaded)
     {
-      vec3 tangentNormal2 = unsignedOctahedralToHemisphereDirection(vec2(secondNormalSample.xy), cb.opaqueMaterialArgs.normalIntensity);
+      vec3 tangentNormal2 = normalIsTangentXY
+        ? unsignedTangentXYToHemisphereDirection(vec2(secondNormalSample.xy), cb.opaqueMaterialArgs.normalIntensity)
+        : unsignedOctahedralToHemisphereDirection(vec2(secondNormalSample.xy), cb.opaqueMaterialArgs.normalIntensity);
       
       tangentNormal2 = normalBlendRNM(tangentNormal2, tangentNormal);
       normal = normalize(mul(tangentToWorld, tangentNormal2));
@@ -840,6 +1042,13 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   if (roughnessLoaded)
   {
     roughness = roughnessSample.x;
+
+    if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_SMOOTHNESS)
+    {
+      const float smoothness = (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_SMOOTHNESS_IN_GREEN)
+        ? roughnessSample.y : roughnessSample.x;
+      roughness = max(1.0f - smoothness, float(opaqueSurfaceMaterial.roughnessFloor));
+    }
   }
 
 #if defined(RAY_TRACING_PRIMARY_RAY)
@@ -860,7 +1069,48 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   {
     metallic = metallicSample.x;
   }
-    
+
+  // NV-DXVK start: metalness from a spec/gloss map (red = gamma-encoded
+  // specular level). In spec/gloss content a metal is a high specular level
+  // over a dark diffuse; a dielectric sits near 0.22 (F0 0.04). The ramp maps
+  // the specular level (scaled by the material's specular colour) to metalness,
+  // an albedo gate keeps bright painted texels dielectric, and metal texels
+  // take their F0 (spec * tint) as albedo since that is where the colour of a
+  // spec/gloss metal lives.
+  if (roughnessLoaded && (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_METALLIC_FROM_SPECULAR))
+  {
+    const uint params = uint(opaqueSurfaceMaterial.specularMetalParams);
+    const float specLow = float(params & 0xFu) / 15.0f;
+    const float specHigh = float((params >> 4) & 0xFu) / 15.0f;
+    const uint albedoLumMaxCode = (params >> 8) & 0xFu;
+    const float strength = float((params >> 12) & 0xFu) / 15.0f;
+
+    const uint tintBits = uint(opaqueSurfaceMaterial.specularMetalTint);
+    const vec3 tint = vec3(
+      float(tintBits & 0x1Fu) / 31.0f,
+      float((tintBits >> 5) & 0x3Fu) / 63.0f,
+      float((tintBits >> 11) & 0x1Fu) / 31.0f);
+    const bool hasTint = tintBits != 0u;
+
+    const float spec = roughnessSample.x;
+    const float specLevel = hasTint ? spec * max(tint.r, max(tint.g, tint.b)) : spec;
+    float metalMask = saturate((specLevel - specLow) / max(specHigh - specLow, 1.0f / 255.0f));
+
+    if (albedoLumMaxCode < 15u)
+    {
+      const float albedoLumMax = gammaToLinear(vec3(float(albedoLumMaxCode) / 15.0f)).x;
+      metalMask *= 1.0f - smoothstep(0.25f * albedoLumMax, albedoLumMax, calcBt709Luminance(albedo));
+    }
+
+    const float specMetallic = strength * metalMask;
+    if (hasTint)
+    {
+      albedo = lerp(albedo, gammaToLinear(saturate(spec * tint)), specMetallic);
+    }
+    metallic = max(metallic, specMetallic);
+  }
+  // NV-DXVK end
+
   metallic = saturate(metallic * cb.opaqueMaterialArgs.metallicScale + cb.opaqueMaterialArgs.metallicBias);
 
   // Transform to desired Opaque Material Interaction values
@@ -874,17 +1124,25 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // Note: Opacity factored into albedo and base reflectivity to ensure NEE and indirect lighting off of objects with opacity properly
   // account for how much light is being transmitted due to the opacity (similar to how Fresnel on glass works).
   opaqueSurfaceMaterialInteraction.albedo = surface.isMatte ? vec3(0) : albedoToAdjustedAlbedo(albedo, metallic, opacity);
-  opaqueSurfaceMaterialInteraction.baseReflectivity = surface.isMatte ? vec3(0) : calcBaseReflectivity(albedo, metallic, opacity);
+  // NV-DXVK start: Material-scoped Fresnel controls.
+  opaqueSurfaceMaterialInteraction.baseReflectivity = surface.isMatte ? vec3(0) :
+    calcBaseReflectivity(albedo, metallic, opacity, opaqueSurfaceMaterialInteractionGetSpecularLevel(opaqueSurfaceMaterialInteraction));
+  // NV-DXVK end
    
   // Note: Roughness loaded from texture is a perceptual roughness value (for optimal encoding), so this works as intended.
   calcRoughness(roughness, opaqueSurfaceMaterial.anisotropy,
     opaqueSurfaceMaterialInteraction.isotropicRoughness,
     opaqueSurfaceMaterialInteraction.anisotropicRoughness);
 
-  opaqueSurfaceMaterialInteraction.emissiveRadiance = emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity;
+  // Pre-exposure (rtx_pre_exposure.h): every radiance source is stored x cb.preExposure. The G-buffer copy
+  // (gbuffer_memory_polymorphic_surface_material_interaction.slangh) stores the result, so its decode does not
+  // multiply again.
+  opaqueSurfaceMaterialInteraction.emissiveRadiance =
+    emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity * cb.preExposure;
 
   opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction =
     subSurfaceMaterialReadHelper(opaqueSurfaceMaterial.subsurfaceMaterialIndex, surfaceInteraction, opaqueSurfaceMaterial.samplerIndex);
+  opaqueSurfaceMaterialInteraction.dlssControlMask = opaqueSurfaceMaterial.dlssControlMask;
 
   // For an eye, load a secondary texture (iris) and blend on top of primary texture (whites)
   if (cb.eyeArgs.enableEyes && surface.isEye)
@@ -936,6 +1194,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(Polymorp
   opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction.packedTransmittanceColor = polymorphicSurfaceMaterialInteraction.i32data0;
   opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction.packedSingleScatteringAlbedo = polymorphicSurfaceMaterialInteraction.i32data1;
 
+  opaqueSurfaceMaterialInteraction.dlssControlMask = polymorphicSurfaceMaterialInteraction.dlssControlMask;
   opaqueSurfaceMaterialInteraction.flags = polymorphicSurfaceMaterialInteraction.bdata0;
 
   return opaqueSurfaceMaterialInteraction;
@@ -986,6 +1245,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   // We don't store this in the G-buffer
   opaqueSurfaceMaterialInteraction.normalDetail = float(0.0f);
+  opaqueSurfaceMaterialInteraction.dlssControlMask = float4x32ToUnorm4x8(1.0f.rrrr);
 
   // Note thin opaque properties are stored later into PolymorphicSurfaceMaterialInteraction
 
@@ -1034,8 +1294,11 @@ bool opaqueSurfaceMaterialInteractionCalcLobeProbability(
   // Note: Albedo and Base Reflectivity already have opacity baked into them which is why opacity does not need to be specified
   // in the albedo approximations below.
   const vec3 albedo = opaqueSurfaceMaterialInteraction.albedo;
+  // NV-DXVK start: Material-scoped Fresnel controls.
   const vec3 fresnel =
-    evalOpaqueSchlickFresnel(opaqueSurfaceMaterialInteraction.baseReflectivity, normalDotOutputDirection);
+    evalOpaqueSchlickFresnel(opaqueSurfaceMaterialInteraction.baseReflectivity, normalDotOutputDirection,
+    opaqueSurfaceMaterialInteractionGetFresnelGrazing(opaqueSurfaceMaterialInteraction));
+  // NV-DXVK end
 
   // Note: I think these should be using a preintegrated albedo calculation (e.g. the EnvBRDF approximation for specular
   // albedo), but I am not 100% sure if that is the intended "ideal" quantity to be using for a lobe's weight (when only the outgoing
@@ -1056,22 +1319,30 @@ bool opaqueSurfaceMaterialInteractionCalcLobeProbability(
   opacityTransmissionProbability = opacityTransmissionAlbedoApprox;
   diffuseTransmissionProbability = isThinOpaqueSubsurface ? diffuseTransmissionAlbedoApprox : 0.0f;
 
+  // The zero thresholds apply to each lobe's share of the summed lobe weights, so the dominant lobe
+  // of a dark surface is still sampled.
+  const float lobeWeightSum =
+    opacityTransmissionProbability +
+    diffuseTransmissionProbability +
+    specularReflectionProbability +
+    diffuseReflectionProbability;
+
   // Todo: Pass raytraceArgs in in the future if accessing these constants poses a problem later.
   adjustProbabilityValue(
     diffuseReflectionProbability,
-    uint16BitsToF32(cb.opaqueDiffuseLobeSamplingProbabilityZeroThreshold),
+    uint16BitsToF32(cb.opaqueDiffuseLobeSamplingProbabilityZeroThreshold) * lobeWeightSum,
     uint16BitsToF32(cb.minOpaqueDiffuseLobeSamplingProbability));
   adjustProbabilityValue(
     specularReflectionProbability,
-    uint16BitsToF32(cb.opaqueSpecularLobeSamplingProbabilityZeroThreshold),
+    uint16BitsToF32(cb.opaqueSpecularLobeSamplingProbabilityZeroThreshold) * lobeWeightSum,
     uint16BitsToF32(cb.minOpaqueSpecularLobeSamplingProbability));
   adjustProbabilityValue(
     opacityTransmissionProbability,
-    uint16BitsToF32(cb.opaqueOpacityTransmissionLobeSamplingProbabilityZeroThreshold),
+    uint16BitsToF32(cb.opaqueOpacityTransmissionLobeSamplingProbabilityZeroThreshold) * lobeWeightSum,
     uint16BitsToF32(cb.minOpaqueOpacityTransmissionLobeSamplingProbability));
   adjustProbabilityValue(
     diffuseTransmissionProbability,
-    uint16BitsToF32(cb.opaqueDiffuseTransmissionLobeSamplingProbabilityZeroThreshold),
+    uint16BitsToF32(cb.opaqueDiffuseTransmissionLobeSamplingProbabilityZeroThreshold) * lobeWeightSum,
     uint16BitsToF32(cb.minOpaqueDiffuseTransmissionLobeSamplingProbability));
 
   const float lobeProbabilitySum =
@@ -1314,8 +1585,11 @@ SurfaceMaterialInteractionSample opaqueSurfaceMaterialInteractionCalcSpecularRef
 
   // Calculate the throughput of the sample
 
+  // NV-DXVK start: Material-scoped Fresnel controls.
   const vec3 fresnel = evalOpaqueSchlickFresnel(
-    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal);
+    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal,
+    opaqueSurfaceMaterialInteractionGetFresnelGrazing(opaqueSurfaceMaterialInteraction));
+  // NV-DXVK end
 
   // Todo: Pass in a material mode similar to the resolve mode to control this sort of material simplification option.
 #ifdef OPAQUE_MATERIAL_USE_THIN_FILM
@@ -1429,8 +1703,11 @@ SurfaceMaterialInteractionSample opaqueSurfaceMaterialInteractionCalcDiffuseTran
   const float /* l.h */ inputDirectionDotMicrofacetNormal = -inputDirection.z;
   const float /* o.h */ outputDirectionDotMicrofacetNormal = outputDirection.z;
 
+  // NV-DXVK start: Material-scoped Fresnel controls.
   const vec3 fresnel = evalOpaqueSchlickFresnel(
-    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal);
+    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal,
+    opaqueSurfaceMaterialInteractionGetFresnelGrazing(opaqueSurfaceMaterialInteraction));
+  // NV-DXVK end
   const vec3 transmissionFresnel = vec3(1.0f, 1.0f, 1.0f) - fresnel;
 
   SurfaceMaterialInteractionSample materialSample;
@@ -1632,8 +1909,11 @@ SurfaceMaterialInteractionPSRSample opaqueSurfaceMaterialInteractionCalcPSRRefle
 
   // Calculate the attenuation of the sample
 
+  // NV-DXVK start: Material-scoped Fresnel controls.
   const vec3 fresnel = evalOpaqueSchlickFresnel(
-    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal);
+    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal,
+    opaqueSurfaceMaterialInteractionGetFresnelGrazing(opaqueSurfaceMaterialInteraction));
+  // NV-DXVK end
 
   // Todo: Pass in a material mode similar to the resolve mode to control this sort of material simplification option.
 #ifdef OPAQUE_MATERIAL_USE_THIN_FILM
@@ -1879,7 +2159,11 @@ SurfaceMaterialInteractionSplitWeight opaqueSurfaceMaterialInteractionCalcApprox
   }
 
   // Calculate the weight
-  const vec3 fresnel = evalOpaqueSchlickFresnel(opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal);
+  // NV-DXVK start: Material-scoped Fresnel controls.
+  const vec3 fresnel = evalOpaqueSchlickFresnel(
+    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal,
+    opaqueSurfaceMaterialInteractionGetFresnelGrazing(opaqueSurfaceMaterialInteraction));
+  // NV-DXVK end
   const float normalDistributionFunction = evalGGXNormalDistributionIsotropic(opaqueSurfaceMaterialInteraction.isotropicRoughness, normalDotMicrofacetNormal);
   // Note: Actual shadowing/masking (G) function omitted from visibility calculation for a cheaper approximation.
   const float visibility = safePositiveDivide(float(1), float(4) * normalDotInputDirection * normalDotOutputDirection, materialEpsilon);
@@ -1957,8 +2241,11 @@ SurfaceMaterialInteractionSplitWeight opaqueSurfaceMaterialInteractionCalcProjec
 
   // Calculate the weight
 
+  // NV-DXVK start: Material-scoped Fresnel controls.
   const vec3 fresnel = evalOpaqueSchlickFresnel(
-    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal);
+    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal,
+    opaqueSurfaceMaterialInteractionGetFresnelGrazing(opaqueSurfaceMaterialInteraction));
+  // NV-DXVK end
 
   // Todo: Pass in a material mode similar to the resolve mode to control this sort of material simplification option.
 #ifdef OPAQUE_MATERIAL_USE_THIN_FILM

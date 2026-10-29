@@ -19,6 +19,7 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <chrono>
 #include <cstring>
 
 #include "../util/util_time.h"
@@ -28,6 +29,7 @@
 #include "dxvk_pipemanager.h"
 #include "dxvk_spec_const.h"
 #include "dxvk_state_cache.h"
+#include "rtx_render/rtx_pipeline_stats.h"
 
 namespace dxvk {
   
@@ -98,7 +100,18 @@ namespace dxvk {
     if (!this->findInstance(state))
       this->createInstance(state);
   }
-  
+
+
+  bool DxvkComputePipeline::hasInstance(
+    const DxvkComputePipelineStateInfo& state) {
+    if (!m_mutex.try_lock())
+      return false;
+
+    const bool found = this->findInstance(state) != nullptr;
+    m_mutex.unlock();
+    return found;
+  }
+
   
   DxvkComputePipelineInstance* DxvkComputePipeline::createInstance(
     const DxvkComputePipelineStateInfo& state) {
@@ -167,7 +180,7 @@ namespace dxvk {
     VkComputePipelineCreateInfo info;
     info.sType                = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     info.pNext                = nullptr;
-    info.flags                = 0;
+    info.flags                = RtxPipelineStats::captureFlags(); // 0 unless rtx.debug.logPipelineStats
     info.stage                = csm.stageInfo(&specInfo);
     info.layout               = m_layout->pipelineLayout();
     info.basePipelineHandle   = VK_NULL_HANDLE;
@@ -179,14 +192,35 @@ namespace dxvk {
     if (Logger::logLevel() <= LogLevel::Debug)
       t0 = dxvk::high_resolution_clock::now();
     
+    // Creation feedback (core in Vulkan 1.3): whether the pipeline cache served it.
+    VkPipelineCreationFeedback feedback = {};
+    VkPipelineCreationFeedbackCreateInfo feedbackInfo = { VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO };
+    feedbackInfo.pPipelineCreationFeedback = &feedback;
+    if (m_pipeMgr->m_cache->feedbackSupported()) {
+      feedbackInfo.pNext = info.pNext;
+      info.pNext = &feedbackInfo;
+    }
+
     VkPipeline pipeline = VK_NULL_HANDLE;
+    const auto createStart = std::chrono::steady_clock::now();  // RtxPipelineStats::logCreation
+    const auto cacheLock = m_pipeMgr->m_cache->lockForCreate();
     if (m_vkd->vkCreateComputePipelines(m_vkd->device(),
           m_pipeMgr->m_cache->handle(), 1, &info, nullptr, &pipeline) != VK_SUCCESS) {
       Logger::err("DxvkComputePipeline: Failed to compile pipeline");
       Logger::err(str::format("  cs  : ", m_shaders.cs->debugName()));
       return VK_NULL_HANDLE;
     }
-    
+
+    RtxPipelineStats::logCreation(m_pipeMgr->m_cache.ptr(), "compute", m_shaders.cs->debugName(),
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStart).count(),
+      (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) == 0 ? -1
+        : (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0 ? 1 : 0,
+      m_shaders.cs->isRemixShader());
+
+    // Creation has completed on this thread; query the captured statistics.
+    if (unlikely(info.flags & VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR))
+      RtxPipelineStats::logPipeline(*m_vkd, pipeline, RtxPipelineStats::shaderName(m_shaders.cs.ptr()));
+
     if (Logger::logLevel() <= LogLevel::Debug) {
       t1 = dxvk::high_resolution_clock::now();
       auto td = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0);

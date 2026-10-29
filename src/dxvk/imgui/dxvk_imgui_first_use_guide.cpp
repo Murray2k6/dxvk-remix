@@ -22,68 +22,21 @@
 #include "dxvk_imgui_first_use_guide.h"
 
 #include "imgui.h"
+#include "dxvk_imgui.h"
 #include "../rtx_render/rtx_options.h"
 #include "../rtx_render/rtx_utils.h"
 #include "../../util/util_env.h"
-#include "../../util/util_sentry.h"
 #include "../../util/util_local_data.h"
 
 namespace dxvk {
 
   static constexpr const char* kLicenseUrl = "https://github.com/NVIDIAGameWorks/dxvk-remix/blob/main/LICENSE-MIT";
-  static constexpr const char* kPrivacyPolicyUrl = "https://www.nvidia.com/en-us/about-nvidia/privacy-policy/";
   static constexpr const char* kNeverShowFirstUseGuideKey = "neverShowFirstUseGuide";
-  static constexpr const char* kallowUsageReportingKey = "allowUsageReporting";
-
-  namespace {
-
-    void showPrivacyPolicyLink() {
-      if (ImGui::SmallButton("NVIDIA Privacy Policy")) {
-        env::openUrlInBrowser(kPrivacyPolicyUrl);
-      }
-      if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("%s", kPrivacyPolicyUrl);
-      }
-    }
-
-    bool showPermissionsCheckboxes(bool& allowCrash, bool& allowUsage) {
-      ImGui::TextWrapped("Help improve RTX Remix by allowing NVIDIA to collect diagnostic data:");
-      ImGui::Spacing();
-
-      bool changed = false;
-      changed |= ImGui::Checkbox("Basic session and system information collected each time RTX Remix is launched", &allowUsage);
-      if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Includes game name, Remix version, GPU model and driver, OS version,\nRAM, and session configuration flags. Does not include user files, game\ncontent, or broad system state. NVIDIA will use this data to prioritize\ndevelopment work.");
-      }
-      changed |= ImGui::Checkbox("Technical crash information automatically submitted when RTX Remix crashes", &allowCrash);
-      if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Includes the same basic system information above plus crash type, error\nseverity, and GPU diagnostic state at the time of the crash, without identifying\nyou. NVIDIA will use this data to prioritize, investigate, and fix issues.");
-      }
-
-      ImGui::Spacing();
-      ImGui::TextWrapped("Data collected will be used to improve RTX Remix, and is kept in compliance with NVIDIA's Privacy Policy:");
-
-      showPrivacyPolicyLink();
-      return changed;
-    }
-  }
 
   bool ImGuiFirstUseGuide::shouldShow() {
     LocalData::app().load();
     return !LocalData::app().get<bool>(kNeverShowFirstUseGuideKey, false)
            && !RtxOptions::Automation::disableBlockingDialogBoxes();
-  }
-
-  void ImGuiFirstUseGuide::showPermissionsUI() {
-    bool allowCrash = LocalData::app().get<bool>(sentry::kAllowCrashReportingKey, true);
-    bool allowUsage = LocalData::app().get<bool>(sentry::kAllowUsageReportingKey, true);
-
-    if (showPermissionsCheckboxes(allowCrash, allowUsage)) {
-      LocalData::app().set(sentry::kAllowCrashReportingKey, allowCrash);
-      LocalData::app().set(sentry::kAllowUsageReportingKey, allowUsage);
-      LocalData::app().save();
-      sentry::syncConsentFromUserSettings();
-    }
   }
 
   bool ImGuiFirstUseGuide::show(ImFont* boldFont) {
@@ -104,7 +57,11 @@ namespace dxvk {
       ImGuiWindowFlags_NoSavedSettings |
       ImGuiWindowFlags_AlwaysAutoResize;
 
-    if (!ImGui::Begin("Welcome to RTX Remix", nullptr, kWindowFlags)) {
+    const std::string& productName = ImGUI::productName();
+
+    // The window ID after "###" stays fixed, so the title can follow the product name.
+    const std::string windowTitle = str::format("Welcome to ", ImGUI::productNameWithVersion(), "###Welcome to RTX Remix");
+    if (!ImGui::Begin(windowTitle.c_str(), nullptr, kWindowFlags)) {
       ImGui::End();
       return false;
     }
@@ -113,8 +70,7 @@ namespace dxvk {
 
     {
       const auto keyBindDescriptor = buildKeyBindDescriptorStringForDisplay(RtxOptions::remixMenuKeyBinds());
-      ImGui::TextWrapped(
-        "RTX Remix is now active. To open or close the Remix menus press:");
+      ImGui::TextWrapped("%s is now active. To open or close the Remix menus press:", productName.c_str());
       ImGui::Spacing();
 
       if (boldFont) {
@@ -127,30 +83,28 @@ namespace dxvk {
         ImGui::PopFont();
       }
       ImGui::TextWrapped(
-        "RTX Remix Menus can be navigated using mouse, keyboard, or gamepad. On keyboard, use the arrow keys to navigate and the spacebar to select.");
+        "%s Menus can be navigated using mouse, keyboard, or gamepad. On keyboard, use the arrow keys to navigate and the spacebar to select.",
+        productName.c_str());
     }
 
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
-    ImGui::TextWrapped("By using this software, you agree to RTX Remix's License:");
+    ImGui::TextWrapped("By using this software, you agree to its license:");
     ImGui::Spacing();
 
-    if (ImGui::SmallButton("RTX Remix License")) {
+    if (ImGui::SmallButton("License")) {
       env::openUrlInBrowser(kLicenseUrl);
     }
     if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip("%s", kLicenseUrl);
     }
 
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    showPermissionsUI();
-    ImGui::Spacing();
-    ImGui::TextWrapped("These settings can also be changed at any time in the permissions tab of Remix's User Graphics Settings Menu.");
+    if (!ImGUI::donateUrl().empty()) {
+      ImGui::Spacing();
+      ImGUI::showDonateButton();
+    }
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -171,21 +125,9 @@ namespace dxvk {
 
       if (ImGui::Button("Never Show This Again", ImVec2(buttonWidth, 0))) {
         LocalData::app().set(kNeverShowFirstUseGuideKey, true);
+        LocalData::app().save();
         wantClose = true;
       }
-    }
-
-    if (wantClose) {
-      // Persist whatever consent state is currently shown (including defaults if the user
-      // did not interact with the checkboxes), so closing the dialog always leaves a
-      // stored preference. showPermissionsUI already saves+syncs when checkboxes change,
-      // so this is a no-op for values the user explicitly set this frame.
-      bool allowCrash = LocalData::app().get<bool>(sentry::kAllowCrashReportingKey, true);
-      bool allowUsage = LocalData::app().get<bool>(sentry::kAllowUsageReportingKey, true);
-      LocalData::app().set(sentry::kAllowCrashReportingKey, allowCrash);
-      LocalData::app().set(sentry::kAllowUsageReportingKey, allowUsage);
-      LocalData::app().save();
-      sentry::syncConsentFromUserSettings();
     }
 
     ImGui::Spacing();

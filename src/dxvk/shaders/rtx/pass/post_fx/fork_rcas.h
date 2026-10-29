@@ -23,7 +23,6 @@
 
 #define RCAS_INPUT          0
 #define RCAS_OUTPUT         1
-#define RCAS_LINEAR_SAMPLER 2
 
 #define RCAS_TILE_SIZE      8
 

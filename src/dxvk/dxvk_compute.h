@@ -136,7 +136,12 @@ namespace dxvk {
      */
     void compilePipeline(
       const DxvkComputePipelineStateInfo& state);
-    
+
+    // Whether a pipeline instance for the given state exists, so that getPipelineHandle would not
+    // compile. Does not wait: while another thread holds the lock (e.g. a worker compiling an instance) it returns false.
+    bool hasInstance(
+      const DxvkComputePipelineStateInfo& state);
+
   private:
     
     Rc<vk::DeviceFn>            m_vkd;

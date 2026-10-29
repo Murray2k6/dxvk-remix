@@ -1,77 +1,39 @@
 # Contributing to Remix Plus
 
-Thanks for being here! Remix Plus is a small, focused fork — every
-contribution that lands moves it forward in a real way. This guide
-walks you through setting up, working on something, and sending it
-back as a pull request. It's meant to be readable end-to-end in a
-few minutes.
+Remix Plus is a hard fork of NVIDIA [`dxvk-remix`](https://github.com/NVIDIAGameWorks/dxvk-remix). The runtime has an API-neutral scene interface fed by the D3D9 frontend and by Remix API hosts.
 
-If you get stuck, open an issue or ask on the
-[RTX Remix Discord](https://discord.gg/c7J6gUhXMk). Friendly
-questions are welcome.
+**The rules are in [`AGENTS.md`](../AGENTS.md).** Read it before changing anything: working rules, upstream policy, git rules, the changelog rule, code style, RTX options, graphics presets, and documentation. This page covers setup and building only.
 
-## Why this fork exists
+## Getting the code
 
-NVIDIA's stock `dxvk-remix` was tuned around a small set of
-demonstration mods. The community **gmod-rtx** fork extended the
-Remix SDK API for real game integrations — batched mesh and light
-creation, plugin-injected game state, UI state plumbing, VRAM
-control, and so on — but it lives in a Garry's Mod-flavored tree
-that's hard to use as a base for other engines.
+Clone with submodules:
 
-**Remix Plus** brings those SDK extensions back into a clean,
-NVIDIA-rebase-friendly fork. The goal is a maintained codebase that
-plugin developers and game integrations can build on without
-inheriting gmod-specific assumptions, and that can absorb upstream
-NVIDIA improvements without two days of merge pain every time.
+```
+git clone --recursive <repo-url>
+```
 
-If you write Remix plugins, integrate Remix into a game, or just
-want to make this fork better — you're in the right place.
-
-## Setting up your fork
-
-1. **Fork** [`RemixProjGroup/dxvk-remix`](https://github.com/RemixProjGroup/dxvk-remix)
-   on GitHub.
-2. **Clone** your fork locally with submodules:
-   ```
-   git clone --recursive https://github.com/<your-username>/dxvk-remix.git
-   ```
-   If you forgot `--recursive`, run `git submodule update --init --recursive`
-   inside the clone.
-3. *(Optional)* Add the canonical repo as an extra remote so you can
-   pull updates from it:
-   ```
-   git remote add canonical https://github.com/RemixProjGroup/dxvk-remix.git
-   ```
-
-The canonical repo's default branch is `main`. Your
-fork has a tracking copy of that branch — it's where shipped work
-lives, and it's the target of every PR.
+If you forgot `--recursive`, or you made a new `git worktree`, run `git submodule update --init --recursive` inside it. Worktrees do not get submodules on their own, and meson then fails on missing files under `submodules/`.
 
 ## Building
 
-Remix Plus builds on Windows with MSVC and ninja. The full build
-takes 10–15 minutes cold; incremental builds are 1–3 minutes.
+Remix Plus builds on Windows with MSVC, Meson and Ninja. A cold build takes 10-15 minutes; incremental builds take 1-3 minutes.
 
 ### Requirements
 
 - Windows 10 or 11
-- [Visual Studio 2019](https://visualstudio.microsoft.com/vs/older-downloads/)
-  (2022 may work but isn't actively tested)
+- Visual Studio 2026 (VS 18) or its Build Tools, with the "Desktop development with C++" workload (x64 C++ tools). `scripts/build.ps1` prefers VS 18 and falls back to VS 2022 or 2019. A build dir keeps the toolchain it was configured with; after switching toolchains, build with `-Clean`.
+- For the bridge: Visual Studio 2019 or 2022 with the C++ tools. `bridge/scripts/build.ps1` does not use VS 18 yet.
 - [Windows SDK 10.0.19041.0](https://developer.microsoft.com/en-us/windows/downloads/sdk-archive/)
-- [Meson 1.8.2+](https://mesonbuild.com/)
+- [Meson 1.8.2+](https://mesonbuild.com/) and Ninja, for example `pip install --user meson ninja`. `scripts/build.ps1` finds a user-site install that is not on `PATH`.
 - [Vulkan SDK 1.4.313.2+](https://vulkan.lunarg.com/sdk/home#windows)
-- [Python 3.9+](https://www.python.org/downloads/) (not the Microsoft
-  Store version)
+- [Python 3.9+](https://www.python.org/downloads/) (not the Microsoft Store version)
 - [DirectX Runtime](https://www.microsoft.com/en-us/download/details.aspx?id=35)
-  (you may already have it from any D3D9 game)
 
-Only x64 is supported.
+Only x64 is supported. The first configure downloads the prebuilt dependencies in `packman-external.xml` into `external/`, so it needs internet access.
 
 ### First-time setup
 
-PowerShell needs to allow local scripts. Run once in an elevated
-PowerShell:
+PowerShell needs to allow local scripts. Run once in an elevated PowerShell:
 
 ```powershell
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned
@@ -85,177 +47,52 @@ From the project root, in PowerShell:
 .\scripts\build.ps1
 ```
 
-This builds the release flavor into `_Comp64Release/` and installs
-`d3d9.dll` to `_output/`. Use `-Flavor debug` or `-Flavor debugoptimized`
-for the instrumented flavors, `-Clean` to wipe the build dir first, and
-`-EnableTracy` to enable the Tracy profiler:
+This builds the release flavor into `_Comp64Release/` and installs the runtime and its support DLLs to `_output/`. Use `-Flavor debug` or `-Flavor debugoptimized` for the instrumented flavors, `-Clean` to wipe the build dir first, and `-EnableTracy` to enable the Tracy profiler.
 
-```powershell
-.\scripts\build.ps1 -Flavor debugoptimized
-.\scripts\build.ps1 -Clean -EnableTracy
-```
+Useful meson options, passed with `-MesonArgs` (for example `.\scripts\build.ps1 -MesonArgs '-Denable_d3d11=true','-Denable_dxgi=true'`):
 
-The build copies `d3d9.dll` to any game targets configured in
-`gametargets.conf` (copy `gametargets.example.conf` and edit paths
-the first time).
+| Option | Default | Effect |
+|---|---|---|
+| `enable_d3d11`, `enable_dxgi` | false | Build DXVK's D3D11 and DXGI modules. Remix API hosts that render with D3D11 (`RegisterD3D11Device`, `RenderD3D11`) need both. |
+| `enable_d3d9_frontend` | true | False builds the API-only module: D3D9 draws are rasterized only and the Remix API is the only way into the path tracer. `-ApiOnly` builds this as a compile check. |
+| `release_build` | true | No local paths in the binary, no PDB, EXP or LIB installed, and an extra SPIR-V optimization pass. Set it false for a development build with symbols. |
+| `build_tag` | `dev` | A build name printed once at startup as `Build: <tag>` in `remix-dxvk.log`. Empty prints nothing. |
+| `enable_tracy` | false | Tracy profiler support (`-EnableTracy` sets it). |
+
+Changing an option on an existing build dir reconfigures it; `-Clean` starts over.
+
+The build has known traps: the toolchain is fixed per build dir, many-core machines need the job count capped at 4, and a shader change can need a second build before `d3d9.dll` relinks. The [`rtx-build` skill](../.claude/skills/rtx-build/SKILL.md) describes each one and its fix.
+
+The bridge builds separately with `.\bridge\scripts\build.ps1` (see the [`bridge-build` skill](../.claude/skills/bridge-build/SKILL.md)).
+
+### Deploying
+
+Copy the whole of `_output/`, not just `d3d9.dll`: into the game's `.trex` folder for a 32-bit game that runs through the bridge, or next to the game's executable for a 64-bit game. `d3d9.dll` imports dozens of DLLs that ship beside it, and their names and versions change between builds. A partial copy fails to load without a crash. The [`deploy-and-test-game` skill](../.agents/skills/deploy-and-test-game/SKILL.md) covers deploying through `gametargets.conf` (copy `gametargets.example.conf` and edit the paths).
 
 ### When dependencies change
 
-If a dependency path changes (new Vulkan SDK, etc.), run
-`meson --reconfigure` inside the build folder.
+If a dependency path changes (new Vulkan SDK, etc.), run `meson --reconfigure` inside the build folder. If meson itself was upgraded, rebuild with `-Clean`.
 
 ### Profiling
 
-Tracy profiling is supported. Enable with
-`meson --reconfigure -D enable_tracy=true`, rebuild, then connect
-[Tracy v0.8.7](https://github.com/wolfpld/tracy/releases/download/v0.8/Tracy-0.8.7z)
-to a running session.
+Tracy profiling is supported. Build with `-EnableTracy`, then connect [Tracy v0.8.7](https://github.com/wolfpld/tracy/releases/download/v0.8/Tracy-0.8.7z) to a running session.
 
-## Making changes — general guidance
+## Commits
 
-### Branch on your fork
-
-Use whatever branch name makes sense to you — `fix-tonemap-clamp`,
-`add-vram-stat`, `feature/lighting-tweak`, anything. The branch
-name on your fork doesn't affect review.
-
-### Keep PRs focused
-
-One thing per PR. A PR that fixes a tonemap bug should not also
-touch unrelated capture code. Reviewers can move quickly through
-small, focused PRs; mixed PRs stall.
-
-### Small commits with clear messages
-
-Each commit should be a self-contained step. The first line is a
-short summary in present tense ("add Lottes 2016 operator", not
-"added" or "this PR adds"). The body, when needed, explains the
-*why* — the *what* lives in the diff.
-
-We use conventional-commit prefixes (`fork(...)`, `feat(...)`,
-`fix(...)`, `docs(...)`, etc.) but they're a soft convention, not
-a check. Match the style of recent commits with `git log --oneline`.
-
-### No AI co-author trailers
-
-Don't add `Co-Authored-By: Claude ...` or similar trailers unless
-the maintainer explicitly asks for it. Authorship stays with the
-human contributor.
-
-### Credit yourself
-
-When your PR adds something visible, add your name to
-[`src/dxvk/imgui/dxvk_imgui_about.cpp`](../src/dxvk/imgui/dxvk_imgui_about.cpp)
-under "GitHub Contributors", organized A–Z by last name. This
-shows up in the in-game About panel.
-
-## Fork-touchpoint discipline (the one rigid rule)
-
-This is the rule that keeps Remix Plus rebaseable against NVIDIA's
-upstream `dxvk-remix`. Read it before touching any file that came
-from upstream.
-
-### The pattern
-
-When you need to add fork logic that lives inside an upstream-owned
-file, **don't write it inline**. Instead:
-
-1. Put the substantive code in a fork-owned file
-   (`src/dxvk/rtx_render/rtx_fork_<subsystem>.cpp/h`).
-2. Declare the entry point in the `fork_hooks::` namespace
-   (`src/dxvk/rtx_render/rtx_fork_hooks.h`).
-3. Leave a single one-line dispatch in the upstream file:
-
-```cpp
-// In an upstream file like rtx_scene_manager.cpp:
-void SceneManager::submitDraw(const DrawCmd& cmd) {
-  fork_hooks::onExternalDraw(*this, cmd);  // ← the touchpoint
-  // ... rest of NVIDIA's original function, untouched ...
-}
-```
-
-Why? Upstream files get touched on every NVIDIA release. Each line
-of fork logic inside an upstream file is a future merge conflict.
-A one-line hook becomes trivial to re-locate when upstream rewrites
-the function around it. Inline blocks, by contrast, drown in
-conflict markers.
-
-### When inline is okay
-
-If the change is genuinely tiny (under ~20 LOC) and structurally
-can't be lifted out — adding a struct field, flipping an enum bit,
-inserting a 2-line guard — inline is fine.
-
-### Always update the fridge list
-
-**Every commit that edits an upstream file must update
-[`docs/fork-touchpoints.md`](fork-touchpoints.md) in the same
-commit.** This is the authoritative inventory of every upstream
-file the fork touches, with Hook-vs-Inline classification. The PR
-template includes a checkbox reminder.
-
-Run the audit script before committing if you want to double-check:
-
-```
-FORK_POINT=<sha> ./scripts/audit-fork-touchpoints.sh
-```
-
-Replace `<sha>` with the upstream NVIDIA fork-point.
-
-## Code style
-
-Two style guides apply:
-
-- C++ — [`docs/CONTRIBUTING-style-guide.md`](CONTRIBUTING-style-guide.md)
-- Shaders — [`src/dxvk/shaders/rtx/README.md`](../src/dxvk/shaders/rtx/README.md)
-
-Headlines: 2-space indent, braces on the same line, `m_` for
-member variables, `p` for pointer variables, `camelCase` for
-functions and variables, `PascalCase` for types, `kConstant` for
-constants, `UPPER_CASE` for macros.
-
-When you change a non-RTX upstream file, wrap the diverging block
-with comment fences:
-
-```cpp
-// NV-DXVK start: Brief description of change
-// ... changed code ...
-// NV-DXVK end
-```
-
-## Submitting your PR
-
-1. **Build clean.** Compile-check release flavor; you should see
-   exit code 0 and zero compile errors. The `rtx-build` skill (or
-   the PowerShell command above) does this.
-2. **Fast-forward** your fork's `main` to your
-   feature-branch tip. Fast-forward only — never `--force` on
-   `main`.
-3. **Push** both your feature branch and your updated
-   `main` to your fork.
-4. **Open a PR** from your fork's `main` →
-   canonical's `main`.
-5. **Squash on merge.** Maintainers squash PRs at merge time, so
-   each merged PR shows up as a single commit on the canonical
-   branch. You don't need to squash locally.
+- Name branches as [`BRANCHING.md`](BRANCHING.md) says.
+- Each commit is a self-contained step. The first line is a short summary in present tense. The body explains why; the diff shows what.
+- Match the prefix style of recent commits (`git log --oneline`).
+- Add a [`CHANGELOG.md`](CHANGELOG.md) entry in the same commit for every major change (see `AGENTS.md`, Changelog).
+- Build clean before you merge: exit code 0 and zero compile errors.
 
 ## Bug reports
 
-Bugs in **Remix Plus specifically** go in this repo's issue tracker.
+Bugs in Remix Plus go in this repo's issue tracker. Bugs in the broader RTX Remix toolkit belong in [NVIDIAGameWorks/rtx-remix](https://github.com/NVIDIAGameWorks/rtx-remix/issues).
 
-Bugs in the broader RTX Remix runtime (not the dxvk-remix fork)
-belong in [NVIDIAGameWorks/rtx-remix](https://github.com/NVIDIAGameWorks/rtx-remix/issues).
-If you're not sure which one applies, file here and we'll redirect.
+## Credits
 
-## Credits and upstream attribution
+Remix Plus stands on:
 
-Remix Plus stands on the shoulders of:
-
-- [DXVK](https://github.com/doitsujin/dxvk) — the original D3D9 → Vulkan
-  translation layer this whole project descends from.
-- [NVIDIA `dxvk-remix`](https://github.com/NVIDIAGameWorks/dxvk-remix) —
-  the path-traced remastering fork of DXVK.
-- The **gmod-rtx community fork** — where most of the SDK extensions
-  carried by Remix Plus originated.
-
-Thanks to everyone whose work makes this possible.
+- [DXVK](https://github.com/doitsujin/dxvk), the D3D9 to Vulkan translation layer this project descends from.
+- [NVIDIA `dxvk-remix`](https://github.com/NVIDIAGameWorks/dxvk-remix), the path-traced remastering fork of DXVK (MIT, see `LICENSE-MIT`).
+- The gmod-rtx community fork, where many of the Remix SDK API extensions originated.

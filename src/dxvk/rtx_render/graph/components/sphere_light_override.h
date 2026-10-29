@@ -70,14 +70,14 @@ private:
       if (!m_enabled[i] || instances[i] == nullptr) {
         continue;
       }
-      const PrimInstance* primInstance = m_batch.resolvePrimTarget(context, i, m_target[i]);
+      const PrimInstance primInstance = m_batch.resolvePrimTarget(context, i, m_target[i]);
       
-      if (primInstance != nullptr && primInstance->getType() == PrimInstance::Type::Light) {
+      if (primInstance.getType() == PrimInstance::Type::Light) {
         // NOTE: light doesn't expose a non-const getter for sphere lights,
         // so we can't actually do this without a hack.
         // TODO: implement a better way for components to alter renderable objects.
         
-        // RtLight* light = primInstance->getLight();
+        // RtLight* light = primInstance.getLight();
   
         // if (light != nullptr && light->getType() == RtLightType::Sphere) {
         //   light->getSphereLight().setRadius(m_radius[i]);

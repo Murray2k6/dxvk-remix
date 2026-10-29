@@ -9,7 +9,8 @@
 #include "d3d11_interop.h"
 
 namespace dxvk {
-  Logger Logger::s_instance("d3d11.log");
+  // Logger::s_instance is defined once for the whole unified module, in
+  // d3d9_main.cpp. Shared instance startup enables remix-dxvk.log.
 }
   
 extern "C" {
@@ -38,7 +39,9 @@ extern "C" {
       DXGI_ADAPTER_DESC desc;
       pAdapter->GetDesc(&desc);
 
-      dxvkInstance = new DxvkInstance();
+      // NV-DXVK start: Share the instance across unified frontends
+      dxvkInstance = DxvkInstance::getSharedInstance();
+      // NV-DXVK end
       dxvkAdapter  = dxvkInstance->findAdapterByLuid(&desc.AdapterLuid);
 
       if (dxvkAdapter == nullptr)

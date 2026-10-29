@@ -24,10 +24,18 @@
 #include "rtx/utility/color.slangh"
 #include "rtx/utility/shader_types.slangh"
 
+#if defined(GBUFFER_COMPACT_PSR) && !defined(RAY_PIPELINE)
+// rtx.gbuffer.compactPsr. The compact PSR kernel takes its pixel from a list rather than its thread position,
+// and main() sets this before any code asks for the pixel (gbuffer_rayquery.comp.slang).
+static uvec2 g_compactPsrPixel;
+#endif
+
 uvec3 getDispatchRaysIndex()
 {
 #ifdef RAY_PIPELINE
   return DispatchRaysIndex();
+#elif defined(GBUFFER_COMPACT_PSR)
+  return uvec3(g_compactPsrPixel, 0);
 #else
   return gl_GlobalInvocationID;
 #endif

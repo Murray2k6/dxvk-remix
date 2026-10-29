@@ -23,6 +23,7 @@
 
 #include "rtx/utility/shader_types.h"
 #ifdef __cplusplus
+#include <cstddef>
 #include "rtx/concept/camera/camera.h"
 #include "rtx/concept/ray_portal/ray_portal.h"
 #else
@@ -32,10 +33,10 @@
 
 #include "rtx/pass/nrd_args.h"
 #include "rtx/pass/nrc_args.h"
+#include "rtx/pass/sharc/sharc_args.h"
 #include "rtx/pass/volume_args.h"
 #include "rtx/pass/material_args.h"
 #include "rtx/pass/view_distance_args.h"
-#include "rtx/pass/atmosphere/atmosphere_args.h"
 #include "rtx/concept/light/light_types.h"
 #include "rtx/concept/surface/surface_shared.h"
 #include "rtx/algorithm/nee_cache_data.h"
@@ -161,10 +162,10 @@ struct RaytraceArgs {
   NeeCacheArgs neeCacheArgs;
   DomeLightArgs domeLightArgs;
   NrcArgs nrcArgs;
+  SharcArgs sharcArgs;
   SssArgs sssArgs;
   EyeArgs eyeArgs;
   ShadowTerminatorArgs shadowTerminatorArgs;
-  AtmosphereArgs atmosphereArgs;
 
   Camera renderTargetCamera;
 
@@ -206,7 +207,7 @@ struct RaytraceArgs {
   // The number of active Ray Portals (Used for Ray Portal sampling). Always <= RAY_PORTAL_MAX_COUNT
   uint8_t numActiveRayPortals;
   float secondarySpecularFireflyFilteringThreshold;
-  uint  outputParticleLayer;
+  uint secondarySignalPadding;
 
   // Note: Packed as float16, uses uint16_t due to being shared on C++ side
   uint16_t emissiveBlendOverrideEmissiveIntensity;
@@ -243,6 +244,7 @@ struct RaytraceArgs {
 
   // NOTE: Variables need to be in groups of 4x32 bits above this comment.
 
+  uint invalidateHistoryForAnimatedWater;
   uint uniformRandomNumber;
   uint16_t opaqueDiffuseLobeSamplingProbabilityZeroThreshold;
   uint16_t minOpaqueDiffuseLobeSamplingProbability;
@@ -268,6 +270,7 @@ struct RaytraceArgs {
   uint enableSecondaryBounces;
   uint enableSeparateUnorderedApproximations;
   uint enableStochasticAlphaBlend;
+  uint forceStaticSceneMotionVectors;
   uint16_t enableDirectTranslucentShadows;
   uint16_t enableDirectAlphaBlendShadows;
   uint16_t enableIndirectTranslucentShadows;
@@ -300,6 +303,8 @@ struct RaytraceArgs {
   uint enableRtxdiDiscardEnlargedPixels;
   uint enableDirectLightBoilingFilter;
   uint enableRtxdiBestLightSampling;
+  uint rtxdiGradientResourcesAllocated;
+  uint rtxdiIlluminanceAllocated;
   float directLightBoilingThreshold;
   float rtxdiDisocclusionFrames;
 
@@ -377,7 +382,7 @@ struct RaytraceArgs {
   uint enableHeuristicSingleScatteringTransmission;
 
   float skyBrightness;
-  uint skyMode;  // 0 = skybox rasterization, 1 = physical atmosphere
+  uint skyMode;  // 0 = skybox rasterization, 1 = sky provider (sky_provider.slangh)
 
   uint isLastCompositeOutputValid;
   uint isZUp; // Note: Indicates if the Z axis is the "up" axis in world space if true, otherwise the Y axis if false.
@@ -394,16 +399,47 @@ struct RaytraceArgs {
   uint pomEnableReSTIRGI;
   uint pomEnablePSR;
   uint pomMaxIterations;
+  // SCCR march budgets (rtx.displacement.coneSteps, binarySteps, coneShadowSteps).
+  uint pomConeSteps;
+  uint pomBinarySteps;
+  uint pomConeShadowSteps;
+  // rtx.displacement.stepLodScale. 0 when rtx.displacement.enableStepLod is off.
+  float pomStepLodScale;
+  // SCCR stable frame, curvature correction and world-unit depth (rtx.displacement.enableStableFrame, curvatureScale,
+  // referenceWorldUnitsPerUv, maxWorldUnitDepthScale). The curvature scale is 0 unless curvature correction and the
+  // stable frame are on. The depth scale limit is 1 when world-unit depth is off.
+  uint pomSccrStableFrame;
+  float pomSccrCurvatureScale;
+  float pomSccrReferenceUvToWorld;
+  float pomSccrMaxDepthScale;
+  // rtx.displacement.zeroPlane, clamped to 1. Negative means as authored.
+  float pomSccrZeroPlane;
+  // SCCR coarse self-shadows for indirect light (rtx.displacement.indirectShadowSteps, 0 = off;
+  // indirectShadowFootprintScale, at least 0).
+  uint pomSccrIndirectShadowSteps;
+  float pomSccrIndirectShadowFootprintScale;
+  // rtx.displacement.enableDepthOffset: depth and motion at the relief point.
+  uint pomSccrDepthOffset;
+  // The SCCR shell march (rtx.displacement.shell.*, SccrShellManager): the hand-off distance in world units (0 turns
+  // the march off), the most prisms crossed and steps taken per march, and its switches (SCCR_SHELL_MARCH_FLAG_*,
+  // sccr_shell_args.h, with the shadow march's prism budget in bits 8-15).
+  float pomSccrShellMaxDistance;
+  uint pomSccrShellMaxPrisms;
+  uint pomSccrShellMaxSteps;
+  uint pomSccrShellFlags;
   uint enableSssTransmission;
   uint enableSssTransmissionSingleScattering;
   uint sssTransmissionBsdfSampleCount;
   uint sssTransmissionSingleScatteringSampleCount;
   uint enableTransmissionDiffusionProfileCorrection;
+  float metersToWorldUnitScale;
   float totalMipBias;
   float hairCardMipBias;
   float hairCardRoughnessScale;
 
   uint forceFirstHitInGBufferPass;
+  uint enableDlssNrControlMask;
+  uint enableDlssNrVolumetricControlMask;
 
   uint enableRaytracedRenderTarget;
   // NRC enablement is controlled by global macros being defined.
@@ -421,12 +457,116 @@ struct RaytraceArgs {
   float wboitDepthWeightTuning;
   uint wboitEnabled;
 
-  // Fork (2026-07-26): scale on the sky-ambient term that the resolver's
-  // opacity lighting approximation adds for sky-lit particle materials
-  // (weather precipitation). 0 disables the term entirely. Appended at the
-  // END of the struct so no existing field offsets move.
+  // True only when NRD will actually consume these this frame; the GBuffer skips the writes otherwise.
+  uint writePrimaryDenoisingNormal;
+  // Also gate secondary normal and virtual motion vector, which NRD is the only consumer of.
+  uint writeSecondaryDenoisingGuides;
+  uint writePrimaryVirtualMotionVector;
+
+  // Scale on the sky-ambient term that the opacity lighting approximation adds for sky-lit particle
+  // materials (OPAQUE_SURFACE_MATERIAL_FLAG_SKY_LIT_PARTICLE). 0 disables the term.
   float particleSkyAmbientScale;
+
+  // Light BVH sampling, see rtx_fork_light_bvh.h and rtx/algorithm/light_bvh.slangh.
+  // lightSamplingMode: 0 = RTXDI (default), 1 = LightBVH. The root box is the dequantization frame for node bounds.
+  uint lightSamplingMode;
+  uint lightBvhNodeCount;
+  uint lightBvhPrimaryCandidateCount;
+  uint lightBvhIndirectCandidateCount;
+  uint lightBvhOverrideNeeCacheAnalytic;
+  uint lightBvhUseSurfaceNormal;
+  float lightBvhInfiniteMinProbability;
+  float lightBvhInfiniteMaxProbability;
+  float lightBvhBoundsMinX;
+  float lightBvhBoundsMinY;
+  float lightBvhBoundsMinZ;
+  float lightBvhBoundsExtentX;
+  float lightBvhBoundsExtentY;
+  float lightBvhBoundsExtentZ;
+  // 1 when the light_bvh_select pass wrote this frame's primary reservoirs.
+  uint lightBvhSelectPassActive;
+  // 1 while rtx.lightSampling.logDirectStats collects [LightSamplingStats] counters.
+  uint lightSamplingStatsEnabled;
+  // rtx.lightSampling.bvhSunOcclusionHint.
+  uint lightBvhSunOcclusionHint;
+
+  // rtx.resolveFinalInteractionSkipsNonOpaque. The last interaction of a resolve loop traces with
+  // CULL_NON_OPAQUE instead of FORCE_OPAQUE (resolve_expanded.slangh).
+  uint resolveFinalInteractionSkipsNonOpaque;
+
+  // rtx.foliageRays.*, see secondaryRayCullsNonOpaque in integrator_indirect.slangh.
+  // foliageRaysCullNonOpaqueFromBounce: the first bounceIteration that culls non-opaque geometry, 0xFF = off.
+  uint foliageRaysCullNonOpaqueFromBounce;
+  uint foliageRaysCullNonOpaqueOnDiffuseRays;
+  // rtx.foliageRays.fastRayMode, 0 = CullNonOpaque, 1 = Omm2State (FOLIAGE_RAYS_MODE_*).
+  uint foliageRaysMode;
+  // rtx.serSurfaceCoherenceHintBits, see TraceRayCustom (resolve_expanded.slangh).
+  uint serSurfaceCoherenceHintBits;
+
+  // Cheaper visibility rays, see rtx_fork_shadow_rays.h and visibility.slangh.
+  // shadowRayFirstHitPrimaryNee: 1 = the primary NEE shadow ray ends at the first confirmed opaque hit.
+  // shadowRayAlphaGradient: 1 / rtx.shadowRays.alphaMipTargetResolution, 0 = ray-cone footprint.
+  uint shadowRayFirstHitPrimaryNee;
+  float shadowRayAlphaGradient;
+
+  // rtx.lightSampling.bvhDedicatedSunSample. 1 = the select pass samples local lights only, and
+  // integrate_direct_sun_rayquery adds a separate distant-light sample (LightBvh::dedicatedSunActive()).
+  uint lightBvhDedicatedSun;
+
+  // rtx.underwater.*, see integrator_direct.slangh. underwaterEnable gates the whole block before the medium read.
+  // underwaterMetersPerUnit converts world units to metres for the depth murk and the caustic frequency.
+  uint underwaterEnable;
+  float underwaterSurfaceHeight;
+  float underwaterMetersPerUnit;
+  float underwaterSunScale;
+  float underwaterCausticScale;
+  float underwaterCausticStrength;
+  float underwaterCausticSpeed;
+  float underwaterMurkAbsorbR;
+  float underwaterMurkAbsorbG;
+  float underwaterMurkAbsorbB;
+
+  // rtx.psrMaxDistanceMeters in world units (0 = off). Primary hits farther than this
+  // skip reflection and transmission PSR and are integrated as ordinary surfaces.
+  float psrMaxDistance;
+
+  // See rtx/algorithm/sky_provider.slangh. skyRadianceUnscale is 1 / the sky provider's pre-exposure
+  // (FrameOutputs::radianceScale). A nonzero skyArgsProbe (rtx.skyProvider.argsProbe) paints sky misses
+  // green when skyArgs holds this frame's AtmosphereArgs, and red when it does not.
+  float skyRadianceUnscale;
+  uint skyArgsProbe;
+
+  // Renderer-wide pre-exposure (rtx_pre_exposure.h). Radiance is stored
+  // multiplied by preExposure. preExposureHistoryRatio is this frame's over last frame's, for histories.
+  float preExposure;
+  float preExposureHistoryRatio;
+
+  // rtx.coreMaterial.build. Bindless raw-buffer index of the per-surface 64 B core material records
+  // (core_surface_material_shared.h, read as uint4). 0xFFFFFFFF = off or not current this frame.
+  uint coreMaterialTable;
+
+  // Bindless raw-buffer index of the core side table (64 B entries, CORE_MATERIAL_EXT_*, read as uint4),
+  // indexed by the core record's extension index. 0xFFFFFFFF = none this frame. No shader reads it.
+  uint coreMaterialExtTable;
+
+  // rtx.coreMaterial.legacyRecord. Bindless raw-buffer index of the per-surface 80 B legacy records
+  // (legacy_surface_shared.h, read as uint4). 0xFFFFFFFF = none this frame.
+  uint legacySurfaceTable;
+
+  // rtx.alphaBake.softwareOmm. Bindless raw-buffer index of the per-surface software micromap table
+  // (uint2 per surface, see software_omm.slangh). 0xFFFFFFFF = none this frame.
+  // softOmmFlags: SOFT_OMM_FLAG_* (software_omm_shared.h).
+  uint surfaceSoftOmmTable;
+  uint softOmmFlags;
 
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.
 };
+
+#ifdef __cplusplus
+// Every struct in the section above must be a whole number of 16B rows. The shader uses scalar layout,
+// while the C++ struct has alignas(16) on vec4 and mat4, so C++ padding before renderTargetCamera
+// would shift every later field in the C++ view only.
+static_assert(offsetof(RaytraceArgs, renderTargetCamera) % 16 == 0,
+              "A struct above renderTargetCamera in RaytraceArgs is not a multiple of 16 bytes.");
+#endif

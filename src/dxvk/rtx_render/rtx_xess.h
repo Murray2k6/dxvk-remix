@@ -52,11 +52,8 @@ namespace dxvk {
 
       RTX_OPTION_ARGS("rtx.xess", XeSSPreset, preset, XeSSPreset::Balanced, "Adjusts XeSS scaling factor, trades quality for performance.",
                       args.flags = RtxOptionFlags::UserSetting);
-      RTX_OPTION("rtx.xess", float, jitterScale, 1.0f, "Multiplier for XeSS jitter intensity. Values > 1.0 increase jitter, < 1.0 reduce it. Can help reduce aliasing or temporal artifacts.");
-      RTX_OPTION("rtx.xess", bool, useOptimizedJitter, true, "Use XeSS-optimized jitter patterns and scaling. When disabled, uses the same jitter as other upscalers.");
       RTX_OPTION("rtx.xess", bool, useRecommendedJitterSequenceLength, true, "Use XeSS 2.1 recommended jitter sequence length calculation based on scaling factor. When disabled, uses the global cameraJitterSequenceLength setting.");
       RTX_OPTION("rtx.xess", float, responsivePixelMaskClampValue, 0.8f, "Maximum value to clamp responsive pixel mask to. XeSS 2.1 default is 0.8 to prevent aliasing artifacts.");
-      RTX_OPTION("rtx.xess", float, scalingJitterDamping, 0.6f, "Additional jitter damping factor to reduce swimming artifacts. Lower values = less jitter.");
       RTX_OPTION("rtx.xess", bool, logJitterSequenceLength, false, "Log the current jitter sequence length being used for XeSS. Useful for debugging swimming artifacts.");
       RTX_OPTION("rtx.xess", uint32_t, minJitterSequenceLength, 8, "Minimum jitter sequence length for XeSS, even at low scaling factors.");
     };
@@ -84,7 +81,6 @@ namespace dxvk {
     
     // XeSS 2.1 public helper methods
     uint32_t calcRecommendedJitterSequenceLength() const;
-    float calcRecommendedMipBias() const;
 
   protected:
 
@@ -122,6 +118,14 @@ namespace dxvk {
     bool m_recreate;
     float m_lastResolutionScale; // Track resolution scale changes for Custom preset
 
+    // The init flags of the current context, and the ones this frame's inputs need.
+    uint32_t m_initFlags = 0;
+    uint32_t m_wantedInitFlags = 0;
+
+    // Interval counters for the [XeSS] log line.
+    uint64_t m_dispatches = 0;
+    uint64_t m_resets = 0;
+
 #else
 
     // Constructor with device
@@ -151,9 +155,6 @@ namespace dxvk {
     // XeSS 2.1 public helper methods
     uint32_t calcRecommendedJitterSequenceLength() const {
       return 1;
-    }
-    float calcRecommendedMipBias() const {
-      return 0;
     }
 
   protected:

@@ -42,7 +42,7 @@ public:
   RtGraphBatch(RtGraphBatch&&) = default;
   RtGraphBatch& operator=(RtGraphBatch&&) = default;
 
-  void Initialize(const RtGraphTopology& topology);
+  void Initialize(std::shared_ptr<const RtGraphTopology> pTopology);
   
   bool addInstance(Rc<DxvkContext> context, const RtGraphState& graphState, GraphInstance* replacementInstance);
 
@@ -102,27 +102,33 @@ public:
 
   // Look up a PrimInstance from the data a component can store / pass around.
   // This is done instead of passing pointers directly, to avoid stale pointer problems.
-  PrimInstance* resolvePrimTarget(const Rc<DxvkContext>& context, size_t batchIndex, PrimTarget primTarget) const {
+  // The instance's owner resolves the target: its ReplacementInstance, or the scene-owned object (ScenePrimOwner).
+  // Returns an empty PrimInstance (Type::None) when the target does not resolve.
+  PrimInstance resolvePrimTarget(const Rc<DxvkContext>& context, size_t batchIndex, PrimTarget primTarget) const {
     // context unused for now, but will probably be needed for fetching prim target from instanceId.
     if (primTarget.replacementIndex != ReplacementInstance::kInvalidReplacementIndex) {
       const std::vector<GraphInstance*>& instances = m_graphInstances;
       if (instances[batchIndex] != nullptr) {
+        const ScenePrimOwner& sceneOwner = instances[batchIndex]->getSceneOwner();
+        if (sceneOwner.handle != 0) {
+          return sceneOwner.resolve(primTarget.replacementIndex);
+        }
         ReplacementInstance* replacementInstance = instances[batchIndex]->getPrimInstanceOwner().getReplacementInstance();
         if (replacementInstance != nullptr) {
-          return &replacementInstance->prims[primTarget.replacementIndex];
+          return replacementInstance->prims[primTarget.replacementIndex];
         }
       }
-      return nullptr;
+      return PrimInstance();
     } else if (primTarget.instanceId != kInvalidInstanceId) {
       Logger::err("components targetting prims in other draw calls is not supported yet.");
-      return nullptr;
+      return PrimInstance();
     }
-    return nullptr;
+    return PrimInstance();
   }
 
 private:
   XXH64_hash_t m_graphHash;
-  const RtGraphTopology* m_topology = nullptr;
+  std::shared_ptr<const RtGraphTopology> m_topology;
   std::vector<std::unique_ptr<RtComponentBatch>> m_componentBatches;
   std::vector<uint32_t> m_batchesWithSceneOverrides;
   std::vector<RtComponentPropertyVector> m_properties;

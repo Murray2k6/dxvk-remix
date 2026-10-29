@@ -45,16 +45,31 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 #define OPAQUE_SURFACE_MATERIAL_FLAG_IS_RAYTRACED_RENDER_TARGET (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(3))
 #define OPAQUE_SURFACE_MATERIAL_FLAG_HAS_DISPLACEMENT (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(4))
 #define OPAQUE_SURFACE_MATERIAL_FLAG_IS_HAIR_CARD (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(5))
-// Set when the albedo/emissive source texture uses an sRGB VkFormat, so the sampler hardware already
-// linearized it on read. The shader skips its own gammaToLinear() for that channel to avoid double
-// linearization (constants remain gamma-encoded and are always converted). See opaque_surface_material_interaction.slangh.
+// Set when the albedo or emissive texture has an sRGB format, so the sampler already linearizes it and the
+// shader skips its own gammaToLinear(). Constants stay gamma-encoded. See opaque_surface_material_interaction.slangh.
 #define OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_TEXTURE_IS_SRGB (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(6))
 #define OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TEXTURE_IS_SRGB (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(7))
-// Fork (2026-07-26): marks a particle material whose sprites are known to see open sky (weather
-// precipitation - the spawn-time shelter probe guarantees it). The resolver's opacity lighting
-// approximation adds a sky-ambient term for such particles on top of the froxel radiance sample,
-// supplying the skylight that the froxel grid does not contain (its integrator has no sky term).
+// Marks a particle material whose sprites see open sky, such as precipitation after the shelter probe.
+// The opacity lighting approximation adds a sky-ambient term for it, since the froxel grid has no skylight.
 #define OPAQUE_SURFACE_MATERIAL_FLAG_SKY_LIT_PARTICLE (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(8))
+// NV-DXVK start: Preserve legacy material provenance through material and G-buffer flags.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_USE_LEGACY_DEFAULTS (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(9))
+#define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_USE_LEGACY_DEFAULTS (1 << 2)
+// NV-DXVK end
+// NV-DXVK start: textures imported from a host keep the host's own encoding.
+// The normal texture holds tangent-space X and Y as unsigned values with Z
+// rebuilt, rather than Remix's octahedral encoding.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_NORMAL_TANGENT_XY (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(10))
+// The roughness texture holds smoothness: roughness = 1 - sample, floored at
+// the material's roughnessFloor.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_SMOOTHNESS (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(11))
+// With ROUGHNESS_FROM_SMOOTHNESS: smoothness is in green rather than red.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_SMOOTHNESS_IN_GREEN (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(12))
+// With SMOOTHNESS_IN_GREEN: the roughness texture's red channel is a specular
+// level (spec/gloss content) and drives a per-pixel metalness from the
+// material's specularMetalParams/specularMetalTint. Last free flag bit.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_METALLIC_FROM_SPECULAR (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(13))
+// NV-DXVK end
 
 
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE (1 << 0)
@@ -62,6 +77,17 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 // flags overlap with type field when in gbuffer, which occupies last 2 bits.
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_MASK 0x3F
 
+
+// Bits for the flags word of a surface material extension entry (SubsurfaceMaterial layout,
+// OpaqueSurfaceMaterial::subsurfaceMaterialIndex). They take no opaque material flag bits.
+// The entry carries an albedo tint (SubsurfaceMaterial::albedoTint, a gamma-space RGB multiplier on the albedo texture).
+#define SURFACE_MATERIAL_EXTENSION_FLAG_ALBEDO_TINT (1 << 0)
+// The entry exists only for the tint, so subsurface reads treat it as absent.
+#define SURFACE_MATERIAL_EXTENSION_FLAG_NO_SUBSURFACE (1 << 1)
+// rtx.subsurface.transmittanceFollowsAlbedo makes the diffusion-profile transmittance texture the albedo texture.
+// TINT multiplies it by albedoTint like the albedo. SRGB means its view is sRGB, so the shader skips gammaToLinear.
+#define SURFACE_MATERIAL_EXTENSION_FLAG_TRANSMITTANCE_TINT (1 << 2)
+#define SURFACE_MATERIAL_EXTENSION_FLAG_TRANSMITTANCE_SRGB (1 << 3)
 
 // Note: Bits for flags field in TranslucentSurfaceMaterial and TranslucentSurfaceMaterialInteraction
 // If set, then the texture bound to transmittanceOrDiffuseTextureIndex is an albedo map for the diffuse layer

@@ -68,6 +68,13 @@ namespace dxvk {
    * aims to work around the issue that there are three
    * different interfaces for basically the same thing.
    */
+  // NV-DXVK start: defined with the Remix API. Runs on the CS thread, before a
+  // write to an image Remix imported in place: gives every Remix texture that
+  // still samples the image its own copy of the current contents.
+  class DxvkContext;
+  void remixHostImportCopyOnWrite(DxvkContext* ctx, const Rc<DxvkImage>& image);
+  // NV-DXVK end
+
   class D3D11CommonTexture {
     
   public:
@@ -188,6 +195,26 @@ namespace dxvk {
     Rc<DxvkImage> GetImage() const {
       return m_image;
     }
+
+    // NV-DXVK start: Remix host import copy-on-write. Set when Remix samples
+    // this texture's image in place (rtx.hostImport.shareDefaultTextures);
+    // the first write through a context takes it and has Remix copy the image
+    // before the write lands.
+    void MarkRemixShared() {
+      m_remixShared.store(true, std::memory_order_release);
+    }
+
+    bool TakeRemixShared() {
+      return m_remixShared.load(std::memory_order_acquire)
+          && m_remixShared.exchange(false, std::memory_order_acq_rel);
+    }
+
+    // Set when Remix imports this texture's image in place. On destruction, an image that is
+    // still referenced is counted in DxvkAppImageStats::heldAfterRelease.
+    void MarkRemixImported() {
+      m_remixImported.store(true, std::memory_order_release);
+    }
+    // NV-DXVK end
     
     /**
      * \brief Mapped subresource buffer
@@ -392,6 +419,8 @@ namespace dxvk {
     VkFormat                      m_packedFormat;
     
     Rc<DxvkImage>                 m_image;
+    std::atomic<bool>             m_remixShared = { false };  // NV-DXVK
+    std::atomic<bool> m_remixImported = { false };
     std::vector<MappedBuffer>     m_buffers;
     std::vector<MappedInfo>       m_mapInfo;
     
@@ -510,7 +539,9 @@ namespace dxvk {
    * Provides access to the underlying Vulkan
    * texture to external Vulkan libraries.
    */
-  class D3D11VkInteropSurface : public IDXGIVkInteropSurface {
+  // NV-DXVK start: Retained immutable image import
+  class D3D11VkInteropSurface : public IDXGIVkInteropSurface, public IDXGIRemixTexture {
+  // NV-DXVK end
     
   public:
     
@@ -519,6 +550,12 @@ namespace dxvk {
             D3D11CommonTexture* pTexture);
     
     ~D3D11VkInteropSurface();
+
+    // NV-DXVK start: Called on the owning D3D11 context thread
+    HRESULT STDMETHODCALLTYPE PrepareRemixView(
+      VkDevice expectedDevice, DXGI_FORMAT format, void* hostContext,
+      Rc<DxvkImageView>* view, BOOL* pDeferInitFlush) final;
+    // NV-DXVK end
     
     ULONG STDMETHODCALLTYPE AddRef();
     

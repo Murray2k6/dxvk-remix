@@ -26,7 +26,10 @@
 #include <string>
 #include <filesystem>
 #include <cassert>
+#include <cstring>
 #include <array>
+
+#include "util_process.h"
 
 namespace version {
   static constexpr uint64_t fileSysV = 1;
@@ -80,6 +83,29 @@ public:
   }
   static void print();
   static void mkDirs(const fspath& path);
+
+  // Returns Remix runtime folder name for the known archs.
+  // If the arch is a nullptr or not known returns the default runtime dir name.
+  static inline const char* runtimeDirName(const char* arch) {
+    if (arch && 0 == std::strcmp(arch, bridge_util::RTX_ARCH_ARM64)) {
+      return ".trex_arm64";
+    }
+    return ".trex";
+  }
+
+  // Returns the runtime folder name to use under the given directory. When the dotted folder is missing and the same
+  // name without the leading dot exists, that one is used, because some mod managers skip names starting with a dot.
+  static inline std::string runtimeDirNameIn(const fspath& baseDir, const char* arch) {
+    const std::string dotted = runtimeDirName(arch);
+    std::error_code ec;
+    if (!std::filesystem::is_directory(baseDir / dotted, ec)) {
+      const std::string undotted = dotted.substr(1);
+      if (std::filesystem::is_directory(baseDir / undotted, ec)) {
+        return undotted;
+      }
+    }
+    return dotted;
+  }
 };
 
 }

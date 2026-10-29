@@ -105,6 +105,14 @@ namespace dxvk {
   }
 
 
+  void DxvkSwapchainBlitter::setHdr10Output(
+          bool                enable,
+          float               whiteNits) {
+    m_hdr10 = enable;
+    m_whiteNits = whiteNits;
+  }
+
+
   void DxvkSwapchainBlitter::draw(
           DxvkContext*        ctx,
     const Rc<DxvkShader>&     fs,
@@ -210,6 +218,9 @@ namespace dxvk {
       args.dstOffset = dstRect.offset;
     else
       args.srcExtent = srcRect.extent;
+
+    args.hdr10 = m_hdr10 ? 1u : 0u;
+    args.whiteNits = m_whiteNits;
 
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 

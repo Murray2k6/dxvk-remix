@@ -8,7 +8,7 @@ cmd_history_exe = executable(
     include_directories : util_include_path,
     dependencies : util_dep,
     win_subsystem : 'console')
-test('command_history', cmd_history_exe)
+test('command_history', cmd_history_exe, timeout : 5)
 tests += cmd_history_exe
 endif
 
@@ -29,6 +29,12 @@ read_name = 'test_remix_api_read'
 read_exe = read_name + '_'  + name_suff
 tests += executable(
     read_exe,  files(read_name + '.cpp'),
+    include_directories : [util_include_path, public_include_path ],
+    dependencies : util_dep,
+    win_subsystem : 'console')
+# Bridge streaming test: the x86 build is the client and starts the x64 build as the server.
+tests += executable(
+    'test_bridge_stream_' + name_suff,  files('test_bridge_stream.cpp'),
     include_directories : [util_include_path, public_include_path ],
     dependencies : util_dep,
     win_subsystem : 'console')

@@ -94,6 +94,12 @@
 [shader("closesthit")]
 void main(inout GeometryPSRResolverState rayPayload : SV_RayPayload, in float2 barycentricCoordinates : SV_IntersectionAttributes)
 {
+  // Skips a hit that hardware micromaps would cull (rtx.alphaBake.softwareOmmResolveSkip).
+  if (softOmmClosestHitSkip(SOFT_OMM_RESOLVE_PASS_GBUFFER, rayPayload, barycentricCoordinates))
+  {
+    return;
+  }
+
   // Construct a Ray Hit Info from the hit
 
   RAY_HIT_INFO_CREATE_TRACE_RAY_HIT(rayHitInfo);

@@ -2,7 +2,7 @@
 
 This folder contains the NVIDIA RTX Remix Bridge client and server components.  These are required for enabling a 32-bit game to interact with the 64-bit Remix Runtime dll.
 
-> **NOTE:** To experience the full feature set of NVIDIA RTX Remix, binaries compiled from this folder need to be combined with the binaries from the top level folder of `dxvk-remix` [repo on GitHub](https://github.com/NVIDIAGameWorks/dxvk-remix/). For additional details and explanation see below!
+> **NOTE:** The bridge is only half of a working install: combine its binaries with the runtime built from the top level of this repository. For additional details and explanation see below.
 
 # Prerequisites
 
@@ -10,13 +10,23 @@ This folder contains the NVIDIA RTX Remix Bridge client and server components.  
 2. Microsoft [Visual Studio](https://visualstudio.microsoft.com/vs/older-downloads/)
     - Visual Studio 2019 is tested.
     - Visual Studio 2022 should also work with MSVC v142 build tools installed.
-    - The free Commmunity Edition of Visual Studio will work fine.
+    - The free Community Edition of Visual Studio will work fine.
     > **NOTE:** Make sure to install the `MSVC v142 - VS 2019 C++ x64/x86 build tools` from the _Individual Components_ list in the Visual Studio Installer interface. NVIDIA RTX Remix has only been tested with the Visual Studio 2019 build tools, and newer compiler versions may or may not work and/or lead to unexpected results/issues.
 3. [Meson](https://mesonbuild.com/) - v0.61.4 has been tested, latest version should also work fine.
     - Follow [instructions](https://mesonbuild.com/SimpleStart.html#installing-meson) on how to install and reboot the PC before moving on (Meson will indicate as much)
 4. [Python](https://www.python.org/downloads/) - version 3.9 or newer
 
 # How to build
+
+The recommended way is the wrapper script, from the repository root:
+
+```powershell
+.\bridge\scripts\build.ps1                # release, both architectures
+.\bridge\scripts\build.ps1 -Arch x86 -Clean
+.\bridge\scripts\build.ps1 -Flavor debugoptimized
+```
+
+It finds Visual Studio 2019 or 2022 with vswhere, builds the 64-bit server and the 32-bit client in separate shells, and stops on the first error. The output goes to `bridge/_output/`. The batch files below still work.
 
 To generate the initial Visual Studio solutions and build, navigate to the `bridge/` folder and run `build_bridge_all.bat`, which will generate build directories for the debug/release configurations for both 32 and 64 bit platform.
 
@@ -90,7 +100,7 @@ The easiest way to get a complete binary package is by downloading one of the re
   - One `IpcChannel` is used for all the client commands sent to the server, and another channel sends the responses back to the client. Likewise within each `IpcChannel` one queue handles the commands being invoked, and the other queue has all the data for parameters and arguments needed by the command.
   - The queues are global static variables and the queue sizes are defined in `util_common.h` as well.
   - The server and client processes each have their own queue instances, but both point at the same shared memory so they read/write data from the same memory to avoid any extra copying.
-  - Read and write access follows a simplified producer/consumer pattern and is regulated either via atomic counters (`AtomicCircularQueue`) or via semaphores that get triggered when the client/server are done writing/reading (`BlockingCircularQueue`), and when the queue is empty the server will block and wait for a new command to come in. Should a queue get filled up by the writer then it will block until the reader consumed items from the queue.
+  - Read and write access follows a single-producer/single-consumer pattern regulated via atomic counters (`AtomicCircularQueue`). When the queue is empty the reader spins briefly (`ipcSpinMicroseconds`) and then blocks on a named wake event until a new command comes in; should a queue get filled up by the writer, the writer does the same until the reader consumed items from the queue.
   - Most of the time the client will be the writer and the server will be the reader for the queues, except during application startup where the client and server exchange a handshake, which the server acknowledges by sending a response back to the client, and when commands are executed that require a response from the server, for example when surface data is being copied into the data queue so that it can be read out on the client side.
   - New commands/data are added to the queue via `push()` and read by doing `pull()` calls. There are some `PUSH` and `PULL` macros defined to make it easier to quickly send a command or read data of specific data types.
   - The data queue supports sending data of arbitrary size by passing it a size and the pointer to the data being pushed. The underlying base type for the data queue is `uint32_t`, which means data is being sent in 4-byte chunks. Sending `nullptr` (i.e. no data but strongly typed) is also supported.

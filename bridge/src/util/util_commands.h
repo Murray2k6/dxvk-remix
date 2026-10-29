@@ -37,9 +37,15 @@ namespace Commands {
     Bridge_Any,
     Bridge_Response,
     Bridge_DebugMessage,
+    // A run of state setter records, see IsBatchableState() and util_bridgecommand.h StateMessage.
+    Bridge_StatePacket,
+    // Publishes the next part of a streamed command's data (see Commands::DataStreamed).
+    Bridge_DataChunk,
 
     RemixApi_CreateMaterial,
     RemixApi_DestroyMaterial,
+    RemixApi_CreateTexture,
+    RemixApi_DestroyTexture,
     RemixApi_CreateMesh,
     RemixApi_DestroyMesh,
     RemixApi_DrawInstance,
@@ -51,6 +57,12 @@ namespace Commands {
     RemixApi_RegisterDevice,
     RemixApi_SetGameValue,
     RemixApi_GetGameValue,
+    // Color grading (remix_c.h). SetColorGrade is asynchronous; the others wait for the server's answer.
+    RemixApi_SetColorGradePreset,
+    RemixApi_SetColorGrade,
+    RemixApi_MixColorGradePresets,
+    RemixApi_GetColorGrade,
+    RemixApi_SaveColorGradePreset,
 
     Bridge_SharedHeap_AddSeg,
     Bridge_SharedHeap_Alloc,
@@ -477,9 +489,13 @@ namespace Commands {
     case Bridge_Any: return "Any";
     case Bridge_Response: return "Response";
     case Bridge_DebugMessage: return "DebugMessage";
+    case Bridge_StatePacket: return "StatePacket";
+    case Bridge_DataChunk: return "DataChunk";
 
     case RemixApi_CreateMaterial: return "RemixApi_CreateMaterial";
     case RemixApi_DestroyMaterial: return "RemixApi_DestroyMaterial";
+    case RemixApi_CreateTexture: return "RemixApi_CreateTexture";
+    case RemixApi_DestroyTexture: return "RemixApi_DestroyTexture";
     case RemixApi_CreateMesh: return "RemixApi_CreateMesh";
     case RemixApi_DestroyMesh: return "RemixApi_DestroyMesh";
     case RemixApi_DrawInstance: return "RemixApi_DrawInstance";
@@ -491,6 +507,11 @@ namespace Commands {
     case RemixApi_RegisterDevice: return "RemixApi_RegisterDevice";
     case RemixApi_SetGameValue: return "RemixApi_SetGameValue";
     case RemixApi_GetGameValue: return "RemixApi_GetGameValue";
+    case RemixApi_SetColorGradePreset: return "RemixApi_SetColorGradePreset";
+    case RemixApi_SetColorGrade: return "RemixApi_SetColorGrade";
+    case RemixApi_MixColorGradePresets: return "RemixApi_MixColorGradePresets";
+    case RemixApi_GetColorGrade: return "RemixApi_GetColorGrade";
+    case RemixApi_SaveColorGradePreset: return "RemixApi_SaveColorGradePreset";
 
     case Bridge_SharedHeap_AddSeg: return "SharedHeap_AddSeg";
     case Bridge_SharedHeap_Alloc: return "SharedHeap_Alloc";
@@ -876,7 +897,24 @@ namespace Commands {
                                     // and only allocation id(s) is transferred on the queue
     DataIsReserved   = 0b00000010,  // Data was already reserved in data queue and only its
                                     // offset is transferred
+    AsyncResult      = 0b00000100,  // IDirect3DQuery9_GetData: no response; the server writes the
+                                    // result to a shared slot (util_queryresults.h)
+    DataStreamed     = 0b00001000,  // The header was pushed before all of the command's data was written.
+                                    // Bridge_DataChunk headers publish the rest (util_bridgecommand.h).
+    DataStreamEnd    = 0b00010000,  // On a Bridge_DataChunk: the streamed command's data ends here.
   };
+
+  inline bool IsDataStreamed(Flags flags) {
+    return (flags & FlagBits::DataStreamed) != 0;
+  }
+
+  inline bool IsDataStreamEnd(Flags flags) {
+    return (flags & FlagBits::DataStreamEnd) != 0;
+  }
+
+  inline bool IsAsyncResult(Flags flags) {
+    return (flags & FlagBits::AsyncResult) != 0;
+  }
 
   inline bool IsDataInSharedHeap(Flags flags) {
     return (flags & FlagBits::DataInSharedHeap) != 0;
@@ -884,6 +922,41 @@ namespace Commands {
 
   inline bool IsDataReserved(Flags flags) {
     return (flags & FlagBits::DataIsReserved) != 0;
+  }
+
+  // Device state setters that may travel as records of a Bridge_StatePacket. They take no flags, answer
+  // nothing unless sendAllServerResponses is set (then packets hold one record each) and only change device state.
+  // The server rejects any other command inside a packet.
+  inline bool IsBatchableState(D3D9Command command) {
+    switch (command) {
+    case IDirect3DDevice9Ex_SetTransform:
+    case IDirect3DDevice9Ex_SetViewport:
+    case IDirect3DDevice9Ex_SetMaterial:
+    case IDirect3DDevice9Ex_SetLight:
+    case IDirect3DDevice9Ex_LightEnable:
+    case IDirect3DDevice9Ex_SetClipPlane:
+    case IDirect3DDevice9Ex_SetRenderState:
+    case IDirect3DDevice9Ex_SetTexture:
+    case IDirect3DDevice9Ex_SetTextureStageState:
+    case IDirect3DDevice9Ex_SetSamplerState:
+    case IDirect3DDevice9Ex_SetScissorRect:
+    case IDirect3DDevice9Ex_SetVertexDeclaration:
+    case IDirect3DDevice9Ex_SetFVF:
+    case IDirect3DDevice9Ex_SetVertexShader:
+    case IDirect3DDevice9Ex_SetVertexShaderConstantF:
+    case IDirect3DDevice9Ex_SetVertexShaderConstantI:
+    case IDirect3DDevice9Ex_SetVertexShaderConstantB:
+    case IDirect3DDevice9Ex_SetStreamSource:
+    case IDirect3DDevice9Ex_SetStreamSourceFreq:
+    case IDirect3DDevice9Ex_SetIndices:
+    case IDirect3DDevice9Ex_SetPixelShader:
+    case IDirect3DDevice9Ex_SetPixelShaderConstantF:
+    case IDirect3DDevice9Ex_SetPixelShaderConstantI:
+    case IDirect3DDevice9Ex_SetPixelShaderConstantB:
+      return true;
+    default:
+      return false;
+    }
   }
 }
 

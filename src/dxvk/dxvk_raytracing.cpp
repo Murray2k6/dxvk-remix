@@ -1,5 +1,7 @@
 #include "dxvk_raytracing.h"
 
+#include <algorithm>
+#include <chrono>
 #include <future>
 
 #include "dxvk_device.h"
@@ -7,6 +9,7 @@
 #include "rtx_render/rtx.h"
 #include "rtx_render/rtx_options.h"
 #include "rtx_render/rtx_opacity_micromap_manager.h"
+#include "rtx_render/rtx_pipeline_stats.h"
 #include "../util/util_threadpool.h"
 #include "../util/util_singleton.h"
 
@@ -118,6 +121,7 @@ namespace dxvk {
       }
     }
 
+    // Returns an invalid Future when every task slot is in use. The caller's own join then does the remaining work.
     Future<VkResult> finalize(const Rc<vk::DeviceFn>& vkd,
                                           VkDeferredOperationKHR deferredOp) {
       std::lock_guard<sync::Spinlock> lock(m_mutex);
@@ -127,21 +131,9 @@ namespace dxvk {
         m_threadPool = new ThreadPoolType(numCpuCores / 4, "dxvk-deferredop-finalizer");
       }
 
-      Future<VkResult> future;
-      do {
-        future = m_threadPool->Schedule([vkd = vkd.ptr(), deferredOp]() -> VkResult {
-          return vkd->vkDeferredOperationJoinKHR(vkd->device(), deferredOp);
-        });
-
-        if (future.valid()) {
-          break;
-        }
-
-        ONCE(Logger::warn("Unable to schedule a deferred op finalizer. Retrying..."));
-        std::this_thread::yield();
-      } while (true);
-
-      return future;
+      return m_threadPool->Schedule([vkd = vkd.ptr(), deferredOp]() -> VkResult {
+        return vkd->vkDeferredOperationJoinKHR(vkd->device(), deferredOp);
+      });
     }
   };
 
@@ -298,6 +290,24 @@ namespace dxvk {
 
   void DxvkRaytracingPipeline::createPipeline() {
     Logger::debug(str::format("Compiling raytracing pipeline: ", m_shaders.debugName ? m_shaders.debugName : "<debug name missing>"));
+    // Creation feedback (core in Vulkan 1.3) and the per-pipeline log (RtxPipelineStats::logCreation), on
+    // every exit, a deferred operation included (the feedback is written when the creation completes).
+    VkPipelineCreationFeedback feedback = {};
+    VkPipelineCreationFeedbackCreateInfo feedbackInfo = { VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO };
+    feedbackInfo.pPipelineCreationFeedback = &feedback;
+    struct CreationLog {
+      DxvkPipelineCache* cache;
+      const char* name;
+      const VkPipelineCreationFeedback& feedback;
+      std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+      ~CreationLog() {
+        RtxPipelineStats::logCreation(cache, "raytracing", name ? name : "<debug name missing>",
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+          (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) == 0 ? -1
+            : (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0 ? 1 : 0,
+          true);
+      }
+    } creationLog { m_pipeMgr->m_cache.ptr(), m_shaders.debugName, feedback };
 
     assert(m_layout != nullptr);
 
@@ -310,7 +320,11 @@ namespace dxvk {
     rayPipelineInfo.maxPipelineRayRecursionDepth = 1;
     rayPipelineInfo.layout = m_layout->pipelineLayout();
     rayPipelineInfo.basePipelineIndex = -1;
-    rayPipelineInfo.flags = m_shaders.pipelineFlags;
+    rayPipelineInfo.flags = m_shaders.pipelineFlags | RtxPipelineStats::captureFlags();
+    if (m_pipeMgr->m_cache->feedbackSupported()) {
+      feedbackInfo.pNext = rayPipelineInfo.pNext;
+      rayPipelineInfo.pNext = &feedbackInfo;
+    }
     
     auto& rtProperties = m_pipeMgr->m_device->properties().khrDeviceRayTracingPipelineProperties;
     THROW_IF_FALSE(rtProperties.maxRayRecursionDepth >= rayPipelineInfo.maxPipelineRayRecursionDepth);
@@ -321,11 +335,14 @@ namespace dxvk {
       VK_THROW_IF_FAILED(m_vkd->vkCreateDeferredOperationKHR(m_vkd->device(), VK_NULL_HANDLE, &deferredOp));
     }
 
+    // Held until the deferred operation is joined, which is when the pipeline goes into the cache.
+    const auto cacheLock = m_pipeMgr->m_cache->lockForCreate();
     VkResult result = m_vkd->vkCreateRayTracingPipelinesKHR(m_vkd->device(), deferredOp, m_pipeMgr->m_cache->handle(),
                                                                1, &rayPipelineInfo, nullptr, &m_pipeline);
     VK_THROW_IF_FAILED(result);
 
     if (deferredOp == VK_NULL_HANDLE) {
+      logPipelineStats(rayPipelineInfo.flags);
       return;
     }
 
@@ -334,7 +351,11 @@ namespace dxvk {
 
       std::vector<Future<VkResult>> joins;
       while (numLaunches > 1) {
-        joins.emplace_back(DxvkDeferredOpFinalizer::get().finalize(m_vkd, deferredOp));
+        Future<VkResult> join = DxvkDeferredOpFinalizer::get().finalize(m_vkd, deferredOp);
+        if (!join.valid()) {
+          break;
+        }
+        joins.emplace_back(std::move(join));
         --numLaunches;
       }
 
@@ -348,6 +369,43 @@ namespace dxvk {
     }
 
     m_vkd->vkDestroyDeferredOperationKHR(m_vkd->device(), deferredOp, VK_NULL_HANDLE);
+
+    // The deferred operation has been joined, so the pipeline is complete.
+    logPipelineStats(rayPipelineInfo.flags);
+  }
+
+  // rtx.debug.logPipelineStats. Name: "<pipeline debug name>[<shader>,<shader>,...]",
+  // every distinct shader of every group in group order, each as RtxPipelineStats::shaderName.
+  void DxvkRaytracingPipeline::logPipelineStats(VkPipelineCreateFlags flags) const {
+    if (likely(!(flags & VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR)))
+      return;
+
+    std::vector<const DxvkShader*> shaders;
+    auto add = [&shaders](const Rc<DxvkShader>& shader) {
+      if (shader != nullptr && std::find(shaders.begin(), shaders.end(), shader.ptr()) == shaders.end())
+        shaders.push_back(shader.ptr());
+    };
+    for (const auto& group : m_shaders.groups) {
+      add(group.generalShader);
+      add(group.closestHitShader);
+      add(group.anyHitShader);
+      add(group.intersectionShader);
+    }
+
+    std::string name = m_shaders.debugName ? m_shaders.debugName : "raytracing_pipeline";
+    for (char& c : name) {
+      if (c == ' ' || c == '=')
+        c = '_';
+    }
+    name += "[";
+    for (size_t i = 0; i < shaders.size(); i++) {
+      if (i)
+        name += ",";
+      name += RtxPipelineStats::shaderName(shaders[i]);
+    }
+    name += "]";
+
+    RtxPipelineStats::logPipeline(*m_vkd, m_pipeline, name);
   }
 
   // Each shader binding table is populated with shader records 
@@ -416,6 +474,10 @@ namespace dxvk {
       info.access = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
       info.size = m_raygenShaderBindingTable.size + m_missShaderBindingTable.size +
         m_hitShaderBindingTable.size + m_callableShaderBindingTable.size;
+      // Every region must start on a shaderGroupBaseAlignment boundary. The region sizes keep that alignment,
+      // so the buffer start must too. Some drivers (AMD) report a buffer alignment of 4 bytes, which is
+      // below it, and a sub-allocated table would otherwise start at any 4-byte offset.
+      info.requiredAlignmentOverride = rtProperties.shaderGroupBaseAlignment;
       m_shaderBindingTableBuffer = m_pipeMgr->m_device->createBuffer(info, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "SBT");
     }
 
@@ -430,6 +492,12 @@ namespace dxvk {
       m_missShaderBindingTable.deviceAddress = m_raygenShaderBindingTable.deviceAddress + m_raygenShaderBindingTable.size;
       m_callableShaderBindingTable.deviceAddress = m_missShaderBindingTable.deviceAddress + m_missShaderBindingTable.size;
       m_hitShaderBindingTable.deviceAddress = m_callableShaderBindingTable.deviceAddress + m_callableShaderBindingTable.size;
+
+      if (m_raygenShaderBindingTable.deviceAddress % rtProperties.shaderGroupBaseAlignment) {
+        Logger::err(str::format("Shader binding table of ", m_shaders.debugName ? m_shaders.debugName : "<debug name missing>",
+                                " starts at 0x", std::hex, m_raygenShaderBindingTable.deviceAddress, std::dec,
+                                ", which is not a multiple of shaderGroupBaseAlignment (", rtProperties.shaderGroupBaseAlignment, ")."));
+      }
     }
 
     // Map the SBT buffer and write in the handles

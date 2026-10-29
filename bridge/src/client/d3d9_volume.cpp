@@ -69,8 +69,7 @@ void Direct3DVolume9_LSS::onDestroy() {
 
 HRESULT Direct3DVolume9_LSS::GetDevice(IDirect3DDevice9** ppDevice) {
   LogFunctionCall();
-  m_pDevice->AddRef();
-  (*ppDevice) = m_pDevice;
+  m_pDevice->reportDevice(ppDevice);
   return S_OK;
 }
 
@@ -128,14 +127,12 @@ HRESULT Direct3DVolume9_LSS::UnlockBox() {
 bool Direct3DVolume9_LSS::lock(D3DLOCKED_BOX& lockedVolume, const D3DBOX* const pBox, const DWORD flags) {
   const D3DBOX box = resolveLockInfoBox(pBox, m_desc);
   const auto [width, height, depth] = getBoxDimensions(box);
-  const auto pixelsPerBlock = bridge_util::getBlockSize(m_desc.Format);
-  const auto bytesPerPixel = bridge_util::getBytesFromFormat(m_desc.Format);
-  const auto rowStride = ((width + pixelsPerBlock - 1) / pixelsPerBlock);
-  const auto columnStride = ((height + pixelsPerBlock - 1) / pixelsPerBlock);
-  const auto size = depth * columnStride * rowStride * bytesPerPixel;
-  void* const pData = new uint8_t[size];
-  lockedVolume.RowPitch = rowStride;
-  lockedVolume.SlicePitch = columnStride;
+  // The pitches are in bytes, rows of blocks for compressed formats, with no padding between rows and slices.
+  const size_t rowSize = bridge_util::calcRowSize((uint32_t) width, m_desc.Format);
+  const size_t numRows = bridge_util::calcStride((uint32_t) height, m_desc.Format);
+  void* const pData = new uint8_t[rowSize * numRows * depth];
+  lockedVolume.RowPitch = (INT) rowSize;
+  lockedVolume.SlicePitch = (INT) (rowSize * numRows);
   lockedVolume.pBits = pData;
   m_lockInfoQueue.push({ lockedVolume, box, flags });
   return true;
@@ -152,10 +149,9 @@ void Direct3DVolume9_LSS::unlock() {
   // Prep command send
   const auto& lockedVolume = lockInfo.lockedVolume;
   const auto& box = lockInfo.box;
-  const auto [width, height, depth] = getBoxDimensions(box);
-  const auto bytesPerPixel = bridge_util::getBytesFromFormat(m_desc.Format);
-  const auto rowSize = lockedVolume.RowPitch * bytesPerPixel;
-  const auto totalSize = depth * lockedVolume.SlicePitch * rowSize;
+  const uint32_t depth = (uint32_t) std::get<2>(getBoxDimensions(box));
+  const uint32_t rowSize = (uint32_t) lockedVolume.RowPitch;
+  const uint32_t numRows = (uint32_t) (lockedVolume.SlicePitch / lockedVolume.RowPitch);
 
   // Now send the box dimensions and surface handle
   if ((lockInfo.flags & D3DLOCK_READONLY) == 0) {
@@ -164,28 +160,18 @@ void Direct3DVolume9_LSS::unlock() {
     c.send_data(sizeof(D3DBOX), &box);
     c.send_data(lockInfo.flags);
 
-    // Now push actual bytes
-    c.send_many(bytesPerPixel, lockedVolume.RowPitch, lockedVolume.SlicePitch, depth);
-#ifdef SEND_ALL_LOCK_DATA_AT_ONCE
-    if (auto* blobPacketPtr = c.begin_data_blob(totalSize))
-#endif
-      for (uint32_t z = 0; z < depth; z++) {
-        for (uint32_t y = 0; y < lockedVolume.SlicePitch; y++) {
-          auto ptr = static_cast<uint8_t*>(lockedVolume.pBits) +
-            y * lockedVolume.RowPitch + z * lockedVolume.SlicePitch;
-#ifdef SEND_ALL_LOCK_DATA_AT_ONCE
-          memcpy(blobPacketPtr, ptr, rowSize);
-          blobPacketPtr += rowSize;
-#else
-          c.send_data(rowSize, ptr);
-#endif
-        }
-      }
-#ifdef SEND_ALL_LOCK_DATA_AT_ONCE
-    c.end_data_blob();
-#endif
+    // The rows of all slices follow in order, in blobs of whole rows of at most one item each.
+    // The server writes them into the volume under one lock.
+    c.send_many(rowSize, numRows, depth);
+    const uint64_t totalRows = uint64_t(numRows) * depth;
+    const uint64_t rowsPerBlob = std::max<uint64_t>(1, DeviceBridge::maxItemBytes() / rowSize);
+    for (uint64_t row = 0; row < totalRows && gbBridgeRunning;) {
+      const uint64_t blobRows = std::min(rowsPerBlob, totalRows - row);
+      c.send_data((uint32_t) (blobRows * rowSize), static_cast<const uint8_t*>(lockedVolume.pBits) + row * rowSize);
+      row += blobRows;
+    }
   }
-  delete lockedVolume.pBits;
+  delete[] static_cast<uint8_t*>(lockedVolume.pBits);
 }
 
 D3DBOX Direct3DVolume9_LSS::resolveLockInfoBox(const D3DBOX* const pBox, const D3DVOLUME_DESC& desc) {

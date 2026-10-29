@@ -1,16 +1,6 @@
-// src/dxvk/rtx_render/rtx_fork_overlay.cpp
-//
-// Fork-owned file. Contains the implementations of fork_hooks:: functions
-// for the overlay subsystem, lifted from rtx_overlay_window.cpp and
-// rtx_context.cpp during the 2026-04-18 fork touchpoint-pattern refactor.
-//
-// See docs/fork-touchpoints.md for the full fork-hooks catalogue.
-//
-// NOTE: overlayInputForward accesses GameOverlay::m_hwnd (private).
-// dispatchScreenOverlay accesses multiple private members of RtxContext
-// (m_pendingScreenOverlay, m_screenOverlay*) and uses ScreenOverlayShader.
-// Both classes require the corresponding fork_hooks functions to be declared
-// as friends — see rtx_overlay_window.h and rtx_context.h.
+// The fork_hooks functions of the overlay subsystem (see rtx_fork_hooks.h).
+// overlayInputForward reads GameOverlay::m_hwnd and dispatchScreenOverlay reads RtxContext's
+// screen-overlay state, so both are friends of those classes (rtx_overlay_window.h, rtx_context.h).
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -34,11 +24,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 namespace dxvk {
 
   namespace {
-    // ScreenOverlayShader — the compute shader that alpha-composites the
-    // plugin-uploaded RGBA overlay over the final tone-mapped output image.
-    // Moved here from the anonymous namespace in rtx_context.cpp so that
-    // dispatchScreenOverlay (a fork_hooks function) can reference it without
-    // requiring a separate TU.
+    // Alpha-composites the plugin-uploaded RGBA overlay over the final tone-mapped output image.
     class ScreenOverlayShader : public ManagedShader {
       SHADER_SOURCE(ScreenOverlayShader, VK_SHADER_STAGE_COMPUTE_BIT, screen_overlay)
 
@@ -55,63 +41,21 @@ namespace dxvk {
 
 namespace fork_hooks {
 
-  // ---------------------------------------------------------------------------
-  // overlayInputForward
-  //
-  // Forwards keyboard AND mouse WM_* messages from the legacy gameWndProc
-  // path to ImGui's Win32 backend. Used when a game menu captures raw input
-  // OR when plugin HUD activity pulls focus away from the overlay window,
-  // either of which causes overlayWndProc to stop receiving direct messages
-  // and the legacy wndProcHandler fallback to be the only delivery path.
-  //
-  // A previous revision of this function forwarded only keyboard messages,
-  // with a comment that mouse was "intentionally not forwarded" because the
-  // overlay's WM_INPUT path already synthesized scaled mouse events. That
-  // assumption fails in the plugin-API case: when the plugin HUD pulls focus,
-  // raw-input delivery to overlayWndProc also stops (the same root cause
-  // that broke keyboard), and mouse events disappear. This function now
-  // forwards both keyboard and mouse, each gated on raw-input (Path B)
-  // recency: Path A only fires when Path B has gone silent, so the two
-  // delivery paths never double-feed ImGui (see the in-case comments).
-  //
-  // Coordinate translation: mouse WM_MOUSEMOVE and WM_{L,R,M,X}BUTTON*
-  // messages carry CLIENT-AREA coordinates in lParam. When the overlay is a
-  // separate HWND from the game window (the common case), we translate game-
-  // client coords to overlay-client coords via ClientToScreen + ScreenToClient
-  // so ImGui hit-tests against the overlay's own geometry. Wheel messages
-  // (WM_MOUSEWHEEL / WM_MOUSEHWHEEL) carry SCREEN coordinates per Windows
-  // convention and are forwarded without translation.
-  //
-  // ACCESS NOTE: this function reads GameOverlay::m_hwnd (private atomic).
-  // A friend declaration for this function is required in GameOverlay.
-  // ---------------------------------------------------------------------------
+  // Forwards keyboard and mouse messages from the game window procedure (Path A) to ImGui's Win32 backend.
+  // It covers the cases where overlayWndProc stops receiving raw input (Path B), such as a game menu
+  // capturing raw input or a plugin HUD pulling focus. Every message is dropped while raw input is
+  // recent, so the two paths never feed ImGui twice.
+  // Mouse button and move messages carry game-client coordinates, which are translated to overlay-client
+  // coordinates when the overlay has its own HWND. Wheel messages carry screen coordinates.
   void overlayInputForward(
       GameOverlay& overlay, HWND gameHwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     HWND overlayHwnd = overlay.m_hwnd.load();
     HWND targetHwnd = overlayHwnd ? overlayHwnd : gameHwnd;
 
     switch (msg) {
-    // Keyboard: gated on Path B liveness, same as mouse below.
-    //
-    // Path B is NOT mouse-only — the fork's ImGui Win32 backend handles
-    // WM_INPUT for RIM_TYPEKEYBOARD too (imgui_impl_win32.cpp), feeding both
-    // key events AND text (ToUnicodeEx -> AddInputCharacterUTF16) straight to
-    // ImGui. overlayWndProc's WM_INPUT case falls through to that backend for
-    // any non-mouse raw packet, so keyboard reaches ImGui via Path B exactly
-    // as mouse does. RIDEV_NOLEGACY on the keyboard device only suppresses the
-    // overlay's *legacy* WM_KEY* messages; it does nothing about the raw path.
-    //
-    // So Path A (this block, the game wnd proc fallback) and Path B both
-    // deliver every keypress and character — producing doubled keys / doubled
-    // text ("dual keyboard input"), the keyboard analogue of the dual-cursor
-    // bug fixed in bf6e6851. The bf6e6851 note that "keyboard is Path A only"
-    // was wrong: it accounted for the legacy path but not the raw one.
-    //
-    // The gate is identical to the mouse gate: only forward via Path A when
-    // raw input has been silent for longer than kRawInputRecencyMs (~100ms).
-    // Normal case: Path B fires concurrently, recency is fresh, Path A skips.
-    // Plugin-HUD-pulls-focus case: Path B goes silent, recency lapses, Path A
-    // picks up — preserving the legacy keyboard fallback (commit ba358314).
+    // Keyboard, gated like the mouse below. Path B also delivers keyboard input: the ImGui Win32 backend
+    // handles WM_INPUT for RIM_TYPEKEYBOARD (keys and text), and RIDEV_NOLEGACY only suppresses the
+    // overlay's legacy WM_KEY* messages. Forwarding while raw input is recent would double every key.
     case WM_KEYDOWN:
     case WM_KEYUP:
     case WM_SYSKEYDOWN:
@@ -125,24 +69,10 @@ namespace fork_hooks {
       ImGui_ImplWin32_WndProcHandler(targetHwnd, msg, wParam, lParam);
       break;
 
-    // Mouse motion + buttons + wheels: gated on Path B liveness.
-    //
-    // Path B (raw input via overlayWndProc::WM_INPUT) is the primary mouse
-    // delivery path and uses imgui-display-space coords (scaled by the
-    // overlay-client/imgui-DisplaySize ratio). Path A (this block, the game
-    // wnd proc fallback) uses unscaled overlay-client coords. When both
-    // fire concurrently they fight for io.MousePos and produce a visible
-    // dual-cursor jitter (the imgui software cursor alternates between
-    // Path A and Path B positions frame-to-frame).
-    //
-    // The gate: only forward via Path A when raw input has been silent for
-    // longer than kRawInputRecencyMs (~100ms). Path B stamps its recency on
-    // every WM_INPUT it receives (see rtx_overlay_window.cpp:WM_INPUT). In
-    // the normal case Path B fires concurrently with Path A on every real
-    // input event, so isRawInputRecent() is always true and Path A skips.
-    // In the plugin-HUD-pulls-focus case Path B goes silent, recency lapses,
-    // and Path A picks up — preserving the original behavior of commit
-    // 3c8fac75 (forward mouse on legacy wnd proc fallback).
+    // Mouse motion and buttons. Path B uses ImGui display-space coordinates and Path A unscaled
+    // overlay-client ones, so both at once would make the cursor jitter between two positions.
+    // Path B stamps its recency on every WM_INPUT, and Path A forwards only after kRawInputRecencyMs
+    // (100 ms) without one.
     case WM_MOUSEMOVE:
     case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
     case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
@@ -177,78 +107,64 @@ namespace fork_hooks {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // dispatchScreenOverlay
-  //
-  // Alpha-composites a plugin-uploaded RGBA pixel buffer over the final
-  // tone-mapped output image using the ScreenOverlayShader compute shader.
-  // Called from RtxContext::dispatchScreenOverlay (which is now a one-line
-  // delegate) after tone mapping and before screenshot capture.
-  //
-  // If no overlay has been queued this frame (m_pendingScreenOverlay is
-  // empty), returns immediately with no GPU work.
-  //
-  // The overlay GPU image is recreated whenever dimensions or format change;
-  // the staging buffer is copied in via copyBufferToImage each frame.
-  //
-  // ACCESS NOTE: reads and writes multiple private members of RtxContext:
-  // m_pendingScreenOverlay, m_screenOverlayImage, m_screenOverlayView,
-  // m_screenOverlayWidth, m_screenOverlayHeight, m_screenOverlayFormat,
-  // and m_device. A friend declaration for this function is required in
-  // RtxContext (see rtx_context.h).
-  // ---------------------------------------------------------------------------
+  // Alpha-composites the host overlays over the final tone-mapped output image: first the CPU pixel buffer
+  // from remixapi_DrawScreenOverlay (if one was queued this frame), then the GPU layers from
+  // remixapi_DrawScreenOverlayD3D11, bottom-first. Runs after tone mapping and before screenshot capture.
+  // The CPU overlay image is recreated when its size or format changes. The GPU layers were copied into
+  // their slot images when they were set, and persist until the host replaces or clears them.
   void dispatchScreenOverlay(RtxContext& ctx, Resources::RaytracingOutput& rtOutput) {
-    if (!ctx.m_pendingScreenOverlay.has_value()) {
+    if (!ctx.m_pendingScreenOverlay.has_value() && ctx.m_gpuScreenOverlayCount == 0) {
       return;
     }
 
     ScopedGpuProfileZone(&ctx, "Screen Overlay");
-    auto& overlay = *ctx.m_pendingScreenOverlay;
 
-    // Recreate overlay image if dimensions or format changed.
-    if (ctx.m_screenOverlayWidth  != overlay.width
-     || ctx.m_screenOverlayHeight != overlay.height
-     || ctx.m_screenOverlayFormat != overlay.format
-     || !ctx.m_screenOverlayImage.ptr()) {
-      DxvkImageCreateInfo imageInfo = {};
-      imageInfo.type        = VK_IMAGE_TYPE_2D;
-      imageInfo.format      = overlay.format;
-      imageInfo.flags       = 0;
-      imageInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
-      imageInfo.extent      = { overlay.width, overlay.height, 1 };
-      imageInfo.numLayers   = 1;
-      imageInfo.mipLevels   = 1;
-      imageInfo.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-      imageInfo.stages      = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-      imageInfo.access      = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-      imageInfo.tiling      = VK_IMAGE_TILING_OPTIMAL;
-      imageInfo.layout      = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (ctx.m_pendingScreenOverlay.has_value()) {
+      auto& overlay = *ctx.m_pendingScreenOverlay;
 
-      ctx.m_screenOverlayImage = ctx.m_device->createImage(
-        imageInfo,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        DxvkMemoryStats::Category::RTXRenderTarget,
-        "Screen overlay image");
+      // Recreate overlay image if dimensions or format changed.
+      if (ctx.m_screenOverlayWidth  != overlay.width
+       || ctx.m_screenOverlayHeight != overlay.height
+       || ctx.m_screenOverlayFormat != overlay.format
+       || !ctx.m_screenOverlayImage.ptr()) {
+        DxvkImageCreateInfo imageInfo = {};
+        imageInfo.type        = VK_IMAGE_TYPE_2D;
+        imageInfo.format      = overlay.format;
+        imageInfo.flags       = 0;
+        imageInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.extent      = { overlay.width, overlay.height, 1 };
+        imageInfo.numLayers   = 1;
+        imageInfo.mipLevels   = 1;
+        imageInfo.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        imageInfo.stages      = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        imageInfo.access      = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        imageInfo.tiling      = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.layout      = VK_IMAGE_LAYOUT_UNDEFINED;
 
-      DxvkImageViewCreateInfo viewInfo = {};
-      viewInfo.type      = VK_IMAGE_VIEW_TYPE_2D;
-      viewInfo.format    = overlay.format;
-      viewInfo.usage     = VK_IMAGE_USAGE_SAMPLED_BIT;
-      viewInfo.aspect    = VK_IMAGE_ASPECT_COLOR_BIT;
-      viewInfo.minLevel  = 0;
-      viewInfo.numLevels = 1;
-      viewInfo.minLayer  = 0;
-      viewInfo.numLayers = 1;
+        ctx.m_screenOverlayImage = ctx.m_device->createImage(
+          imageInfo,
+          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+          DxvkMemoryStats::Category::RTXRenderTarget,
+          "Screen overlay image");
 
-      ctx.m_screenOverlayView = ctx.m_device->createImageView(ctx.m_screenOverlayImage, viewInfo);
+        DxvkImageViewCreateInfo viewInfo = {};
+        viewInfo.type      = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format    = overlay.format;
+        viewInfo.usage     = VK_IMAGE_USAGE_SAMPLED_BIT;
+        viewInfo.aspect    = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.minLevel  = 0;
+        viewInfo.numLevels = 1;
+        viewInfo.minLayer  = 0;
+        viewInfo.numLayers = 1;
 
-      ctx.m_screenOverlayWidth  = overlay.width;
-      ctx.m_screenOverlayHeight = overlay.height;
-      ctx.m_screenOverlayFormat = overlay.format;
-    }
+        ctx.m_screenOverlayView = ctx.m_device->createImageView(ctx.m_screenOverlayImage, viewInfo);
 
-    // Copy staging buffer to overlay image
-    {
+        ctx.m_screenOverlayWidth  = overlay.width;
+        ctx.m_screenOverlayHeight = overlay.height;
+        ctx.m_screenOverlayFormat = overlay.format;
+      }
+
+      // Copy staging buffer to overlay image
       VkImageSubresourceLayers subresource = {};
       subresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
       subresource.mipLevel       = 0;
@@ -262,65 +178,135 @@ namespace fork_hooks {
                             overlay.stagingBuffer, 0, 0, 0);
     }
 
-    // Dispatch overlay blend compute shader
+    // Dispatch overlay blend compute shader, once per layer.
     ctx.setPushConstantBank(DxvkPushConstantBank::RTX);
 
     auto& finalOutput         = rtOutput.m_finalOutput.resource(Resources::AccessType::ReadWrite);
     const VkExtent3D outputSize = finalOutput.image->info().extent;
     const VkExtent3D workgroups = util::computeBlockCount(
       outputSize, VkExtent3D { SCREEN_OVERLAY_TILE_SIZE, SCREEN_OVERLAY_TILE_SIZE, 1 });
+    const Rc<DxvkSampler> sampler = ctx.getResourceManager().getSampler(
+      VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
 
-    ScreenOverlayArgs pushArgs = {};
-    pushArgs.imageSize = { outputSize.width, outputSize.height };
-    pushArgs.opacity   = overlay.opacity;
-    ctx.pushConstants(0, sizeof(pushArgs), &pushArgs);
+    auto blend = [&](const Rc<DxvkImageView>& view, float opacity, uint32_t flags, const float* rect, float alphaCutoff) {
+      ScreenOverlayArgs pushArgs = {};
+      pushArgs.imageSize = { outputSize.width, outputSize.height };
+      pushArgs.opacity   = opacity;
+      pushArgs.flags     = flags;
+      pushArgs.rectX     = rect[0];
+      pushArgs.rectY     = rect[1];
+      pushArgs.rectW     = rect[2];
+      pushArgs.rectH     = rect[3];
+      pushArgs.alphaCutoff = alphaCutoff;
+      ctx.pushConstants(0, sizeof(pushArgs), &pushArgs);
 
-    ctx.bindResourceView(SCREEN_OVERLAY_INPUT_OUTPUT, finalOutput.view, nullptr);
-    ctx.bindResourceView(SCREEN_OVERLAY_TEXTURE, ctx.m_screenOverlayView, nullptr);
-    ctx.bindResourceSampler(SCREEN_OVERLAY_TEXTURE,
-      ctx.getResourceManager().getSampler(
-        VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE));
+      ctx.bindResourceView(SCREEN_OVERLAY_INPUT_OUTPUT, finalOutput.view, nullptr);
+      ctx.bindResourceView(SCREEN_OVERLAY_TEXTURE, view, nullptr);
+      ctx.bindResourceSampler(SCREEN_OVERLAY_TEXTURE, sampler);
 
-    ctx.bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ScreenOverlayShader::getShader());
-    ctx.dispatch(workgroups.width, workgroups.height, workgroups.depth);
+      ctx.bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ScreenOverlayShader::getShader());
+      ctx.dispatch(workgroups.width, workgroups.height, workgroups.depth);
+    };
 
-    // Clear pending overlay after dispatch
-    ctx.m_pendingScreenOverlay.reset();
+    if (ctx.m_pendingScreenOverlay.has_value()) {
+      static const float kFullRect[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+      blend(ctx.m_screenOverlayView, ctx.m_pendingScreenOverlay->opacity, 0, kFullRect, 0.0f);
+      // Clear pending overlay after dispatch
+      ctx.m_pendingScreenOverlay.reset();
+    }
+
+    for (uint32_t i = 0; i < ctx.m_gpuScreenOverlayCount; ++i) {
+      const auto& slot = ctx.m_gpuScreenOverlay[i];
+      if (slot.view != nullptr) {
+        blend(slot.view, slot.opacity, slot.flags, slot.rect, slot.alphaCutoff);
+      }
+    }
   }
 
-  // ---------------------------------------------------------------------------
-  // imguiContextPin
-  //
-  // Pins the ImGui and ImPlot thread-local context pointers to the dev menu's
-  // private contexts at wndProcHandler entry. Plugin-side rendering on other
-  // threads can drift GImGui off the dev menu's context between frames;
-  // without this pin, keyboard input is written into the wrong (or null)
-  // context and the dev menu stops seeing keypresses (pressing Alt+X produces
-  // a Windows "ding" rather than toggling the menu).
-  //
-  // Matches the pattern used in ImGUI's ctor, dtor, and render().
-  //
-  // No private-member access — the call site passes m_context and m_plotContext
-  // directly. No friend declaration needed.
-  // ---------------------------------------------------------------------------
+  // Pins the ImGui and ImPlot context pointers to the dev menu's contexts at wndProcHandler entry.
+  // Plugin-side rendering on other threads can move GImGui off the dev menu's context between frames,
+  // and keyboard input would then go to the wrong (or null) context.
   void imguiContextPin(ImGuiContext* ctx, ImPlotContext* plotCtx) {
     ImGui::SetCurrentContext(ctx);
     ImPlot::SetCurrentContext(plotCtx);
   }
 
-  // ---------------------------------------------------------------------------
-  // wrapperTabDraw
-  //
-  // Invokes the registered plugin ImGui draw callback for the Plugin tab in
-  // the dev menu. Called from the kTab_Wrapper switch case in
-  // ImGUI::showMainMenu when the Plugin tab is selected.
-  //
-  // No private-member access — delegates to remixapi_imgui_InvokeDrawCallback.
-  // No friend declaration needed.
-  // ---------------------------------------------------------------------------
+  // Invokes the registered plugin ImGui draw callback for the dev menu's Plugin tab (kTab_Wrapper).
   void wrapperTabDraw() {
     remixapi_imgui_InvokeDrawCallback();
   }
 
 } // namespace fork_hooks
+
+  // Runs on the command-stream thread (queued by remixapi_DrawScreenOverlayD3D11), so each copy is recorded
+  // after every draw the host issued to the source before the call. A slot's image is only recreated when
+  // the source's size or format changes.
+  void RtxContext::setGpuScreenOverlayLayers(std::vector<GpuScreenOverlaySource>&& layers) {
+    const uint32_t count = std::min<uint32_t>(
+      static_cast<uint32_t>(layers.size()), kMaxGpuScreenOverlayLayers);
+
+    if (count == 0) {
+      for (auto& slot : m_gpuScreenOverlay) {
+        slot = GpuScreenOverlaySlot {};
+      }
+      m_gpuScreenOverlayCount = 0;
+      return;
+    }
+
+    for (uint32_t i = 0; i < count; ++i) {
+      const auto& source = layers[i];
+      auto& slot = m_gpuScreenOverlay[i];
+      const VkFormat format = source.image->info().format;
+      const VkExtent3D extent = source.image->mipLevelExtent(0);
+
+      if (slot.image == nullptr
+       || slot.image->info().format != format
+       || slot.image->info().extent.width != extent.width
+       || slot.image->info().extent.height != extent.height) {
+        DxvkImageCreateInfo imageInfo = {};
+        imageInfo.type        = VK_IMAGE_TYPE_2D;
+        imageInfo.format      = format;
+        imageInfo.flags       = 0;
+        imageInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.extent      = { extent.width, extent.height, 1 };
+        imageInfo.numLayers   = 1;
+        imageInfo.mipLevels   = 1;
+        imageInfo.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        imageInfo.stages      = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        imageInfo.access      = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        imageInfo.tiling      = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.layout      = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        slot.image = m_device->createImage(
+          imageInfo,
+          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+          DxvkMemoryStats::Category::RTXRenderTarget,
+          "Screen overlay GPU layer");
+
+        DxvkImageViewCreateInfo viewInfo = {};
+        viewInfo.type      = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format    = format;
+        viewInfo.usage     = VK_IMAGE_USAGE_SAMPLED_BIT;
+        viewInfo.aspect    = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.minLevel  = 0;
+        viewInfo.numLevels = 1;
+        viewInfo.minLayer  = 0;
+        viewInfo.numLayers = 1;
+
+        slot.view = m_device->createImageView(slot.image, viewInfo);
+      }
+
+      const VkImageSubresourceLayers mip0 = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+      copyImage(slot.image, mip0, VkOffset3D { 0, 0, 0 },
+                source.image, mip0, VkOffset3D { 0, 0, 0 },
+                VkExtent3D { extent.width, extent.height, 1 });
+
+      slot.flags   = source.flags;
+      slot.opacity = source.opacity;
+      slot.alphaCutoff = source.alphaCutoff;
+      std::copy(std::begin(source.rect), std::end(source.rect), std::begin(slot.rect));
+    }
+    m_gpuScreenOverlayCount = count;
+  }
+
 } // namespace dxvk

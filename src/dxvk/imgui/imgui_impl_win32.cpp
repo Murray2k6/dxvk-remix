@@ -236,7 +236,7 @@ static bool ImGui_ImplWin32_UpdateMouseCursor()
 
 static bool IsVkDown(int vk)
 {
-    return (::GetAsyncKeyState(vk) & 0x8000) != 0;
+    return (::GetKeyState(vk) & 0x8000) != 0;
 }
 
 void ImGui_ImplWin32_AddKeyEvent(ImGuiKey key, bool down, int native_keycode, int native_scancode = -1)
@@ -753,6 +753,12 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
             // Submit key event
             const ImGuiKey key = ImGui_ImplWin32_VirtualKeyToImGuiKey(vk);
             const int scancode = (int)LOBYTE(HIWORD(lParam));
+
+            // Windows sends only the key up event for Print Screen, so a key down is submitted before it.
+            // The input queue applies the two in separate frames, so the press is still seen.
+            if (key == ImGuiKey_PrintScreen && !is_key_down)
+                ImGui_ImplWin32_AddKeyEvent(key, true, vk, scancode);
+
             if (key != ImGuiKey_None)
                 ImGui_ImplWin32_AddKeyEvent(key, is_key_down, vk, scancode);
 

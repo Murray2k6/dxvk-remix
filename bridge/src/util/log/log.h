@@ -77,13 +77,16 @@ namespace bridge_util {
     static Logger& get();
     
     LogLevel m_level;
+    // Bytes written so far; past kMaxLogBytes only errors are written.
+    uint64_t m_bytesWritten = 0;
+    bool m_capReached = false;
 
-#ifdef REMIX_BRIDGE_CLIENT
-    void* m_hFile;
-#else
-    std::ofstream m_fileStream;
-#endif
+    // The log file's handle, or null without a log file.
+    void* m_hFile = nullptr;
+
     static void emitPreInitMsgs();
+    // Writes a line from the logger itself, such as the separator above a continued log.
+    void emitNote(const LogLevel level, const std::string& message);
     static void emitMsg(const LogLevel level, const std::string& message);
     void emitLine(const LogLevel level, const std::string& line);
     static std::stringstream formatMessage(const LogLevel level, const std::string& message);

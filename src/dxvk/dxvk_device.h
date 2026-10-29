@@ -51,6 +51,7 @@
 namespace dxvk {
   
   class DxvkInstance;
+  class GpuBreadcrumbs;
 
   /**
    * \brief Device options
@@ -475,6 +476,10 @@ namespace dxvk {
      * and the device is usable.
      */
     void initResources();
+
+    // The half of initResources() every client needs, RTX runtime excluded.
+    // See DxvkAdapter::createDevice's initRtx parameter.
+    void initDummyResources();
     
     /**
      * \brief Registers a shader
@@ -499,17 +504,21 @@ namespace dxvk {
      * \param [in] cachedAcquiredImageIndex The acquired image index to use for presentation at the time of calling.
      * \param [in] presenter The presenter
      * \param [out] status Present status
-     * \param [in] swapchainImage DxvkImageView for the swapchain image being presented
+     * \param [in] isRemixPresent Whether this present advances the Remix frame
      */
     void presentImage(
       std::uint64_t                   cachedReflexFrameId,
       bool                            insertReflexPresentMarkers,
       std::uint32_t                   cachedAcquiredImageIndex,
       const Rc<vk::Presenter>&        presenter,
-            DxvkSubmitStatus*         status
+            DxvkSubmitStatus*         status,
+            bool                      isRemixPresent = true,
+            float                     reflexSleepMs = -1.0f // Trace CSV only
             );
 
-    void incrementPresentCount();
+    // NV-DXVK start: Raster presents must not advance the Remix frame
+    void incrementPresentCount(bool isRemixPresent = true);
+    // NV-DXVK end
 
     // NV-DXVK start: DLFG integration
     /**
@@ -541,6 +550,13 @@ namespace dxvk {
             bool                      insertReflexRenderMarkers = false,
             uint64_t                  cachedReflexFrameId = 0);
     // NV-DXVK end
+
+    // Submits a command list like submitCommandList without semaphores.
+    // The status gets the submission's result once the submission thread has submitted it to the Vulkan queue.
+    // The caller sets it to VK_NOT_READY first, so waitForSubmission can wait for that.
+    void submitCommandListWithStatus(
+      const Rc<DxvkCommandList>&      commandList,
+            DxvkSubmitStatus*         status);
 
     /**
      * \brief Locks submission queue
@@ -586,6 +602,11 @@ namespace dxvk {
      */
     uint32_t pendingSubmissions() const {
       return m_submissionQueue.pendingSubmissions();
+    }
+
+    // The Remix presents since the last call ([Perf] line).
+    DxvkSubmissionQueue::PresentWindow takePresentWindow() {
+      return m_submissionQueue.takePresentWindow();
     }
 
     /**
@@ -642,6 +663,37 @@ namespace dxvk {
       return &m_objects;
     }
 
+    // Registers a D3D9 device that uses this device's common objects.
+    void addD3D9Device() {
+      std::lock_guard<sync::Spinlock> lock(m_d3d9DeviceLock);
+      ++m_d3d9DeviceCount;
+    }
+
+    // Unregisters a D3D9 device.
+    // Returns true when it was the last one. The caller then destroys the common objects,
+    // and the device is retired so that no new frontend reuses it.
+    bool removeD3D9Device() {
+      std::lock_guard<sync::Spinlock> lock(m_d3d9DeviceLock);
+      if (m_d3d9DeviceCount > 0) {
+        --m_d3d9DeviceCount;
+      }
+      if (m_d3d9DeviceCount > 0) {
+        return false;
+      }
+      m_retired = true;
+      return true;
+    }
+
+    // Returns true once the last D3D9 device on this device has destroyed the common objects.
+    bool isRetired() const {
+      return m_retired.load();
+    }
+
+    // Returns the device-loss diagnostics, or nullptr when the device has neither extension.
+    GpuBreadcrumbs* gpuBreadcrumbs() const {
+      return m_gpuBreadcrumbs.get();
+    }
+
     // NV-DXVK start: DLFG integration
     // release the current presenter stashed in the device
     void synchronizePresenter() {
@@ -668,14 +720,24 @@ namespace dxvk {
     DxvkDevicePerfHints         m_perfHints;
     DxvkObjects                 m_objects;
 
+    sync::Spinlock              m_d3d9DeviceLock;
+    uint32_t                    m_d3d9DeviceCount = 0;
+    std::atomic<bool>           m_retired = { false };
+
     sync::Spinlock              m_statLock;
     DxvkStatCounters            m_statCounters;
+    // NV-DXVK start: Independent Remix frame clock on a shared device
+    std::atomic<uint32_t>       m_remixFrameId { 0 };
+    // NV-DXVK end
     
     DxvkDeviceQueueSet          m_queues;
     
     DxvkRecycler<DxvkCommandList,    16> m_recycledCommandLists;
     DxvkRecycler<DxvkDescriptorPool, 16> m_recycledDescriptorPools;
-    
+
+    // Declared before the submission queue so it outlives the queue's threads.
+    std::unique_ptr<GpuBreadcrumbs> m_gpuBreadcrumbs;
+
     DxvkSubmissionQueue m_submissionQueue;
 
     DxvkDevicePerfHints getPerfHints();
@@ -691,5 +753,11 @@ namespace dxvk {
             uint32_t                index) const;
     
   };
+
+  // NV-DXVK start: Remix native device access
+  // Non-owning. D3D9DeviceEx::m_dxvkDevice owns the device while published.
+  // Callers must serialize registration, queries, and shutdown.
+  extern DxvkDevice* g_dxvkDeviceNative;
+  // NV-DXVK end
   
 }

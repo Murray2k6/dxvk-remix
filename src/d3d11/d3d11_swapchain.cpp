@@ -2,7 +2,69 @@
 #include "d3d11_device.h"
 #include "d3d11_swapchain.h"
 
+#include "../dxvk/dxvk_perf_counters.h"
+
+#include <mutex>
+#include <unordered_map>
+
 namespace dxvk {
+
+  // NV-DXVK start: developer-menu input on the native D3D11 host.
+  // The Remix menu's input sink (GameOverlay) is driven by the game window's
+  // messages: activation shows it over the game, and mouse/keyboard messages
+  // are forwarded to ImGui. The D3D9 swapchain gets them by subclassing the
+  // window; this does the same for the window a D3D11 swapchain presents
+  // Remix into. Messages always continue to the game's own procedure.
+  namespace {
+    struct RemixWindowHook {
+      WNDPROC          original = nullptr;
+      Rc<DxvkDevice>   device;
+      const void*      owner = nullptr;
+    };
+    std::mutex g_remixWindowHookMutex;
+    std::unordered_map<HWND, RemixWindowHook> g_remixWindowHooks;
+
+    LRESULT CALLBACK RemixD3D11WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+      RemixWindowHook hook;
+      {
+        std::lock_guard lock(g_remixWindowHookMutex);
+        auto it = g_remixWindowHooks.find(window);
+        if (it == g_remixWindowHooks.end())
+          return DefWindowProcW(window, message, wParam, lParam);
+        hook = it->second;
+      }
+      auto& gui = hook.device->getCommon()->getImgui();
+      if (gui.isInit())
+        gui.wndProcHandler(window, message, wParam, lParam);
+      return CallWindowProcW(hook.original, window, message, wParam, lParam);
+    }
+
+    void InstallRemixWindowHook(HWND window, const Rc<DxvkDevice>& device, const void* owner) {
+      std::lock_guard lock(g_remixWindowHookMutex);
+      if (!window || g_remixWindowHooks.count(window))
+        return;
+      auto original = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrW(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&RemixD3D11WindowProc)));
+      if (!original)
+        return;
+      g_remixWindowHooks[window] = { original, device, owner };
+      Logger::info("D3D11: Remix developer-menu input hooked on the presenting window");
+    }
+
+    void RemoveRemixWindowHook(HWND window, const void* owner) {
+      std::lock_guard lock(g_remixWindowHookMutex);
+      auto it = g_remixWindowHooks.find(window);
+      if (it == g_remixWindowHooks.end() || it->second.owner != owner)
+        return;
+      // Only unhook if nobody subclassed on top of us; otherwise stay in the
+      // chain (the map entry keeps forwarding to the original procedure).
+      if (reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window, GWLP_WNDPROC)) == &RemixD3D11WindowProc) {
+        SetWindowLongPtrW(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(it->second.original));
+        g_remixWindowHooks.erase(it);
+      }
+    }
+  }
+  // NV-DXVK end
 
   static uint16_t MapGammaControlPoint(float x) {
     if (x < 0.0f) x = 0.0f;
@@ -35,6 +97,7 @@ namespace dxvk {
 
 
   D3D11SwapChain::~D3D11SwapChain() {
+    RemoveRemixWindowHook(m_window, this);
     m_device->waitForSubmission(&m_presentStatus);
     m_device->waitForIdle();
     
@@ -262,6 +325,25 @@ namespace dxvk {
 
     // Flush pending rendering commands before
     auto immediateContext = static_cast<D3D11ImmediateContext*>(deviceContext.ptr());
+    // NV-DXVK start: End the selected host frame before submitting it
+    m_remixPresent = immediateContext->FinishRemixFrame(
+      m_swapImageView->image(), m_remixFrameId);
+    if (m_remixPresent && !m_remixWindowHooked) {
+      InstallRemixWindowHook(m_window, m_device, this);
+      m_remixWindowHooked = true;
+    }
+    // NV-DXVK end
+    // The rtx.reflexD3D11Markers value is latched once per present so the sleep, the
+    // simulation start and the present markers of one frame agree. Only the Remix output swapchain
+    // drives Reflex; other swapchains the game owns never sleep or mark.
+    m_reflexMarkers = m_remixPresent && RtxOptions::reflexD3D11Markers();
+    if (!RtxOptions::reflexD3D11Markers()) {
+      m_lastReflexSleepMs = -1.0f;
+    }
+    if (m_reflexMarkers) {
+      // As on D3D9: cheap, and keeps latency pings on whichever thread is presenting.
+      m_device->getCommon()->metaReflex().setLatencyPingThread();
+    }
     immediateContext->Flush();
 
     // Bump our frame id.
@@ -305,14 +387,50 @@ namespace dxvk {
 
       if (m_hud != nullptr)
         m_hud->render(m_context, info.format, info.imageExtent);
-      
+
+      // NV-DXVK start: the Remix developer menu draws over the frame that
+      // Remix rendered, as the D3D9 swapchain does. Other swapchains (the
+      // game may own several) never show it.
+      if (m_remixPresent) {
+        auto& gui = m_device->getCommon()->getImgui();
+        gui.render(m_context, info.imageExtent);
+        // The input overlay only shows on window activation, and the game
+        // is normally active before the first menu frame creates it; replay
+        // the activation once the overlay exists.
+        if (!m_remixOverlayPrimed && gui.isInit() && GetForegroundWindow() == m_window) {
+          gui.wndProcHandler(m_window, WM_ACTIVATEAPP, TRUE, 0);
+          m_remixOverlayPrimed = true;
+        }
+      }
+      // NV-DXVK end
+
       if (i + 1 >= SyncInterval)
         m_context->signal(m_frameLatencySignal, m_frameId);
 
-      SubmitPresent(immediateContext, sync, i);
+      SubmitPresent(immediateContext, sync, i, imageIndex);
     }
 
     SyncFrameLatency();
+
+    // The D3D9 swapchain's end-of-Present Reflex block. Sleeping before Present
+    // returns delays the game's next input sample / simulation start by what Reflex asks for. FinishRemixFrame
+    // already advanced the frame id, so the id read here is the next frame's, which injectRTX, endFrame and
+    // the present of that frame will carry.
+    auto& reflex = m_device->getCommon()->metaReflex();
+
+    if (m_reflexMarkers) {
+      const uint64_t sleepStartNs = perf::nowNs();
+      reflex.sleep();
+      m_lastReflexSleepMs = float(double(perf::nowNs() - sleepStartNs) * 1e-6);
+    }
+
+    reflex.limitFrameRate(m_reflexMarkers);
+
+    if (m_reflexMarkers) {
+      const uint64_t nextReflexFrameId = immediateContext->GetRemixFrameId();
+      reflex.beginSimulation(nextReflexFrameId);
+      reflex.latencyPing(nextReflexFrameId);
+    }
     return S_OK;
   }
 
@@ -320,26 +438,61 @@ namespace dxvk {
   void D3D11SwapChain::SubmitPresent(
           D3D11ImmediateContext*  pContext,
     const vk::PresenterSync&      Sync,
-          uint32_t                FrameId) {
+          uint32_t                FrameId,
+          uint32_t                AcquiredImageIndex) {
     auto lock = pContext->LockContext();
 
     // Present from CS thread so that we don't
     // have to synchronize with it first.
     m_presentStatus.result = VK_NOT_READY;
 
+    // The frame rate limit spaces the presents where the CS thread queues them, after the frame's rendering is submitted.
+    const uint32_t presentFrameRateLimit = m_remixPresent && FrameId == 0 ? m_device->getCommon()->metaReflex().presentFrameRateLimit() : 0u;
+
     pContext->EmitCs([this,
-      cFrameId     = FrameId,
-      cSync        = Sync,
-      cHud         = m_hud,
-      cCommandList = m_context->endRecording()
+      cPresentFrameRateLimit = presentFrameRateLimit,
+      cPacePresent = m_remixPresent && FrameId == 0,
+      // NV-DXVK start: Secondary and repeated presents do not advance Remix
+      cRemixPresent = m_remixPresent && FrameId == 0,
+      cRemixFrameId = m_remixFrameId,
+      // NV-DXVK end
+      // One PRESENT_START/END pair per Remix frame (not per SyncInterval repeat)
+      cReflexPresentMarkers = m_reflexMarkers && m_remixPresent && FrameId == 0,
+      cReflexSleepMs = m_remixPresent ? m_lastReflexSleepMs : -1.0f,
+      cFrameId      = FrameId,
+      cSync         = Sync,
+      cHud          = m_hud,
+      cImageIndex   = AcquiredImageIndex,
+      cCommandList  = m_context->endRecording()
     ] (DxvkContext* ctx) {
+      if (cPacePresent) {
+        m_device->getCommon()->metaReflex().pacePresent(cPresentFrameRateLimit);
+      }
+
       m_device->submitCommandList(cCommandList,
         cSync.acquire, cSync.present);
 
+      // NV-DXVK start: fix HUD FPS/frame-time blowup on the D3D11 host path
+      // m_frameId is the swapchain's cumulative, ever-growing present
+      // counter (also used for frame-latency fencing), not a per-call delta.
+      // HudFpsItem::update() treats its argument as "how many real frames
+      // were presented since the last update call" and accumulates it, so
+      // passing the absolute frame id here made the reported frame count
+      // (and thus FPS) grow without bound while frame time collapsed to
+      // ~0. This path has no DLFG frame generation, so exactly one real
+      // frame is presented per call, matching the D3D9 host's non-DLFG
+      // path (see D3D9SwapChainEx::SubmitPresent's `cHud->update(1)`).
       if (cHud != nullptr && !cFrameId)
-        cHud->update();
+        cHud->update(1);
+      // NV-DXVK end
 
-      m_device->presentImage(m_presenter, &m_presentStatus);
+      // The Reflex frame id is the Remix frame id (the same one injectRTX tagged its render submit
+      // with). Present markers are placed by the submission queue around vkQueuePresentKHR only when
+      // rtx.reflexD3D11Markers is on; this presenter is never the DLFG one, so no presenter emits its own.
+      // NV-DXVK start: Do not advance Remix while its CS thread is rendering
+      m_device->presentImage(cRemixFrameId, cReflexPresentMarkers, cImageIndex, m_presenter, &m_presentStatus, cRemixPresent,
+        cReflexSleepMs);
+      // NV-DXVK end
     });
 
     pContext->FlushCsChunk();
@@ -350,8 +503,10 @@ namespace dxvk {
     // Recreate swap chain if the previous present call failed
     VkResult status = m_device->waitForSubmission(&m_presentStatus);
     
-    if (status != VK_SUCCESS)
+    if (status != VK_SUCCESS) {
+      Logger::info(str::format("D3D11SwapChain: Present returned ", status, ", recreating the swap chain"));
       RecreateSwapChain(m_vsync);
+    }
   }
 
 
@@ -369,8 +524,21 @@ namespace dxvk {
     presenterDesc.numPresentModes = PickPresentModes(Vsync, presenterDesc.presentModes);
     presenterDesc.fullScreenExclusive = PickFullscreenMode();
 
-    if (m_presenter->recreateSwapChain(presenterDesc) != VK_SUCCESS)
+    VkResult vr = m_presenter->recreateSwapChain(presenterDesc);
+
+    // Swap chain images come from the same heap as Remix's allocator chunks. Empty
+    // chunks are returned to the driver before one more attempt.
+    if (vr != VK_SUCCESS) {
+      Logger::err(str::format("D3D11SwapChain: Recreating the swap chain failed with ", vr,
+                              ", retrying after releasing empty memory chunks"));
+      m_device->getCommon()->memoryManager().freeUnusedChunks();
+      vr = m_presenter->recreateSwapChain(presenterDesc);
+    }
+
+    if (vr != VK_SUCCESS) {
+      Logger::err(str::format("D3D11SwapChain: Failed to recreate swap chain: ", vr));
       throw DxvkError("D3D11SwapChain: Failed to recreate swap chain");
+    }
     
     CreateRenderTargetViews();
   }
@@ -392,6 +560,8 @@ namespace dxvk {
     presenterDevice.queue         = graphicsQueue.queueHandle;
     presenterDevice.adapter       = m_device->adapter()->handle();
     presenterDevice.features.fullScreenExclusive = m_device->extensions().extFullScreenExclusive;
+    // Used by rtx.present.presentWaitPacing (ids are attached only while it is on).
+    presenterDevice.features.presentWait = m_device->extensions().khrPresentId && m_device->extensions().khrPresentWait;
 
     vk::PresenterDesc presenterDesc;
     presenterDesc.imageExtent     = { m_desc.Width, m_desc.Height };
@@ -565,7 +735,26 @@ namespace dxvk {
 
   void D3D11SwapChain::SyncFrameLatency() {
     // Wait for the sync event so that we respect the maximum frame latency
+    // NV-DXVK start: [PerfCpu] frame-latency wait time, [GpuStall] on a long wait
+    // Logs which frame latency is in effect (and whether dxgi.maxFrameLatency applied).
+    if (const uint32_t latency = GetActualFrameLatency(); latency != m_loggedFrameLatency) {
+      m_loggedFrameLatency = latency;
+      UINT deviceLatency = 0;
+      m_dxgiDevice->GetMaximumFrameLatency(&deviceLatency);
+      Logger::info(str::format("[PresentPacing] D3D11 swapchain frame latency now ", latency,
+        " (swapchain value ", m_frameLatency, ", device value ", deviceLatency,
+        (m_desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) ? ", waitable swapchain" : ", device value used",
+        ", dxgi.maxFrameLatency cap ", m_frameLatencyCap, ", buffer count ", m_desc.BufferCount, ")"));
+    }
+    const uint64_t latencyWaitStart = perf::nowNs();
     m_frameLatencySignal->wait(m_frameId - GetActualFrameLatency());
+    const uint64_t latencyWaitNs = perf::nowNs() - latencyWaitStart;
+    if (perf::recordLatencyWait(latencyWaitNs)) {
+      Logger::warn(str::format("[GpuStall] D3D11 present frame-latency wait took ", latencyWaitNs / 1000000ull,
+        " ms (swapchain frame ", m_frameId, ", max latency ", GetActualFrameLatency(),
+        "): the GPU has not finished the frame from ", GetActualFrameLatency(), " presents ago"));
+    }
+    // NV-DXVK end
 
     if (m_frameLatencyEvent) {
       m_frameLatencySignal->setCallback(m_frameId, [cFrameLatencyEvent = m_frameLatencyEvent] () {

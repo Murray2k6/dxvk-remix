@@ -7,6 +7,7 @@
 #include "../dxvk/dxvk_device.h"
 
 #include "../util/util_bit.h"
+#include "../frontends/translator/resource_stamp.h"
 
 namespace dxvk {
 
@@ -476,6 +477,9 @@ namespace dxvk {
         ? m_seqs[Subresource]
         : 0ull;
     }
+
+    // D3D9 v2: never-reused object id. Draws key the texture by (id, image hash).
+    uint64_t remixResourceId = translator::nextStamp();
 
   private:
 

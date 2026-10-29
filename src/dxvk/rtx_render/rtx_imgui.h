@@ -92,6 +92,9 @@ namespace RemixGui {
   IMGUI_API void TextCentered(const char* fmt, ...);
   IMGUI_API void TextWrappedCentered(const char* fmt, ...);
   IMGUI_API bool Checkbox(const char* label, dxvk::RtxOption<bool>* rtxOption);
+  // Label-less variant for compact inline rows, with the same option plumbing and tooltip.
+  // It skips RtxOptionUxWrapper, whose hover background and reset lane need a full-width row.
+  IMGUI_API bool CheckboxNoLabel(const char* id, dxvk::RtxOption<bool>* rtxOption, float boxScale = .9f);
   IMGUI_API bool ListBox(const char* label, int* current_item, const std::pair<const char*, const char*> items[], int items_count, int height_in_items = -1);
   IMGUI_API bool ListBox(const char* label, int* current_item, bool (*items_getter)(void* data, int idx, const char** out_text, const char** out_tooltip), void* data, int items_count, int height_in_items = -1);
 
@@ -210,7 +213,7 @@ namespace RemixGui {
 
   template <typename T, std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>, bool> = true, typename ... Args>
   IMGUI_API bool SliderInt(const char* label, dxvk::RtxOption<T>* rtxOption, Args&& ... args) {
-    IMGUI_RTXOPTION_WIDGET(RemixGui::SliderInt(label, (int*)&value, std::forward<Args>(args)...))
+    IMGUI_RTXOPTION_WIDGET(SliderInt(label, &value, std::forward<Args>(args)...))
   }
 
   
@@ -345,6 +348,10 @@ namespace RemixGui {
 
     return changed;
   }
+
+  // Edits a key combination as comma-separated key names (as in rtx.conf, e.g. "CTRL, SHIFT, M").
+  // The option is written when Enter is pressed or the box loses focus, and only if every name parses.
+  IMGUI_API bool InputKeyBind(const char* label, dxvk::RtxOption<dxvk::VirtualKeys>* rtxOption);
 
   // Combo Box with unique key per combo entry
   // The combo entries are displayed in the order they appear in ComboEntries

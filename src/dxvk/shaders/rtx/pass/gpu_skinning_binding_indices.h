@@ -56,4 +56,10 @@ struct SkinningArgs {
   uint useIndices;
   uint numBones;
   uint useOctahedralNormals;
+
+  // How many entries of bones hold a transform. The others are not written, and weights on them add nothing.
+  uint boneTransformCount;
+  uint pad0;
+  uint pad1;
+  uint pad2;
 };

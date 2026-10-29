@@ -4,4 +4,5 @@
 
 ## Checklist
 
-- [ ] If this PR touches an upstream file, I updated `docs/fork-touchpoints.md`.
+- [ ] `docs/CHANGELOG.md` updated if this is a major change (see `AGENTS.md`, Changelog).
+- [ ] A new option that trades quality for performance is set by the graphics presets, or the commit says why it is preset-independent (see `AGENTS.md`, Graphics Presets).

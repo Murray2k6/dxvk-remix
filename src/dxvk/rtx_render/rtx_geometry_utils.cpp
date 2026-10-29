@@ -31,6 +31,11 @@
 #include <rtx_shaders/decode_and_add_opacity.h>
 #include <rtx_shaders/interleave_geometry.h>
 #include <rtx_shaders/smooth_normals.h>
+#include <rtx_shaders/omm_class_census.h>
+#include <rtx_shaders/omm_micro_census.h>
+#include <rtx_shaders/omm_sw_pack.h>
+#include <rtx_shaders/omm_sw_selftest.h>
+#include <rtx_shaders/omm_compact.h>
 #include "dxvk_scoped_annotation.h"
 
 #include "rtx_context.h"
@@ -38,6 +43,11 @@
 
 #include "rtx/pass/view_model/view_model_correction_binding_indices.h"
 #include "rtx/pass/opacity_micromap/bake_opacity_micromap_binding_indices.h"
+#include "rtx/pass/opacity_micromap/omm_class_census_args.h"
+#include "rtx/pass/opacity_micromap/omm_micro_census_args.h"
+#include "rtx/pass/opacity_micromap/omm_sw_pack_args.h"
+#include "rtx/pass/opacity_micromap/software_omm_shared.h"
+#include "rtx/pass/opacity_micromap/omm_compact_args.h"
 #include "rtx/pass/terrain_baking/decode_and_add_opacity_binding_indices.h"
 #include "rtx/pass/gpu_skinning_binding_indices.h"
 #include "rtx/pass/skinning.h"
@@ -46,6 +56,9 @@
 #include "rtx/pass/gen_tri_list_index_buffer.h"
 #include "rtx/pass/interleave_geometry_indices.h"
 #include "rtx/pass/interleave_geometry.h"
+
+#include <algorithm>
+#include <cstddef>
 
 namespace dxvk {
   static constexpr uint32_t kMaxInterleavedComponents = 3 + 3 + 2 + 1;
@@ -156,6 +169,71 @@ namespace dxvk {
 
     PREWARM_SHADER_PIPELINE(SmoothNormalsShader);
 
+    // rtx.alphaBake.census. Not prewarmed, since it only runs with the census on.
+    class OmmClassCensusShader : public ManagedShader {
+      SHADER_SOURCE(OmmClassCensusShader, VK_SHADER_STAGE_COMPUTE_BIT, omm_class_census)
+
+      PUSH_CONSTANTS(OmmCensusArgs)
+
+      BEGIN_PARAMETER()
+        STRUCTURED_BUFFER(OMM_CENSUS_BINDING_ARRAY_INPUT)
+        RW_STRUCTURED_BUFFER(OMM_CENSUS_BINDING_COUNTERS)
+      END_PARAMETER()
+    };
+
+    // rtx.alphaBake.censusMicroStates. Not prewarmed, since it only runs with the option on.
+    class OmmMicroCensusShader : public ManagedShader {
+      SHADER_SOURCE(OmmMicroCensusShader, VK_SHADER_STAGE_COMPUTE_BIT, omm_micro_census)
+
+      PUSH_CONSTANTS(OmmMicroCensusArgs)
+
+      BEGIN_PARAMETER()
+        STRUCTURED_BUFFER(OMM_MICRO_CENSUS_BINDING_ARRAY_INPUT)
+        RW_STRUCTURED_BUFFER(OMM_MICRO_CENSUS_BINDING_COUNTERS)
+      END_PARAMETER()
+    };
+
+    // rtx.alphaBake.softwareOmm. Not prewarmed, since it only runs with the option on.
+    class OmmSwPackShader : public ManagedShader {
+      SHADER_SOURCE(OmmSwPackShader, VK_SHADER_STAGE_COMPUTE_BIT, omm_sw_pack)
+
+      PUSH_CONSTANTS(OmmSwPackArgs)
+
+      BEGIN_PARAMETER()
+        STRUCTURED_BUFFER(OMM_SW_PACK_BINDING_ARRAY_INPUT)
+        STRUCTURED_BUFFER(OMM_SW_PACK_BINDING_INDEX_INPUT)
+        STRUCTURED_BUFFER(OMM_SW_PACK_BINDING_TRIANGLE_INPUT)
+        RW_STRUCTURED_BUFFER(OMM_SW_PACK_BINDING_STORE_OUTPUT)
+      END_PARAMETER()
+    };
+
+    // rtx.alphaBake.softwareOmmSelfTest. Not prewarmed.
+    class OmmSwSelfTestShader : public ManagedShader {
+      SHADER_SOURCE(OmmSwSelfTestShader, VK_SHADER_STAGE_COMPUTE_BIT, omm_sw_selftest)
+
+      PUSH_CONSTANTS(SoftOmmSelfTestArgs)
+
+      BEGIN_PARAMETER()
+        RW_STRUCTURED_BUFFER(SOFT_OMM_SELFTEST_BINDING_RESULTS)
+      END_PARAMETER()
+    };
+
+    // Opacity micromap compaction.
+    class OmmCompactShader : public ManagedShader {
+      SHADER_SOURCE(OmmCompactShader, VK_SHADER_STAGE_COMPUTE_BIT, omm_compact)
+
+      PUSH_CONSTANTS(OmmCompactArgs)
+
+      BEGIN_PARAMETER()
+        STRUCTURED_BUFFER(OMM_COMPACT_BINDING_ARRAY_INPUT)
+        RW_STRUCTURED_BUFFER(OMM_COMPACT_BINDING_INDEX_OUTPUT)
+        RW_STRUCTURED_BUFFER(OMM_COMPACT_BINDING_TRIANGLE_OUTPUT)
+        RW_STRUCTURED_BUFFER(OMM_COMPACT_BINDING_COUNTER)
+      END_PARAMETER()
+    };
+
+    PREWARM_SHADER_PIPELINE(OmmCompactShader);
+
     float calcUVTileSizeSqr(const Matrix4& objectToWorld, const uint8_t* pVertex, size_t vertexStride, const uint8_t* pTexcoord, size_t texcoordStride, uint32_t vertex1, uint32_t vertex2, uint32_t vertex3) {
       const Vector4 p1 = objectToWorld * Vector4(*reinterpret_cast<const Vector3* const>(pVertex + vertexStride * vertex1), 1.f);
       const Vector4 p2 = objectToWorld * Vector4(*reinterpret_cast<const Vector3* const>(pVertex + vertexStride * vertex2), 1.f);
@@ -254,6 +332,7 @@ namespace dxvk {
       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
 
     m_skinningContext = device->createContext();
+    m_skinningArgs = std::make_unique<SkinningArgs>();
   }
 
   RtxGeometryUtils::~RtxGeometryUtils() { }
@@ -264,7 +343,7 @@ namespace dxvk {
     m_skinningContext = nullptr;
   }
 
-  void RtxGeometryUtils::dispatchSkinning(const DrawCallState& drawCallState,
+  void RtxGeometryUtils::dispatchSkinning(const SceneDraw& drawCallState,
                                           const RaytraceGeometry& geo) {
     const Rc<DxvkContext>& ctx = m_skinningContext;
     // Create command list for the initial skinning dispatch (e.g. The first frame we get skinning mesh draw calls)
@@ -273,10 +352,11 @@ namespace dxvk {
     }
 
     ScopedGpuProfileZone(ctx, "performSkinning");
+    ++m_skinningCommands;
 
     const auto normalVertexFormat = drawCallState.getGeometryData().normalBuffer.vertexFormat();
 
-    SkinningArgs params {};
+    SkinningArgs& params = *m_skinningArgs;
 
     // Note: VK_FORMAT_R32_UINT assumed to be 32 bit spherical octahedral normals.
     assert(normalVertexFormat == VK_FORMAT_R32G32B32_SFLOAT || normalVertexFormat == VK_FORMAT_R32G32B32A32_SFLOAT || normalVertexFormat == VK_FORMAT_R32_UINT);
@@ -285,7 +365,10 @@ namespace dxvk {
       return;
     }
 
-    memcpy(&params.bones[0], &drawCallState.getSkinningState().pBoneMatrices[0], sizeof(Matrix4) * drawCallState.getSkinningState().numBones);
+    constexpr uint32_t kMaxBones = uint32_t(sizeof(SkinningArgs::bones) / sizeof(SkinningArgs::bones[0]));
+    const uint32_t boneTransformCount = std::min(drawCallState.getSkinningState().numBones, kMaxBones);
+    memcpy(&params.bones[0], drawCallState.getSkinningState().pBoneMatrices.data(), sizeof(params.bones[0]) * boneTransformCount);
+    params.boneTransformCount = boneTransformCount;
 
     params.dstPositionStride = geo.positionBuffer.stride();
     params.dstPositionOffset = geo.positionBuffer.offsetFromSlice();
@@ -327,8 +410,13 @@ namespace dxvk {
       const auto& devInfo = ctx->getDevice()->properties().core.properties;
       VkDeviceSize alignment = devInfo.limits.minUniformBufferOffsetAlignment;
 
+      // Only the bones that hold a transform and the fields after the bone array are copied.
+      constexpr size_t kFieldsOffset = offsetof(SkinningArgs, dstPositionOffset);
+      static_assert(kFieldsOffset == sizeof(SkinningArgs::bones), "The fields follow the bone array.");
       DxvkBufferSlice cb = m_pCbData->alloc(alignment, sizeof(SkinningArgs));
-      memcpy(cb.mapPtr(0), &params, sizeof(SkinningArgs));
+      uint8_t* cbData = static_cast<uint8_t*>(cb.mapPtr(0));
+      memcpy(cbData, &params.bones[0], sizeof(params.bones[0]) * boneTransformCount);
+      memcpy(cbData + kFieldsOffset, reinterpret_cast<const uint8_t*>(&params) + kFieldsOffset, sizeof(SkinningArgs) - kFieldsOffset);
       ctx->getCommandList()->trackResource<DxvkAccess::Write>(cb.buffer());
 
       ctx->bindResourceBuffer(BINDING_SKINNING_CONSTANTS, cb);
@@ -368,7 +456,6 @@ namespace dxvk {
         ctx->writeToBuffer(geo.normalBuffer.buffer(), geo.normalBuffer.offsetFromSlice() + idx * geo.normalBuffer.stride(), sizeof(dstNormal), &dstNormal[0]);
       }
     }
-    ++m_skinningCommands;
   }
 
   void RtxGeometryUtils::dispatchViewModelCorrection(
@@ -483,7 +570,43 @@ namespace dxvk {
     return numMicroTrianglesToBake;
   }
 
-  void RtxGeometryUtils::dispatchBakeOpacityMicromap(
+  // NV-DXVK start: [OmmBake] input validation and stall diagnostics
+  namespace {
+    // Persistent storage for the per-item checkpoint/stall labels. vkCmdSetCheckpointNV keeps the
+    // pointer, and the [GpuStall] watchdog prints it after the fact, so a label must outlive every
+    // command list that can still be in flight: a ring far larger than a few frames of bakes.
+    constexpr uint32_t kOmmBakeLabelCount = 2048;
+    constexpr uint32_t kOmmBakeLabelSize = 320;
+    char s_ommBakeLabels[kOmmBakeLabelCount][kOmmBakeLabelSize];
+    uint32_t s_ommBakeLabelNext = 0; // CS thread only
+
+    const char* storeOmmBakeLabel(const std::string& text) {
+      char* slot = s_ommBakeLabels[s_ommBakeLabelNext++ % kOmmBakeLabelCount];
+      const size_t n = std::min<size_t>(text.size(), kOmmBakeLabelSize - 1);
+      std::memcpy(slot, text.data(), n);
+      slot[n] = '\0';
+      return slot;
+    }
+
+    uint32_t s_ommBakeRejectLogs = 0;
+    constexpr uint32_t kMaxOmmBakeRejectLogs = 64;
+
+    void logOmmBakeReject(const std::string& what, const RtInstance& instance, const TextureRef* texture) {
+      if (s_ommBakeRejectLogs >= kMaxOmmBakeRejectLogs) {
+        return;
+      }
+      if (++s_ommBakeRejectLogs == kMaxOmmBakeRejectLogs) {
+        Logger::warn("[OmmBake] further rejections are not logged");
+      }
+      Logger::warn(str::format("[OmmBake] rejected: ", what,
+        " | surface ", instance.getSurfaceIndex(),
+        ", texture 0x", std::hex, texture ? texture->getImageHash() : 0ull, std::dec,
+        ", material type ", uint32_t(instance.getMaterialType())));
+    }
+  }
+  // NV-DXVK end
+
+  bool RtxGeometryUtils::dispatchBakeOpacityMicromap(
     Rc<DxvkContext> ctx,
     const RtInstance& instance,
     const RaytraceGeometry& geo,
@@ -498,13 +621,84 @@ namespace dxvk {
     uint32_t& availableBakingBudget,
     Rc<DxvkBuffer> opacityMicromapBuffer) const {
 
+    // NV-DXVK start: [OmmBake] validate every input the shader derives an address or a loop
+    // bound from, before anything is recorded. A rejection returns false and the caller
+    // blacklists the item; nothing is dispatched.
+    if (albedoOpacityTextureIndex >= textures.size()) {
+      logOmmBakeReject(str::format("opacity texture index ", albedoOpacityTextureIndex, " outside the texture table (", textures.size(), ")"), instance, nullptr);
+      return false;
+    }
+    if (samplerIndex >= samplers.size() || samplers[samplerIndex] == nullptr) {
+      logOmmBakeReject(str::format("sampler index ", samplerIndex, " invalid (", samplers.size(), " samplers)"), instance, nullptr);
+      return false;
+    }
+    // NV-DXVK end
+
     // Init textures
     const TextureRef& opacityTexture = textures[albedoOpacityTextureIndex];
     const TextureRef* secondaryOpacityTexture = nullptr;
-    if (secondaryAlbedoOpacityTextureIndex != kSurfaceMaterialInvalidTextureIndex)
+    if (secondaryAlbedoOpacityTextureIndex != kSurfaceMaterialInvalidTextureIndex) {
+      // NV-DXVK start: [OmmBake]
+      if (secondaryAlbedoOpacityTextureIndex >= textures.size() || textures[secondaryAlbedoOpacityTextureIndex].getImageView() == nullptr ||
+          secondarySamplerIndex >= samplers.size() || samplers[secondarySamplerIndex] == nullptr) {
+        logOmmBakeReject("secondary opacity texture or sampler invalid", instance, &opacityTexture);
+        return false;
+      }
+      // NV-DXVK end
       secondaryOpacityTexture = &textures[secondaryAlbedoOpacityTextureIndex];
+    }
 
-    VkExtent3D opacityTextureResolution = opacityTexture.getImageView()->imageInfo().extent;
+    // NV-DXVK start: [OmmBake] Hold the exact view sampled for the whole bake. A shared import can be
+    // replaced in place (rtx.hostImport.enableInPlaceTextureReplace) or copied on write while this
+    // command list is in flight; the table entry then names another view, but this Rc keeps the one
+    // bound here alive and it is tracked by the command list below.
+    const Rc<DxvkImageView> opacityView = opacityTexture.getImageView();
+    if (opacityView == nullptr || opacityView->image() == nullptr) {
+      logOmmBakeReject("opacity texture has no image view (released or not yet resident)", instance, &opacityTexture);
+      return false;
+    }
+    if (opacityView->handle(VK_IMAGE_VIEW_TYPE_2D) == VK_NULL_HANDLE) {
+      logOmmBakeReject(str::format("opacity view is not sampleable as 2D (view type ", uint32_t(opacityView->info().type), ")"), instance, &opacityTexture);
+      return false;
+    }
+
+    // The shader samples mip 0 of the view. A mip-capped shared import (rtx.hostImport.maxCopiedTextureDimension
+    // or the host's own cap) starts its view past the image's mip 0, so the image extent would overstate the
+    // resolution by 2^minLevel per axis.
+    VkExtent3D opacityTextureResolution = opacityView->mipLevelExtent(0);
+    if (opacityTextureResolution.width == 0 || opacityTextureResolution.height == 0 ||
+        opacityTextureResolution.width > BAKE_OPACITY_MICROMAP_MAX_TEXTURE_DIMENSION ||
+        opacityTextureResolution.height > BAKE_OPACITY_MICROMAP_MAX_TEXTURE_DIMENSION) {
+      logOmmBakeReject(str::format("opacity texture extent ", opacityTextureResolution.width, "x", opacityTextureResolution.height,
+                                   " outside [1, ", BAKE_OPACITY_MICROMAP_MAX_TEXTURE_DIMENSION, "]"), instance, &opacityTexture);
+      return false;
+    }
+    if (desc.subdivisionLevel > 12 || desc.numMicroTrianglesPerTriangle != (1u << (2u * desc.subdivisionLevel))) {
+      logOmmBakeReject(str::format("subdivision level ", uint32_t(desc.subdivisionLevel), " / ", desc.numMicroTrianglesPerTriangle,
+                                   " micro-triangles per triangle is invalid"), instance, &opacityTexture);
+      return false;
+    }
+    if (desc.numTriangles == 0 ||
+        uint64_t(desc.numTriangles) * uint64_t(desc.numMicroTrianglesPerTriangle) > uint64_t(UINT32_MAX) ||
+        uint64_t(desc.triangleOffset) + uint64_t(desc.numTriangles) > uint64_t(desc.numTexelsPerMicrotriangle.size())) {
+      logOmmBakeReject(str::format(desc.numTriangles, " triangles at offset ", desc.triangleOffset, " with ", desc.numMicroTrianglesPerTriangle,
+                                   " micro-triangles each overflow 32 bits or the texel-density table (", desc.numTexelsPerMicrotriangle.size(), ")"),
+                       instance, &opacityTexture);
+      return false;
+    }
+    // The shader reads texcoords as two 32-bit floats, so a packed half2 stream would give garbage UVs.
+    if (!geo.texcoordBuffer.defined() || geo.texcoordBuffer.stride() < 2 * sizeof(float) ||
+        geo.texcoordBuffer.vertexFormat() == VK_FORMAT_R16G16_SFLOAT) {
+      logOmmBakeReject(str::format("texcoord buffer missing, stride ", geo.texcoordBuffer.defined() ? geo.texcoordBuffer.stride() : 0u,
+                                   " or format ", uint32_t(geo.texcoordBuffer.vertexFormat()), " not float2"),
+                       instance, &opacityTexture);
+      return false;
+    }
+    if (opacityMicromapBuffer == nullptr) {
+      logOmmBakeReject("no output buffer", instance, &opacityTexture);
+      return false;
+    }
+    // NV-DXVK end
 
     // Fill out the arguments
     BakeOpacityMicromapArgs args {};
@@ -525,7 +719,15 @@ namespace dxvk {
     args.numMicroTrianglesPerThread = args.is2StateOMMFormat ? 8 : 4;
     args.textureResolution = vec2 { static_cast<float>(opacityTextureResolution.width), static_cast<float>(opacityTextureResolution.height) };
     args.rcpTextureResolution = vec2 { 1.f / opacityTextureResolution.width, 1.f / opacityTextureResolution.height };
-    args.conservativeEstimationMaxTexelTapsPerMicroTriangle = desc.conservativeEstimationMaxTexelTapsPerMicroTriangle;
+    // NV-DXVK start: [OmmBake] the shader caps this at BAKE_OPACITY_MICROMAP_MAX_TEXEL_TAPS_HARD_CAP too
+    args.conservativeEstimationMaxTexelTapsPerMicroTriangle =
+      std::clamp<uint32_t>(desc.conservativeEstimationMaxTexelTapsPerMicroTriangle, 1u, BAKE_OPACITY_MICROMAP_MAX_TEXEL_TAPS_HARD_CAP);
+    if (args.conservativeEstimationMaxTexelTapsPerMicroTriangle != desc.conservativeEstimationMaxTexelTapsPerMicroTriangle) {
+      ONCE(Logger::warn(str::format("[OmmBake] rtx.opacityMicromap.building.conservativeEstimation.maxTexelTapsPerMicroTriangle = ",
+                                    desc.conservativeEstimationMaxTexelTapsPerMicroTriangle, " clamped to ",
+                                    args.conservativeEstimationMaxTexelTapsPerMicroTriangle)));
+    }
+    // NV-DXVK end
     args.triangleOffset = desc.triangleOffset;
 
     // Init samplers
@@ -553,10 +755,15 @@ namespace dxvk {
 
     // Bind other resources
     ctx->bindResourceBuffer(BINDING_BAKE_OPACITY_MICROMAP_TEXCOORD_INPUT, geo.texcoordBuffer);
-    ctx->bindResourceView(BINDING_BAKE_OPACITY_MICROMAP_OPACITY_INPUT, opacityTexture.getImageView(), nullptr);
+    const Rc<DxvkImageView> secondaryView = secondaryOpacityTexture ? Rc<DxvkImageView>(secondaryOpacityTexture->getImageView()) : opacityView;
+    ctx->bindResourceView(BINDING_BAKE_OPACITY_MICROMAP_OPACITY_INPUT, opacityView, nullptr);
     ctx->bindResourceSampler(BINDING_BAKE_OPACITY_MICROMAP_OPACITY_INPUT, opacitySampler);
-    ctx->bindResourceView(BINDING_BAKE_OPACITY_MICROMAP_SECONDARY_OPACITY_INPUT,
-                          secondaryOpacityTexture ? secondaryOpacityTexture->getImageView() : opacityTexture.getImageView(), nullptr);
+    ctx->bindResourceView(BINDING_BAKE_OPACITY_MICROMAP_SECONDARY_OPACITY_INPUT, secondaryView, nullptr);
+    // NV-DXVK: [OmmBake] explicit lifetime tracking of the exact views/images sampled (see above)
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(opacityView);
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(opacityView->image());
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(secondaryView);
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(secondaryView->image());
     ctx->bindResourceSampler(BINDING_BAKE_OPACITY_MICROMAP_SECONDARY_OPACITY_INPUT, secondaryOpacitySampler);
     ctx->bindResourceBuffer(BINDING_BAKE_OPACITY_MICROMAP_BINDING_SURFACE_DATA_INPUT,
                             DxvkBufferSlice(device()->getCommon()->getSceneManager().getSurfaceBuffer()));
@@ -596,8 +803,34 @@ namespace dxvk {
     // Calculate per dispatch counts
     const uint32_t numThreads = numMicroTrianglesToBake / args.numMicroTrianglesPerThread;
     const uint32_t numThreadsPerDispatch = std::min(numThreads, maxThreadsPerDispatchAligned);
-    const uint32_t numDispatches = dxvk::util::ceilDivide(numThreads, numThreadsPerDispatch);
+    // NV-DXVK: [OmmBake] nothing left to bake (ceilDivide(0, 0) below would divide by zero)
+    const uint32_t numDispatches = numThreadsPerDispatch != 0 ? dxvk::util::ceilDivide(numThreads, numThreadsPerDispatch) : 0;
     const uint32_t baseThreadIndexOffset = bakeState.numMicroTrianglesBaked / args.numMicroTrianglesPerThread;
+
+    // NV-DXVK start: [OmmBake] stall diagnostics. Name this item in a GPU checkpoint (read back by the
+    // [GpuStall] watchdog with dxvk.enableAftermath) and in the command list's CPU-side context, so a
+    // stall inside the bake says which texture and mesh were being baked.
+    if (numDispatches != 0) {
+      const DxvkImageCreateInfo& imageInfo = opacityView->imageInfo();
+      const char* label = storeOmmBakeLabel(str::format(
+        "OmmBake surf ", instance.getSurfaceIndex(),
+        " tex 0x", std::hex, opacityTexture.getImageHash(), std::dec,
+        " ", opacityTextureResolution.width, "x", opacityTextureResolution.height,
+        " (image ", imageInfo.extent.width, "x", imageInfo.extent.height, " mips ", imageInfo.mipLevels,
+        " view mip ", opacityView->info().minLevel, "+", opacityView->info().numLevels,
+        " fmt ", uint32_t(opacityView->info().format), ")",
+        " tris ", desc.numTriangles, "@", desc.triangleOffset,
+        " subdiv ", uint32_t(desc.subdivisionLevel),
+        " uTris ", numMicroTrianglesToBake, " from ", bakeState.numMicroTrianglesBaked, "/", bakeState.numMicroTrianglesToBake,
+        " taps ", args.conservativeEstimationMaxTexelTapsPerMicroTriangle, args.useConservativeEstimation ? " cons" : " center",
+        " uvStride ", args.texcoordStride));
+      ctx->deviceDiagnosticCheckpoint(label);
+      auto& perfInfo = ctx->getCommandList()->perfInfo();
+      perfInfo.ommBakeItems += 1;
+      perfInfo.ommBakeMicroTriangles += numMicroTrianglesToBake;
+      perfInfo.lastOmmBake = label;
+    }
+    // NV-DXVK end
 
     for (uint32_t i = 0; i < numDispatches; i++) {
       const uint32_t dispatchThreadOffset = i * numThreadsPerDispatch;
@@ -627,6 +860,7 @@ namespace dxvk {
 
     // Make sure the geom buffers are tracked for liveness
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(opacityMicromapBuffer);
+    return true;
   }
 
   void RtxGeometryUtils::decodeAndAddOpacity(
@@ -772,6 +1006,124 @@ namespace dxvk {
         dispatchGenTriListCpu<uint16_t>(ctx, cb, dstSlice, dst, srcBuffer);
       }
     }
+  }
+
+  void RtxGeometryUtils::dispatchOmmClassCensus(const Rc<DxvkContext>& ctx, const Rc<DxvkBuffer>& ommArray, const Rc<DxvkBuffer>& counters,
+                                                uint32_t numTriangles, uint32_t wordsPerTriangle, uint32_t opaqueWord, uint32_t slotOffset) const {
+    if (numTriangles == 0 || wordsPerTriangle == 0 || ommArray == nullptr || counters == nullptr) {
+      return;
+    }
+    ScopedGpuProfileZone(ctx, "ommClassCensus");
+    constexpr uint32_t kMaxGroupsX = 65535;
+    OmmCensusArgs args {};
+    args.numTriangles = numTriangles;
+    args.wordsPerTriangle = wordsPerTriangle;
+    args.opaqueWord = opaqueWord;
+    args.slotOffset = slotOffset;
+    args.groupsX = std::min(numTriangles, kMaxGroupsX);
+    const uint32_t groupsY = (numTriangles + args.groupsX - 1) / args.groupsX;
+
+    ctx->bindResourceBuffer(OMM_CENSUS_BINDING_ARRAY_INPUT, DxvkBufferSlice(ommArray, 0, VkDeviceSize(numTriangles) * wordsPerTriangle * 4));
+    ctx->bindResourceBuffer(OMM_CENSUS_BINDING_COUNTERS, DxvkBufferSlice(counters));
+    ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+    ctx->pushConstants(0, sizeof(OmmCensusArgs), &args);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, OmmClassCensusShader::getShader());
+    ctx->dispatch(args.groupsX, groupsY, 1);
+  }
+
+  void RtxGeometryUtils::dispatchOmmMicroCensus(const Rc<DxvkContext>& ctx, const Rc<DxvkBuffer>& ommArray, const Rc<DxvkBuffer>& counters,
+                                                uint32_t numTriangles, uint32_t wordsPerTriangle, bool twoState, uint32_t level) const {
+    if (numTriangles == 0 || wordsPerTriangle == 0 || ommArray == nullptr || counters == nullptr) {
+      return;
+    }
+    ScopedGpuProfileZone(ctx, "ommMicroCensus");
+    constexpr uint32_t kMaxGroupsX = 65535;
+    OmmMicroCensusArgs args {};
+    args.numTriangles = numTriangles;
+    args.wordsPerTriangle = wordsPerTriangle;
+    args.twoState = twoState ? 1u : 0u;
+    args.level = std::min<uint32_t>(level, OMM_MICRO_CENSUS_LEVELS - 1);
+    args.groupsX = std::min(numTriangles, kMaxGroupsX);
+    const uint32_t groupsY = (numTriangles + args.groupsX - 1) / args.groupsX;
+
+    ctx->bindResourceBuffer(OMM_MICRO_CENSUS_BINDING_ARRAY_INPUT, DxvkBufferSlice(ommArray, 0, VkDeviceSize(numTriangles) * wordsPerTriangle * 4));
+    ctx->bindResourceBuffer(OMM_MICRO_CENSUS_BINDING_COUNTERS, DxvkBufferSlice(counters));
+    ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+    ctx->pushConstants(0, sizeof(OmmMicroCensusArgs), &args);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, OmmMicroCensusShader::getShader());
+    ctx->dispatch(args.groupsX, groupsY, 1);
+  }
+
+  void RtxGeometryUtils::dispatchOmmSwPack(const Rc<DxvkContext>& ctx, const Rc<DxvkBuffer>& ommArray, const Rc<DxvkBuffer>& indexIn,
+                                           const Rc<DxvkBuffer>& triangleIn, const Rc<DxvkBuffer>& storeOut, uint32_t numTriangles,
+                                           uint32_t wordsPerTriangle, uint32_t numMixed) const {
+    if (numTriangles == 0 || wordsPerTriangle == 0 || ommArray == nullptr || indexIn == nullptr || triangleIn == nullptr || storeOut == nullptr) {
+      return;
+    }
+    ScopedGpuProfileZone(ctx, "ommSwPack");
+    constexpr uint32_t kMaxGroupsX = 65535;
+    OmmSwPackArgs args {};
+    args.numTriangles = numTriangles;
+    args.wordsPerTriangle = wordsPerTriangle;
+    args.numMixed = numMixed;
+    args.totalWords = numTriangles + numMixed * wordsPerTriangle;
+    const uint32_t groups = (args.totalWords + OMM_SW_PACK_THREADS_PER_GROUP - 1) / OMM_SW_PACK_THREADS_PER_GROUP;
+    args.groupsX = std::min(groups, kMaxGroupsX);
+    const uint32_t groupsY = (groups + args.groupsX - 1) / args.groupsX;
+
+    ctx->bindResourceBuffer(OMM_SW_PACK_BINDING_ARRAY_INPUT, DxvkBufferSlice(ommArray, 0, VkDeviceSize(numTriangles) * wordsPerTriangle * 4));
+    ctx->bindResourceBuffer(OMM_SW_PACK_BINDING_INDEX_INPUT, DxvkBufferSlice(indexIn));
+    ctx->bindResourceBuffer(OMM_SW_PACK_BINDING_TRIANGLE_INPUT, DxvkBufferSlice(triangleIn));
+    ctx->bindResourceBuffer(OMM_SW_PACK_BINDING_STORE_OUTPUT, DxvkBufferSlice(storeOut, 0, VkDeviceSize(args.totalWords) * 4));
+    ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+    ctx->pushConstants(0, sizeof(OmmSwPackArgs), &args);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, OmmSwPackShader::getShader());
+    ctx->dispatch(args.groupsX, groupsY, 1);
+  }
+
+  void RtxGeometryUtils::dispatchSoftOmmSelfTest(const Rc<DxvkContext>& ctx, const Rc<DxvkBuffer>& results) const {
+    if (results == nullptr) {
+      return;
+    }
+    ScopedGpuProfileZone(ctx, "softOmmSelfTest");
+    constexpr uint32_t kMaxGroupsX = 65535;
+    SoftOmmSelfTestArgs args {};
+    args.totalThreads = 0;
+    for (uint32_t level = 0; level <= SOFT_OMM_SELFTEST_MAX_LEVEL; ++level) {
+      args.totalThreads += 1u << (2u * level);
+    }
+    const uint32_t groups = (args.totalThreads + SOFT_OMM_SELFTEST_THREADS_PER_GROUP - 1) / SOFT_OMM_SELFTEST_THREADS_PER_GROUP;
+    args.groupsX = std::min(groups, kMaxGroupsX);
+    const uint32_t groupsY = (groups + args.groupsX - 1) / args.groupsX;
+
+    ctx->bindResourceBuffer(SOFT_OMM_SELFTEST_BINDING_RESULTS, DxvkBufferSlice(results));
+    ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+    ctx->pushConstants(0, sizeof(SoftOmmSelfTestArgs), &args);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, OmmSwSelfTestShader::getShader());
+    ctx->dispatch(args.groupsX, groupsY, 1);
+  }
+
+  void RtxGeometryUtils::dispatchOmmCompact(const Rc<DxvkContext>& ctx, const Rc<DxvkBuffer>& ommArray, const Rc<DxvkBuffer>& indexOut,
+                                            const Rc<DxvkBuffer>& triangleOut, const Rc<DxvkBuffer>& counter, uint32_t numTriangles,
+                                            uint32_t wordsPerTriangle, uint32_t opaqueWord, uint32_t triangleWord1) const {
+    ScopedGpuProfileZone(ctx, "ommCompact");
+    constexpr uint32_t kMaxGroupsX = 65535;
+    OmmCompactArgs args {};
+    args.numTriangles = numTriangles;
+    args.wordsPerTriangle = wordsPerTriangle;
+    args.opaqueWord = opaqueWord;
+    args.triangleWord1 = triangleWord1;
+    args.groupsX = std::min(numTriangles, kMaxGroupsX);
+    const uint32_t groupsY = (numTriangles + args.groupsX - 1) / args.groupsX;
+
+    ctx->bindResourceBuffer(OMM_COMPACT_BINDING_ARRAY_INPUT, DxvkBufferSlice(ommArray, 0, VkDeviceSize(numTriangles) * wordsPerTriangle * 4));
+    ctx->bindResourceBuffer(OMM_COMPACT_BINDING_INDEX_OUTPUT, DxvkBufferSlice(indexOut));
+    ctx->bindResourceBuffer(OMM_COMPACT_BINDING_TRIANGLE_OUTPUT, DxvkBufferSlice(triangleOut));
+    ctx->bindResourceBuffer(OMM_COMPACT_BINDING_COUNTER, DxvkBufferSlice(counter));
+    ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+    ctx->pushConstants(0, sizeof(OmmCompactArgs), &args);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, OmmCompactShader::getShader());
+    ctx->dispatch(args.groupsX, groupsY, 1);
   }
 
   void RtxGeometryUtils::processGeometryBuffers(const InterleavedGeometryDescriptor& desc, RaytraceGeometry& output) {

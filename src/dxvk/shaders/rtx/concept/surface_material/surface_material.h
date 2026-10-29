@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -98,11 +98,22 @@ struct OpaqueSurfaceMaterial
 
   // 26
   uint16_t samplerFeedbackStamp;
+  // Lower bound for roughness decoded from a smoothness map
+  // (OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_SMOOTHNESS).
+  float16_t roughnessFloor;
+
+  // 28-29
+  uint dlssControlMask;
 
   // Todo: Fixed function blend state info here in the future (Actually this should go on a Legacy Material, or some sort of non-PBR Legacy Surface)
 
-  // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[5];
+  // 30-31
+  // OPAQUE_SURFACE_MATERIAL_FLAG_METALLIC_FROM_SPECULAR parameters, 4 bits each
+  // (value / 15): [0:3] spec low, [4:7] spec high, [8:11] albedo luminance max
+  // (gamma; 15 = no albedo gate), [12:15] metal strength.
+  uint16_t specularMetalParams;
+  // Specular colour as RGB565 (gamma). 0 = keep the albedo on metal texels.
+  uint16_t specularMetalTint;
 
   bool hasValidDisplacement() {
     return flags & OPAQUE_SURFACE_MATERIAL_FLAG_HAS_DISPLACEMENT;
@@ -133,8 +144,11 @@ struct TranslucentSurfaceMaterial
   // 14-16
   f16vec3 emissiveColorConstant;
 
+  // 17
+  uint16_t samplerFeedbackStamp;
+
   // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[15];
+  uint16_t data[14];
 };
 
 struct RayPortalSurfaceMaterial
@@ -170,9 +184,12 @@ struct SubsurfaceMaterial
   f16vec3 singleScatteringAlbedo;
 
   float16_t maxSampleRadius;
-  
+
+  // 13-15: valid when flags has SURFACE_MATERIAL_EXTENSION_FLAG_ALBEDO_TINT
+  f16vec3 albedoTint;
+
   // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[19];
+  uint16_t data[16];
 };
 
 struct SubsurfaceMaterialInteraction
@@ -199,6 +216,7 @@ struct OpaqueSurfaceMaterialInteraction
   SubsurfaceMaterialInteraction subsurfaceMaterialInteraction;
   // Note: A value of 0 in the thin film thickness indicates the thin film is disabled.
   float thinFilmThickness;
+  uint32_t dlssControlMask;
   uint8_t flags;
 };
 
@@ -295,6 +313,7 @@ struct PolymorphicSurfaceMaterialInteraction
 
   uint32_t i32data0;
   uint32_t i32data1;
+  uint32_t dlssControlMask;
 
   uint8_t bdata0;
   uint8_t bdata1;

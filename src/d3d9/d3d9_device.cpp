@@ -97,6 +97,8 @@ namespace dxvk {
 // NV-DXVK start: external API
     , m_withExternalSwapchain { WithExternalSwapchain } {
 // NV-DXVK end
+    m_dxvkDevice->addD3D9Device();
+
     // If we can SWVP, then we use an extended constant set
     // as SWVP has many more slots available than HWVP.
     bool canSWVP = CanSWVP();
@@ -170,7 +172,11 @@ namespace dxvk {
 
     m_dxvkDevice->waitForIdle(); // Sync Device
     // NV-DXVK start: clean exit
-    m_dxvkDevice->getCommon()->onDestroy();
+    // Every D3D9 device on the shared DXVK device uses the same common objects.
+    // An overlay's short-lived probe device must not destroy them under the game's device.
+    if (m_dxvkDevice->removeD3D9Device()) {
+      m_dxvkDevice->getCommon()->onDestroy();
+    }
     // NV-DXVK end
   }
 
@@ -390,6 +396,7 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) {
     ScopedCpuProfileZone();
     D3D9DeviceLock lock = LockDevice();
+    m_rtx.onReset();
 
     HRESULT hr = ResetSwapChain(pPresentationParameters, nullptr);
     if (FAILED(hr))
@@ -1448,11 +1455,13 @@ namespace dxvk {
 
     if (unlikely(!isImplicitSwapchain)) {
       // Check if RT is a surface of an additional swapchain
+      // Only a swapchain that is or can become the scene output sets the scene's present parameters.
       IDirect3DSwapChain9* swapchain = nullptr;
       if (D3D_OK == rt->GetContainer(__uuidof(IDirect3DSwapChain9),
                                      reinterpret_cast<void**>(&swapchain))) {
         D3DPRESENT_PARAMETERS pp;
-        if (D3D_OK == swapchain->GetPresentParameters(&pp)) {
+        if (CanBeSceneOutput(static_cast<D3D9SwapChainEx*>(swapchain)) &&
+            D3D_OK == swapchain->GetPresentParameters(&pp)) {
           m_rtx.ResetSwapChain(pp);
         }
 
@@ -1544,6 +1553,9 @@ namespace dxvk {
       return D3DERR_INVALIDCALL;
 
     m_flags.set(D3D9DeviceFlag::InScene);
+
+    // A frame without a present (minimized or inactive window) ends here, at the start of the next frame's first scene.
+    m_rtx.onBeginScene();
 
     return D3D_OK;
   }
@@ -1823,6 +1835,7 @@ namespace dxvk {
 
     m_state.material = *pMaterial;
     m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);
+    ++m_remixMaterialStateVersion;
 
     return D3D_OK;
   }
@@ -1999,6 +2012,7 @@ namespace dxvk {
     bool changed = states[State] != Value;
 
     if (likely(changed)) {
+      ++m_remixMaterialStateVersion;
       const bool oldClipPlaneEnabled = IsClipPlaneEnabled();
 
       const bool oldDepthBiasEnabled = IsDepthBiasEnabled();
@@ -2605,6 +2619,7 @@ namespace dxvk {
       return S_OK;
 
     // NV-DXVK start: geometry processing
+    const perf::ApiScope perfDrawScope { perf::Api::D3D9Draw }; // [PerfApi] rtx.profile.detailedLogging
     const D3D9Rtx::DrawContext drawContext { PrimitiveType, (INT) StartVertex, 0, 0, 0, PrimitiveCount, FALSE };
     const PrepareDrawFlags drawPrepare = m_rtx.PrepareDrawGeometryForRT(false, drawContext);
 
@@ -2659,6 +2674,7 @@ namespace dxvk {
       return S_OK;
 
     // NV-DXVK start: geometry processing
+    const perf::ApiScope perfDrawScope { perf::Api::D3D9Draw }; // [PerfApi] rtx.profile.detailedLogging
     const D3D9Rtx::DrawContext drawContext = { PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimitiveCount, TRUE };
     const PrepareDrawFlags drawPrepare = m_rtx.PrepareDrawGeometryForRT(true, drawContext);
 
@@ -2721,6 +2737,7 @@ namespace dxvk {
     FillUPVertexBuffer(upSlice.mapPtr, pVertexStreamZeroData, dataSize, bufferSize);
 
     // NV-DXVK start: geometry processing
+    const perf::ApiScope perfDrawScope { perf::Api::D3D9Draw }; // [PerfApi] rtx.profile.detailedLogging
     const D3D9Rtx::DrawContext drawContext = { PrimitiveType, 0, 0, 0, 0, PrimitiveCount, FALSE };
     const PrepareDrawFlags drawPrepare = m_rtx.PrepareDrawUPGeometryForRT(false, upSlice, D3DFMT_UNKNOWN, 0, 0, dataSize, VertexStreamZeroStride, drawContext);
 
@@ -2797,6 +2814,7 @@ namespace dxvk {
     std::memcpy(data + vertexBufferSize, pIndexData, indicesSize);
 
     // NV-DXVK start: geometry processing
+    const perf::ApiScope perfDrawScope { perf::Api::D3D9Draw }; // [PerfApi] rtx.profile.detailedLogging
     const D3D9Rtx::DrawContext drawContext = { PrimitiveType, 0, MinVertexIndex, NumVertices, 0, PrimitiveCount, TRUE };
     const PrepareDrawFlags drawPrepare = m_rtx.PrepareDrawUPGeometryForRT(true, upSlice, IndexDataFormat, indicesSize, vertexDataSize, vertexDataSize, VertexStreamZeroStride, drawContext);
 
@@ -2949,6 +2967,9 @@ namespace dxvk {
     }
 
     dst->SetWrittenByGPU(true);
+    // The GPU rewrote the destination: anything keyed on its content version (the geometry hash memo, D3D9 v2) must
+    // see a new one. Write locks are the only other place it is bumped.
+    dst->remixContentVersion = D3D9CommonBuffer::nextRemixContentVersion();
     TrackBufferMappingBufferSequenceNumber(dst);
 
     return D3D_OK;
@@ -3448,6 +3469,7 @@ namespace dxvk {
     if (shader == m_state.pixelShader.ptr())
       return D3D_OK;
 
+    ++m_remixMaterialStateVersion;
     auto* oldShader = GetCommonShader(m_state.pixelShader);
     auto* newShader = GetCommonShader(shader);
 
@@ -3742,6 +3764,25 @@ namespace dxvk {
   }
 
 
+  bool D3D9DeviceEx::IsSceneOutput(const D3D9SwapChainEx* swapchain) {
+    if (swapchain == m_implicitSwapchain.ptr()) {
+      if (!m_implicitSwapchainPresented) {
+        // Another swapchain may have set the scene's present parameters before the implicit one first presented.
+        m_rtx.ResetSwapChain(*m_implicitSwapchain->GetPresentParams());
+        m_implicitSwapchainPresented = true;
+      }
+      return true;
+    }
+    if (m_implicitSwapchainPresented) {
+      return false;
+    }
+    if (m_fallbackSceneOutput == nullptr) {
+      m_fallbackSceneOutput = swapchain;
+    }
+    return swapchain == m_fallbackSceneOutput;
+  }
+
+
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(
     const RECT* pSourceRect,
     const RECT* pDestRect,
@@ -3908,6 +3949,7 @@ namespace dxvk {
           D3DDISPLAYMODEEX*      pFullscreenDisplayMode) {
     ScopedCpuProfileZone();
     D3D9DeviceLock lock = LockDevice();
+    m_rtx.onReset();
 
     HRESULT hr = ResetSwapChain(pPresentationParameters, pFullscreenDisplayMode);
     if (FAILED(hr))
@@ -3979,6 +4021,7 @@ namespace dxvk {
     if (state[StateSampler][Type] == Value)
       return D3D_OK;
 
+    ++m_remixMaterialStateVersion;
     state[StateSampler][Type] = Value;
 
     if (Type == D3DSAMP_ADDRESSU
@@ -4038,6 +4081,7 @@ namespace dxvk {
     if (m_state.textures[StateSampler] == pTexture)
       return D3D_OK;
 
+    ++m_remixMaterialStateVersion;
     auto oldTexture = GetCommonTexture(m_state.textures[StateSampler]);
     auto newTexture = GetCommonTexture(pTexture);
 
@@ -4111,6 +4155,10 @@ namespace dxvk {
 
     m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);
 
+    // Texture transforms sit between PROJECTION and WORLD; they feed the material's texture transform.
+    if (idx != GetTransformIndex(D3DTS_VIEW) && idx != GetTransformIndex(D3DTS_PROJECTION) && idx < GetTransformIndex(D3DTS_WORLD))
+      ++m_remixMaterialStateVersion;
+
     if (idx == GetTransformIndex(D3DTS_VIEW) || idx >= GetTransformIndex(D3DTS_WORLD))
       m_flags.set(D3D9DeviceFlag::DirtyFFVertexBlend);
 
@@ -4139,6 +4187,7 @@ namespace dxvk {
       return m_recorder->SetStateTextureStageState(Stage, Type, Value);
 
     if (likely(m_state.textureStages[Stage][Type] != Value)) {
+      ++m_remixMaterialStateVersion;
       m_state.textureStages[Stage][Type] = Value;
 
       switch (Type) {
@@ -4324,6 +4373,9 @@ namespace dxvk {
 
     // DXVK Meta
     enabled.core.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+    // NV-DXVK start
+    enabled.core.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
+    // NV-DXVK end
     enabled.core.features.imageCubeArray = VK_TRUE;
 
     // SM1 level hardware
@@ -5088,9 +5140,11 @@ namespace dxvk {
 
       pResource->SetWrittenByGPU(false);
       pResource->GPUReadingRange().Clear();
+      ++pResource->remixDiscards;
 
       // NV-DXVK start: Implement memoization for some expensive CPU operations
       pResource->remixMemoization.invalidateAll();
+      pResource->remixContentVersion = D3D9CommonBuffer::nextRemixContentVersion();
       // NV-DXVK end
     }
     else {
@@ -5126,6 +5180,7 @@ namespace dxvk {
       // NV-DXVK start: Implement memoization for some expensive CPU operations
       if (!readOnly) {
         pResource->remixMemoization.invalidate(offset, size);
+        pResource->remixContentVersion = D3D9CommonBuffer::nextRemixContentVersion();
       }
       // NV-DXVK end
     }
@@ -6915,6 +6970,7 @@ namespace dxvk {
     ScopedCpuProfileZone();
     m_state.vsConsts.bConsts[idx] &= ~mask;
     m_state.vsConsts.bConsts[idx] |= bits & mask;
+    ++m_remixVsConstantsVersion;
 
     m_consts[DxsoProgramTypes::VertexShader].dirty = true;
   }
@@ -6981,6 +7037,7 @@ namespace dxvk {
         Count);
 
     if constexpr (ProgramType == DxsoProgramType::VertexShader) {
+      ++m_remixVsConstantsVersion;
       if constexpr (ConstantType == D3D9ConstantType::Float) {
         m_vsFloatConstsCount = std::max(m_vsFloatConstsCount, StartRegister + Count);
       } else if constexpr (ConstantType == D3D9ConstantType::Int) {

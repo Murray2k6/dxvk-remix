@@ -19,6 +19,7 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include "rtx_pre_exposure.h"
 #include "rtx_composite.h"
 #include "dxvk_device.h"
 #include "rtx/pass/composite/composite_binding_indices.h"
@@ -33,7 +34,6 @@
 #include "rtx_restir_gi_rayquery.h"
 #include "rtx_debug_view.h"
 #include "rtx_sparse_rendering.h"
-#include "rtx_atmosphere.h"
 
 #include "../util/util_global_time.h"
 
@@ -84,7 +84,6 @@ namespace dxvk {
         RW_TEXTURE2D(COMPOSITE_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_LAST_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ALPHA_BLEND_RADIANCE_OUTPUT)
-        RW_TEXTURE2D(COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_DEBUG_VIEW_OUTPUT)
       END_PARAMETER()
     };
@@ -114,21 +113,42 @@ namespace dxvk {
         CONSTANT_BUFFER(COMPOSITE_CONSTANTS_INPUT)
         TEXTURE2D(COMPOSITE_BSDF_FACTOR_INPUT)
         TEXTURE2D(COMPOSITE_BSDF_FACTOR2_INPUT)
-        TEXTURE2D(COMPOSITE_DIRECT_PIXEL_SAMPLING_RATE_INPUT)
-        TEXTURE2D(COMPOSITE_INDIRECT_PIXEL_SAMPLING_RATE_INPUT)
+        TEXTURE2D(COMPOSITE_PIXEL_SAMPLING_RATE_INPUT)
         SAMPLER3D(COMPOSITE_VOLUME_FILTERED_RADIANCE_AGE_INPUT)
         SAMPLER3D(COMPOSITE_VOLUME_FILTERED_RADIANCE_Y_INPUT)
         SAMPLER3D(COMPOSITE_VOLUME_FILTERED_RADIANCE_CO_CG_INPUT)
         TEXTURE2D(COMPOSITE_ALPHA_GBUFFER_INPUT)
         TEXTURE2D(COMPOSITE_ACTIVE_PIXEL_MASK_INPUT)
         TEXTURE2D(COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
-        TEXTURE2D(COMPOSITE_DIRECT_ACTIVE_PIXEL_MASK_INPUT)
-        TEXTURE2D(COMPOSITE_INDIRECT_ACTIVE_PIXEL_MASK_INPUT)
         TEXTURE2DARRAY(COMPOSITE_BLUE_NOISE_TEXTURE)
         SAMPLER3D(COMPOSITE_VALUE_NOISE_SAMPLER)
         SAMPLER2D(COMPOSITE_SKY_LIGHT_TEXTURE)
-        TEXTURE3D(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT)
-        SAMPLER(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_SAMPLER)
+        TEXTURE2D(COMPOSITE_ATMOSPHERE_FOREGROUND_INPUT)
+        TEXTURE2D(COMPOSITE_SECONDARY_HIT_DISTANCE_INPUT)
+        // Sky provider (NUMOS): cloud composite and aerial perspective.
+        CONSTANT_BUFFER(COMPOSITE_SKY_ARGS)
+        TEXTURE2D(COMPOSITE_SKY_CLOUD_RENDER_INPUT)
+        TEXTURE2D(COMPOSITE_SKY_CLOUD_DEPTH_INPUT)
+        TEXTURE3D(COMPOSITE_SKY_AP_NEAR_SCATTER_INPUT)
+        TEXTURE3D(COMPOSITE_SKY_AP_FAR_SCATTER_INPUT)
+        TEXTURE3D(COMPOSITE_SKY_AP_FAR_TRANSMITTANCE_INPUT)
+        TEXTURE3D(COMPOSITE_SKY_AP_FROXEL_AUX_INPUT)
+        STRUCTURED_BUFFER(COMPOSITE_SKY_AP_LIGHTS_INPUT)
+        STRUCTURED_BUFFER(COMPOSITE_SKY_AP_LIGHT_CLUSTERS_INPUT)
+        SAMPLER(COMPOSITE_SKY_AP_SAMPLER)
+        TEXTURE2D(COMPOSITE_SKY_TRANSMITTANCE_LUT_INPUT)
+        TEXTURE2D(COMPOSITE_SKY_MULTISCATTERING_LUT_INPUT)
+        TEXTURE2D(COMPOSITE_SKY_SKY_VIEW_LUT_INPUT)
+        SAMPLER(COMPOSITE_SKY_SKY_VIEW_SAMPLER)
+        TEXTURE2D(COMPOSITE_SKY_CLOUD_SKY_TRANSMITTANCE_LUT_INPUT)
+        TEXTURE3D(COMPOSITE_SKY_CLOUD_SHADOW_MAP_INPUT)
+        SAMPLER(COMPOSITE_SKY_CLOUD_NOISE_SAMPLER)
+        TEXTURE2D(COMPOSITE_SKY_CLOUD_SECONDARY_LUT_INPUT)
+        STRUCTURED_BUFFER(COMPOSITE_SKY_NIGHT_SKY_STAR_CELLS_INPUT)
+        STRUCTURED_BUFFER(COMPOSITE_SKY_NIGHT_SKY_STARS_INPUT)
+        STRUCTURED_BUFFER(COMPOSITE_SKY_NIGHT_SKY_MILKY_WAY_INPUT)
+        TEXTURE2D(COMPOSITE_SKY_NIGHT_SKY_STARLIGHT_LOW_INPUT)
+        TEXTURE2D(COMPOSITE_SKY_NIGHT_SKY_MOON_INPUT)
 
         RW_TEXTURE2D(COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ACCUMULATED_FINAL_OUTPUT_INPUT_OUTPUT)
@@ -136,9 +156,14 @@ namespace dxvk {
         RW_TEXTURE2D(COMPOSITE_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_LAST_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ALPHA_BLEND_RADIANCE_OUTPUT)
-        RW_TEXTURE2D(COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_DEBUG_VIEW_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT)
+        RW_TEXTURE2D(COMPOSITE_DLSS_NR_CONTROL_MASK_OUTPUT)
+        RW_TEXTURE2D(COMPOSITE_BIAS_CURRENT_COLOR_MASK_INPUT_OUTPUT)
+        RW_TEXTURE2D(COMPOSITE_PRIMARY_DEPTH_INPUT_OUTPUT)
+        RW_TEXTURE2D(COMPOSITE_PRIMARY_SCREEN_SPACE_MOTION_VECTOR_INPUT_OUTPUT)
+        RW_TEXTURE2D(COMPOSITE_PRIMARY_DEPTH_DLSSRR_INPUT_OUTPUT)
+        RW_TEXTURE2D(COMPOSITE_PRIMARY_SCREEN_SPACE_MOTION_VECTOR_DLSSRR_INPUT_OUTPUT)
       END_PARAMETER()
     };
 
@@ -181,6 +206,7 @@ namespace dxvk {
 
     ImGui::BeginDisabled(!enableFog());
     ImGui::Indent();
+    RemixGui::Checkbox("Apply Fog to Sky", &fogApplyToSkyObject());
     RemixGui::DragFloat("Fog Color Scale", &fogColorScaleObject(), 0.01f, 0.0f, 10.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
     RemixGui::DragFloat("Max Fog Distance", &maxFogDistanceObject(), 1.f, 0.0f, 0.f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
     ImGui::Unindent();
@@ -323,6 +349,8 @@ namespace dxvk {
     ctx->bindResourceView(COMPOSITE_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
     ctx->bindResourceView(COMPOSITE_SHARED_RADIANCE_RG_INPUT, rtOutput.m_sharedRadianceRG.view, nullptr);
     ctx->bindResourceView(COMPOSITE_SHARED_RADIANCE_B_INPUT, rtOutput.m_sharedRadianceB.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_ATMOSPHERE_FOREGROUND_INPUT, rtOutput.m_atmosphereForeground.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_SECONDARY_HIT_DISTANCE_INPUT, rtOutput.m_secondaryHitDistance.view, nullptr);
     
     ctx->bindResourceView(COMPOSITE_PRIMARY_ATTENUATION_INPUT, rtOutput.m_primaryAttenuation.view, nullptr);
     
@@ -350,13 +378,10 @@ namespace dxvk {
     const DxvkReSTIRGIRayQuery& restirGI = ctx->getCommonObjects()->metaReSTIRGIRayQuery();
     ctx->bindResourceView(COMPOSITE_BSDF_FACTOR_INPUT, rtOutput.m_bsdfFactor.view, nullptr);
     ctx->bindResourceView(COMPOSITE_BSDF_FACTOR2_INPUT, restirGI.getBsdfFactor2().view, nullptr);
-    ctx->bindResourceView(COMPOSITE_DIRECT_PIXEL_SAMPLING_RATE_INPUT, rtOutput.m_sparseRenderingDirectPixelSamplingRate.view, nullptr);
-    ctx->bindResourceView(COMPOSITE_INDIRECT_PIXEL_SAMPLING_RATE_INPUT, rtOutput.m_sparseRenderingIndirectPixelSamplingRate.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_PIXEL_SAMPLING_RATE_INPUT, rtOutput.m_sparseRenderingPixelSamplingRate.view, nullptr);
     ctx->bindResourceView(COMPOSITE_ALPHA_GBUFFER_INPUT, rtOutput.m_alphaBlendGBuffer.view, nullptr);
-    ctx->bindResourceView(COMPOSITE_ACTIVE_PIXEL_MASK_INPUT, rtOutput.m_sparseRenderingUnionActivePixelMask.view, nullptr);
-    ctx->bindResourceView(COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT, rtOutput.m_sparseRenderingUnionActiveLocalPixelCoords.view, nullptr);
-    ctx->bindResourceView(COMPOSITE_DIRECT_ACTIVE_PIXEL_MASK_INPUT, rtOutput.m_sparseRenderingDirectActivePixelMask.view, nullptr);
-    ctx->bindResourceView(COMPOSITE_INDIRECT_ACTIVE_PIXEL_MASK_INPUT, rtOutput.m_sparseRenderingIndirectActivePixelMask.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_ACTIVE_PIXEL_MASK_INPUT, rtOutput.m_sparseRenderingActivePixelMask.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT, rtOutput.m_sparseRenderingActiveLocalPixelCoords.view, nullptr);
 
     // Note: Clamp to edge used to avoid interpolation to black on the edges of the view.
     Rc<DxvkSampler> linearSampler = ctx->getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
@@ -386,9 +411,19 @@ namespace dxvk {
 
     DebugView& debugView = ctx->getDevice()->getCommon()->metaDebugView();
     ctx->bindResourceView(COMPOSITE_DEBUG_VIEW_OUTPUT, debugView.getDebugOutput(), nullptr);
-    ctx->bindResourceView(COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT, rtOutput.m_rayReconstructionParticleBuffer.view, nullptr);
     ctx->bindResourceView(COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT,
       ctx->useRayReconstruction() ? rtOutput.m_rayReconstructionHitDistance.view(Resources::AccessType::Write) : nullptr, nullptr);
+    ctx->bindResourceView(COMPOSITE_DLSS_NR_CONTROL_MASK_OUTPUT, rtOutput.m_controlMask.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_BIAS_CURRENT_COLOR_MASK_INPUT_OUTPUT,
+      rtOutput.m_sharedBiasCurrentColorMask.view(Resources::AccessType::ReadWrite), nullptr);
+    // The cloud motion vector targets. Every path tracing pass that reads them has run by now, so the
+    // composite can write the clouds' values for the upscalers and frame generation in place.
+    ctx->bindResourceView(COMPOSITE_PRIMARY_DEPTH_INPUT_OUTPUT, rtOutput.m_primaryDepth.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_PRIMARY_SCREEN_SPACE_MOTION_VECTOR_INPUT_OUTPUT, rtOutput.m_primaryScreenSpaceMotionVector.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_PRIMARY_DEPTH_DLSSRR_INPUT_OUTPUT,
+      ctx->useRayReconstruction() ? rtOutput.m_primaryDepthDLSSRR.view(Resources::AccessType::ReadWrite) : nullptr, nullptr);
+    ctx->bindResourceView(COMPOSITE_PRIMARY_SCREEN_SPACE_MOTION_VECTOR_DLSSRR_INPUT_OUTPUT,
+      ctx->useRayReconstruction() ? rtOutput.m_primaryScreenSpaceMotionVectorDLSSRR.view : nullptr, nullptr);
     const DomeLightArgs& domeLightArgs = sceneManager.getLightManager().getDomeLightArgs();
     ctx->bindResourceSampler(COMPOSITE_SKY_LIGHT_TEXTURE, linearSampler);
     if (domeLightArgs.active && domeLightArgs.textureIndex != BINDING_INDEX_INVALID) {
@@ -400,27 +435,15 @@ namespace dxvk {
       ctx->bindResourceView(COMPOSITE_SKY_LIGHT_TEXTURE, ctx->getResourceManager().getSkyMatte(ctx).view, nullptr);
     }
 
-    // Aerial perspective volume. Null outside Numos / when the feature is off, where the shader also
-    // skips sampling it (aerialPerspectiveLutSize == 0).
-    {
-      RtxAtmosphere& atmosphere = ctx->getCommonObjects()->metaAtmosphere();
-      const Resources::Resource aerialPerspectiveLut = atmosphere.getAerialPerspectiveLut();
-      const bool aerialPerspectiveActive = RtxOptions::skyMode() == SkyMode::Numos
-        && RtxAtmosphere::aerialPerspective()
-        && aerialPerspectiveLut.isValid();
-
-      ctx->bindResourceSampler(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_SAMPLER, linearSampler);
-      ctx->bindResourceView(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT,
-        aerialPerspectiveActive ? aerialPerspectiveLut.view : nullptr, nullptr);
-    }
-
     compositeArgs.camera = sceneManager.getCamera().getShaderConstants();
     compositeArgs.frameIdx = frameIdx;
 
     if (enableFog()) {
-      const float colorScale = fogColorScale();
+      // Pre-exposure (rtx_pre_exposure.h): the fog colour is radiance.
+      const float colorScale = fogColorScale() * PreExposure::get();
       auto& fog = settings.fog;
-      compositeArgs.fogMode = fog.mode;
+      compositeArgs.fogMode = static_cast<uint32_t>(fog.mode);
+      compositeArgs.fogApplyToSky = fogApplyToSky();
       compositeArgs.fogColor = { fog.color.x * colorScale, fog.color.y * colorScale, fog.color.z * colorScale };
       // Todo: Scene scale stuff ignored for now because scene scale stuff is not actually functioning properly. Add back in if it's ever fixed.
       // compositeArgs.fogEnd = fog.end * RtxOptions::sceneScale();
@@ -447,17 +470,30 @@ namespace dxvk {
     auto& rayReconstruction = ctx->getCommonObjects()->metaRayReconstruction();
     compositeArgs.postFilterThreshold = postFilterThreshold();
     compositeArgs.pixelHighlightReuseStrength = 1.0 / pixelHighlightReuseStrength();
-    compositeArgs.enableRtxdi = RtxOptions::useRTXDI();
+    compositeArgs.enableRtxdi = RtxOptions::rtxdiActive();
     compositeArgs.enableReSTIRGI = RtxOptions::useReSTIRGI();
     compositeArgs.sparseRenderingArgs = rtOutput.m_raytraceArgs.sparseRenderingArgs;
     compositeArgs.volumeArgs = rtOutput.m_raytraceArgs.volumeArgs;
-    compositeArgs.atmosphereArgs = rtOutput.m_raytraceArgs.atmosphereArgs;
-    compositeArgs.outputParticleLayer = ctx->useRayReconstruction() && rayReconstruction.useParticleBuffer();
-    compositeArgs.outputSecondarySignalToParticleLayer = ctx->useRayReconstruction() && rayReconstruction.preprocessSecondarySignal();
-    compositeArgs.enableDemodulateAttenuation = ctx->useRayReconstruction() && rayReconstruction.demodulateAttenuation();
+    // Sky provider (NUMOS): active only while it rendered this frame.
+    ctx->getCommonObjects()->metaNumos().bindCompositeResources(*ctx, compositeArgs.skyProviderActive,
+      compositeArgs.skyWorldUnitsPerKm, compositeArgs.skyRadianceScale, compositeArgs.skyHostSkyOverride,
+      compositeArgs.skyCloudsValid);
+    // A submerged camera (any start-in medium): no aerial perspective, see composite_args.h.
+    compositeArgs.skyCameraInMedium =
+      rtOutput.m_raytraceArgs.startInMediumMaterialIndex != SURFACE_INDEX_INVALID ? 1u : 0u;
+    // The upscaler's bias mask: NUMOS's layer share, and the unordered-emissive bits only where the
+    // active upscaler's anti-ghost option asks for them (DLSS and ray reconstruction only).
+    compositeArgs.skyWriteBiasMask = ctx->getCommonObjects()->metaNumos().writesUpscalerBiasMask() ? 1u : 0u;
+    compositeArgs.skyBiasMaskKeepUnorderedEmissive =
+      (RtxOptions::isDLSSEnabled() && ctx->getCommonObjects()->metaDLSS().biasCurrentColorEnabled()) ||
+      (RtxOptions::isRayReconstructionEnabled() && rayReconstruction.biasCurrentColorEnabled()) ? 1u : 0u;
+    compositeArgs.useRayReconstruction = ctx->useRayReconstruction();
+    compositeArgs.cloudMotionVectors = ctx->getCommonObjects()->metaNumos().writesCloudMotionVectors();
+    compositeArgs.cloudMotionVectorCoverage = RtxNumos::cloudMotionVectorCoverage();
+    compositeArgs.cloudMotionVectorMissDepth = sceneManager.getGlobals().clearColorDepth;
     compositeArgs.enhanceAlbedo = ctx->useRayReconstruction() && rayReconstruction.enableDetailEnhancement();
-    compositeArgs.compositeVolumetricLight = ctx->useRayReconstruction() && rayReconstruction.compositeVolumetricLight();
     compositeArgs.writeRayReconstructionHitDistance = ctx->useRayReconstruction() ? 1u : 0u;
+    compositeArgs.enableDlssNrVolumetricControlMask = rtOutput.m_raytraceArgs.enableDlssNrVolumetricControlMask;
 
     NrdArgs primaryDirectNrdArgs;
     NrdArgs primaryIndirectNrdArgs;
@@ -501,7 +537,8 @@ namespace dxvk {
     compositeArgs.stochasticAlphaBlendRadianceVolumeMultiplier = stochasticAlphaBlendRadianceVolumeMultiplier();
     compositeArgs.alphaBlendSurfacePackMult = RtxOptions::getMeterToWorldUnitScale();
     
-    compositeArgs.clearColorFinalColor = sceneManager.getGlobals().clearColorFinalColor;
+    // Pre-exposure (rtx_pre_exposure.h): radiance sources, like the sky and the dome light below.
+    compositeArgs.clearColorFinalColor = sceneManager.getGlobals().clearColorFinalColor * PreExposure::get();
 
     // TODO: These are copied from raytrace_args.  Perhaps we should unify this...
     
@@ -517,15 +554,8 @@ namespace dxvk {
     memcpy(&compositeArgs.rayPortalHitInfos[maxRayPortalCount], &portalData.previousRayPortalHitInfos, sizeof(portalData.previousRayPortalHitInfos));
 
     compositeArgs.domeLightArgs = domeLightArgs;
-    compositeArgs.skyBrightness = RtxOptions::skyBrightness();
-    // Cloud-shadow composite application removed 2026-06-19 (fork). The
-    // screen-space PrimaryCloudShadowFactor texture and the pow(factor,
-    // cloudShadowFactorStrength) multiply on post-denoise primary direct radiance
-    // were deleted when the cloud shadow moved onto the sun term in the NEE
-    // (atmosphere_common.slangh). The contrast knob is now populated into
-    // atmosphereArgs (rtx_atmosphere.cpp). composite_args.h::pad1/pad2 are the
-    // retired cloudShadowFactorStrength / cloudShadowIndirectStrength CB slots.
-
+    compositeArgs.domeLightArgs.radiance = compositeArgs.domeLightArgs.radiance * PreExposure::get();
+    compositeArgs.skyBrightness = RtxOptions::skyBrightness() * PreExposure::get();
     const bool sparseRenderingEnabled = rtOutput.m_raytraceArgs.sparseRenderingArgs.mode != SparseRenderingMode::Off;
 
     Rc<DxvkBuffer> cb = getCompositeConstantsBuffer();

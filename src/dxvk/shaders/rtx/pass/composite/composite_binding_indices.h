@@ -50,10 +50,7 @@
 
 #define COMPOSITE_BSDF_FACTOR_INPUT                                 17
 #define COMPOSITE_BSDF_FACTOR2_INPUT                                18
-// Slot 19 was COMPOSITE_PRIMARY_CLOUD_SHADOW_FACTOR_INPUT (fork screen-space
-// cloud shadow). Removed 2026-06-19 when the cloud shadow moved onto the sun
-// term in the NEE; the number is left reserved (no descriptor bound) so the
-// remaining slot numbers stay stable rather than renumbering 20..26.
+// Slot 19 is reserved with no descriptor bound, so the later slot numbers stay stable.
 
 #define COMPOSITE_VOLUME_FILTERED_RADIANCE_AGE_INPUT                20
 #define COMPOSITE_VOLUME_FILTERED_RADIANCE_Y_INPUT                  21
@@ -65,17 +62,54 @@
 #define COMPOSITE_SKY_LIGHT_TEXTURE                                 26
 #define COMPOSITE_ACTIVE_PIXEL_MASK_INPUT                           27
 #define COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT                   28
-#define COMPOSITE_DIRECT_ACTIVE_PIXEL_MASK_INPUT                    33
-#define COMPOSITE_INDIRECT_ACTIVE_PIXEL_MASK_INPUT                  34
-#define COMPOSITE_DIRECT_PIXEL_SAMPLING_RATE_INPUT                  58
-#define COMPOSITE_INDIRECT_PIXEL_SAMPLING_RATE_INPUT                59
-#define COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT               60
-#define COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_SAMPLER             61
+#define COMPOSITE_PIXEL_SAMPLING_RATE_INPUT                         58
+// 64-69: free (59 is COMPOSITE_DLSS_NR_CONTROL_MASK_OUTPUT and 60-63 are the cloud motion vector
+// targets below). The sky provider's (NUMOS) composite inputs are at 72-89.
+#define COMPOSITE_ATMOSPHERE_FOREGROUND_INPUT                      70
+// Virtual hit distance of the secondary (PSR) surface, -1 on a miss. Aerial perspective on PSR pixels.
+#define COMPOSITE_SECONDARY_HIT_DISTANCE_INPUT                     71
+
+// Sky provider (NUMOS) outputs for the cloud composite and the aerial perspective, under the names of
+// numos/host/numos_host.slangh's binding contract where it has one.
+#define COMPOSITE_SKY_ARGS                                         72
+#define COMPOSITE_SKY_CLOUD_RENDER_INPUT                           73
+#define COMPOSITE_SKY_CLOUD_DEPTH_INPUT                            74
+#define COMPOSITE_SKY_AP_NEAR_SCATTER_INPUT                        75
+#define COMPOSITE_SKY_AP_FAR_SCATTER_INPUT                         76
+#define COMPOSITE_SKY_AP_FAR_TRANSMITTANCE_INPUT                   77
+#define COMPOSITE_SKY_AP_FROXEL_AUX_INPUT                          78
+#define COMPOSITE_SKY_AP_LIGHTS_INPUT                              79
+#define COMPOSITE_SKY_AP_LIGHT_CLUSTERS_INPUT                      80
+#define COMPOSITE_SKY_AP_SAMPLER                                   81
+#define COMPOSITE_SKY_TRANSMITTANCE_LUT_INPUT                      82
+#define COMPOSITE_SKY_MULTISCATTERING_LUT_INPUT                    83
+#define COMPOSITE_SKY_SKY_VIEW_LUT_INPUT                           84
+#define COMPOSITE_SKY_SKY_VIEW_SAMPLER                             85
+#define COMPOSITE_SKY_CLOUD_SKY_TRANSMITTANCE_LUT_INPUT            86
+#define COMPOSITE_SKY_CLOUD_SHADOW_MAP_INPUT                       87
+#define COMPOSITE_SKY_CLOUD_NOISE_SAMPLER                          88
+#define COMPOSITE_SKY_CLOUD_SECONDARY_LUT_INPUT                    89
+// The night sky data (FrameOutputs::nightSky*), for the moon's surface in the disks the composite adds.
+#define COMPOSITE_SKY_NIGHT_SKY_STAR_CELLS_INPUT                   90
+#define COMPOSITE_SKY_NIGHT_SKY_STARS_INPUT                        91
+#define COMPOSITE_SKY_NIGHT_SKY_MILKY_WAY_INPUT                    92
+#define COMPOSITE_SKY_NIGHT_SKY_STARLIGHT_LOW_INPUT                93
+#define COMPOSITE_SKY_NIGHT_SKY_MOON_INPUT                         94
 
 // Inputs/Outputs
 
 #define COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT                       30
 #define COMPOSITE_ACCUMULATED_FINAL_OUTPUT_INPUT_OUTPUT             31
+// The upscalers' bias-current-colour mask (Resources::m_sharedBiasCurrentColorMask): the geometry
+// resolver's unordered-emissive mask in, with the sky provider's layer share folded in (skyWriteBiasMask).
+#define COMPOSITE_BIAS_CURRENT_COLOR_MASK_INPUT_OUTPUT              32
+// The primary depth and screen-space motion vectors the upscalers and frame generation read. Where the
+// sky provider's clouds hide a pixel's surface, the composite replaces them with the cloud's
+// (CompositeArgs::cloudMotionVectors). The ray reconstruction copies are bound only while it runs.
+#define COMPOSITE_PRIMARY_DEPTH_INPUT_OUTPUT                        60
+#define COMPOSITE_PRIMARY_SCREEN_SPACE_MOTION_VECTOR_INPUT_OUTPUT   61
+#define COMPOSITE_PRIMARY_DEPTH_DLSSRR_INPUT_OUTPUT                 62
+#define COMPOSITE_PRIMARY_SCREEN_SPACE_MOTION_VECTOR_DLSSRR_INPUT_OUTPUT 63
 
 // Outputs
 
@@ -83,6 +117,6 @@
 #define COMPOSITE_LAST_FINAL_OUTPUT                                 52
 #define COMPOSITE_ALPHA_BLEND_RADIANCE_OUTPUT                       53
 
-#define COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT         54
-#define COMPOSITE_DEBUG_VIEW_OUTPUT                                 55
-#define COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT            57
+#define COMPOSITE_DEBUG_VIEW_OUTPUT                                 54
+#define COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT            55
+#define COMPOSITE_DLSS_NR_CONTROL_MASK_OUTPUT                       59

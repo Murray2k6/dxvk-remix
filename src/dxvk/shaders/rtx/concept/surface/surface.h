@@ -153,17 +153,11 @@ struct Surface
     set { data2.w = newValue ? packedFlagSet(data2.w, 1 << 29) : packedFlagUnset(data2.w, 1 << 29); }
   }
 
-  property bool ignoreTransparencyLayer
-  {
-    get { return packedFlagGet(data2.w, 1 << 30); }
-    set { data2.w = newValue ? packedFlagSet(data2.w, 1 << 30) : packedFlagUnset(data2.w, 1 << 30); }
-  }
-
   // SceneManager preserve path (usePreservePath); not the same as motion-related isStatic.
   property bool isPreservePath
   {
-    get { return packedFlagGet(data2.w, 1 << 31); }
-    set { data2.w = newValue ? packedFlagSet(data2.w, 1 << 31) : packedFlagUnset(data2.w, 1 << 31); }
+    get { return packedFlagGet(data2.w, 1 << 30); }
+    set { data2.w = newValue ? packedFlagSet(data2.w, 1 << 30) : packedFlagUnset(data2.w, 1 << 30); }
   }
 
   // Matrices
@@ -310,11 +304,6 @@ struct Surface
     get { return packedFlagGet(data0b.z, 1 << 1); }
     set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 1) : packedFlagUnset(data0b.z, 1 << 1); }
   }
-
-  // flags0 bit 2 (data0b.z) is FREE again. It briefly held isDecalCategory (fork —
-  // 2026-06-18), a blend-independent decal flag read by the cloud-shadow zenith
-  // gate; that gate and flag were removed 2026-06-19 when the cloud shadow moved
-  // onto the sun term in the NEE (no geometry test needed any more).
 
   property uint16_t hashPacked
   {
@@ -501,9 +490,17 @@ struct Surface
     set { data2.x = newValue; }
   }
 
+  // See RtEyeParams::eyeballOrigin (rtx_materials.h) for what this is decoded from.
   property vec3 eyeOrigin
   {
     get { return asfloat(data15.xyz); }
+  }
+
+  // Bindless slot of the geometry's SCCR shell data (sccr_shell_args.h), BINDING_INDEX_INVALID when it has none.
+  // The low 16 bits of data15.w. The high 16 bits are reserved.
+  property uint16_t shellBufferIndex
+  {
+    get { return uint16_t(data15.w & 0xFFFFu); }
   }
 };
 
@@ -544,6 +541,23 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   vec3 rawBitangent = 0.f;
   vec4 vertexColor = 0.0f;
   float triangleArea = 0.f;
+  // SCCR displacement fields (surface_interaction_sccr.slangh). surfaceInteractionCreate fills them in SCCR mode only.
+  // World units per UV unit along the triangle's larger UV axis. 0 means unknown.
+  float pomUvToWorld = 0.f;
+  // The smooth base surface at the hit, over the triangle: height, d/du, d/dv (world units) and its bound.
+  vec4 pomBaseLinear = 0.f;
+  // The base surface's second derivatives over UV (uu, uv, vv).
+  vec3 pomBaseQuadric = 0.f;
+  // The along-ray world distance from the mesh point to the relief point the primary march found, negative where the
+  // relief stands above the mesh. Set in G-buffer passes with rtx.displacement.enableDepthOffset and read only for the
+  // depth and motion outputs (geometry_resolver.slangh).
+  float pomDepthOffset = 0.f;
+  // The shell march (sccrShellResolve) already placed the texture coordinates and re-framed this interaction, so
+  // opaqueSurfaceMaterialInteractionCreate skips its own POM march.
+  bool pomShellDone = false;
+  // With pomShellDone, the shell marker the G-buffer stores in SharedTextureCoord.w (sccrShellMarkerEncode), so the
+  // self-shadows find the relief point's prism again.
+  float pomShellMarker = 0.f;
 };
 
 struct GBufferMemoryMinimalSurfaceInteraction

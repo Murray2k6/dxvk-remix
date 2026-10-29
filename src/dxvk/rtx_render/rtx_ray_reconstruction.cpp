@@ -24,6 +24,7 @@
 #include <cassert>
 
 #include "rtx.h"
+#include "rtx_pre_exposure.h"
 #include "rtx_context.h"
 #include "rtx_options.h"
 #include "rtx/pass/tonemap/tonemapping.h"
@@ -70,6 +71,7 @@ namespace dxvk {
         TEXTURE2D(RAY_RECONSTRUCTION_NORMALS_DLSSRR_INPUT)
         TEXTURE2D(RAY_RECONSTRUCTION_DEPTHS_INPUT)
         TEXTURE2D(RAY_RECONSTRUCTION_MOTION_VECTOR_INPUT)
+        TEXTURE2D(RAY_RECONSTRUCTION_INPUT_COLOR_INPUT)
 
         RW_TEXTURE2D(RAY_RECONSTRUCTION_PRIMARY_ALBEDO_INPUT_OUTPUT)
         RW_TEXTURE2D(RAY_RECONSTRUCTION_PRIMARY_SPECULAR_ALBEDO_INPUT_OUTPUT)
@@ -81,10 +83,12 @@ namespace dxvk {
     };
   }
 
+  // Combo box shared with dxvk_imgui.cpp
+  extern RemixGui::ComboWithKey<DxvkRayReconstruction::RayReconstructionPreset> rayReconstructionPresetCombo;
+
   DxvkRayReconstruction::DxvkRayReconstruction(DxvkDevice* device)
     : DxvkDLSS(device)
-    , m_prevModel(model())
-    , m_prevEnableTransformerModelD(enableTransformerModelD()) {
+    , m_prevPreset(preset()) {
 
     DxvkBufferCreateInfo info;
     info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -106,10 +110,6 @@ namespace dxvk {
     return m_device->getCommon()->metaNGXContext().supportsRayReconstruction();
   }
 
-  DxvkRayReconstruction::RayReconstructionParticleBufferMode DxvkRayReconstruction::getParticleBufferMode() {
-    return RtxOptions::isRayReconstructionEnabled() ? particleBufferMode() : RayReconstructionParticleBufferMode::None;
-  }
-
   void DxvkRayReconstruction::release() {
     m_rayReconstructionContext = {};
     mRecreate = true;
@@ -121,10 +121,6 @@ namespace dxvk {
 
   bool DxvkRayReconstruction::useRayReconstruction() const {
     return supportsRayReconstruction() && RtxOptions::isRayReconstructionEnabled();
-  }
-
-  bool DxvkRayReconstruction::denoiseSecondarySignalWithExternalDenoiser() const {
-    return useRayReconstruction() && !enableNRDForTraining() && preprocessSecondarySignal();
   }
 
   void DxvkRayReconstruction::dispatch(
@@ -142,11 +138,9 @@ namespace dxvk {
 
     bool dlssAutoExposure = true;
     mRecreate |= (mAutoExposure != dlssAutoExposure)
-      || m_prevModel != model()
-      || m_prevEnableTransformerModelD != enableTransformerModelD();
+      || m_prevPreset != preset();
     mAutoExposure = dlssAutoExposure;
-    m_prevModel = model();
-    m_prevEnableTransformerModelD = enableTransformerModelD();
+    m_prevPreset = preset();
 
     if (mRecreate) {
       initializeRayReconstruction(ctx);
@@ -175,7 +169,6 @@ namespace dxvk {
       constants.enableDemodulateRoughness = demodulateRoughness() ? 1 : 0;
       constants.upscalerRoughnessDemodulationMultiplier = upscalerRoughnessDemodulationMultiplier();
       constants.upscalerRoughnessDemodulationOffset = upscalerRoughnessDemodulationOffset();
-      constants.particleBufferMode = (uint32_t)getParticleBufferMode();
       constants.frameIdx = rtOutput.m_raytraceArgs.frameIdx;
       constants.enableDisocclusionMaskBlur = enableDisocclusionMaskBlur();
       constants.disocclusionMaskBlurRadius = disocclusionMaskBlurRadius();
@@ -207,6 +200,8 @@ namespace dxvk {
       ctx->bindResourceView(RAY_RECONSTRUCTION_NORMALS_DLSSRR_INPUT, rtOutput.m_primaryWorldShadingNormalDLSSRR.view(Resources::AccessType::Read), nullptr);
       ctx->bindResourceView(RAY_RECONSTRUCTION_DEPTHS_INPUT, depthInput->view, nullptr);
       ctx->bindResourceView(RAY_RECONSTRUCTION_MOTION_VECTOR_INPUT, motionVectorInput->view, nullptr);
+      // Color fed into DLSS-RR (composite output), for the input-color debug view.
+      ctx->bindResourceView(RAY_RECONSTRUCTION_INPUT_COLOR_INPUT, rtOutput.m_compositeOutput.view(Resources::AccessType::Read), nullptr);
 
       // Inputs/Outputs
 
@@ -241,7 +236,6 @@ namespace dxvk {
         rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read),
         rtOutput.m_primaryAlbedo.view,
         rtOutput.m_sharedBiasCurrentColorMask.view(Resources::AccessType::Read),
-        rtOutput.m_rayReconstructionParticleBuffer.view,
         rtOutput.m_primaryWorldShadingNormalDLSSRR.view(Resources::AccessType::Read),
         rtOutput.m_primarySpecularAlbedo.view(Resources::AccessType::Read),
         rtOutput.m_primaryPerceptualRoughness.view,
@@ -319,14 +313,16 @@ namespace dxvk {
       buffers.pRoughness = &rtOutput.m_primaryPerceptualRoughness;
       buffers.pBiasCurrentColorMask = &rtOutput.m_sharedBiasCurrentColorMask.resource(Resources::AccessType::Read);
       buffers.pHitDistance = useSpecularHitDistance() ? &rtOutput.m_rayReconstructionHitDistance.resource(Resources::AccessType::Read) : nullptr;
-      buffers.pInTransparencyLayer = getParticleBufferMode() == RayReconstructionParticleBufferMode::RayReconstructionUpscaling ? &rtOutput.m_rayReconstructionParticleBuffer : nullptr;
       buffers.pDisocclusionMask = enableDisocclusionMaskBlur()
         ? &rtOutput.m_primaryDisocclusionMaskForRR.resource(Resources::AccessType::Read)
         : &rtOutput.m_primaryDisocclusionThresholdMix;
 
       NGXRayReconstructionContext::NGXSettings settings;
-      settings.resetAccumulation = resetHistory;
-      settings.antiGhost = m_biasCurrentColorEnabled;
+      // DLSS-RR takes no exposure input, so it reads the colour at the scale it is given. The colour stays
+      // pre-exposed (rtx_pre_exposure.h), which keeps it near display range whatever the scene's physical level,
+      // and NGX is not told about P. Its history is reset on the rare frames P steps.
+      settings.resetAccumulation = resetHistory || PreExposure::stepped();
+      settings.antiGhost = m_biasCurrentColorEnabled || device()->getCommon()->metaNumos().writesUpscalerBiasMask();
       settings.preExposure = mPreExposure;
       settings.jitterOffset[0] = jitterOffset[0];
       settings.jitterOffset[1] = jitterOffset[1];
@@ -366,18 +362,14 @@ namespace dxvk {
 
       constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
 
-      RemixGui::Combo("Particle Mode", &particleBufferModeObject(), "None\0DLSS-RR Upscaling\0");
       RemixGui::Checkbox("Use Specular Hit Distance", &useSpecularHitDistanceObject());
       RemixGui::Checkbox("Preserve Settings in Native Mode", &preserveSettingsInNativeModeObject());
       RemixGui::Checkbox("Combine Specular Albedo", &combineSpecularAlbedoObject());
-      RemixGui::Checkbox("DLSS-RR Demodulate Attenuation", &demodulateAttenuationObject());
       RemixGui::Checkbox("DLSS-RR Detail Enhancement", &enableDetailEnhancementObject());
-      RemixGui::Checkbox("Preprocess Secondary Signal", &preprocessSecondarySignalObject());
       RemixGui::Checkbox("DLSS-RR Demodulate Roughness", &demodulateRoughnessObject());
       RemixGui::DragFloat("DLSS-RR Roughness Sensitivity", &upscalerRoughnessDemodulationOffsetObject(), 0.01f, 0.0f, 2.0f, "%.3f");
       RemixGui::DragFloat("DLSS-RR Roughness Multiplier", &upscalerRoughnessDemodulationMultiplierObject(), 0.01f, 0.0f, 20.0f, "%.3f");
-      RemixGui::Checkbox("Composite Volumetric Light", &compositeVolumetricLightObject());
-      RemixGui::Checkbox("Transformer Model D", &enableTransformerModelDObject());
+      rayReconstructionPresetCombo.getKey(&presetObject());
 
       if (RemixGui::CollapsingHeader("Disocclusion Mask")) {
         ImGui::Indent();
@@ -385,6 +377,7 @@ namespace dxvk {
         RemixGui::Checkbox("Blur", &enableDisocclusionMaskBlurObject());
         RemixGui::DragInt("Blur Radius", &disocclusionMaskBlurRadiusObject(), 1.f, 1, 64, "%d", sliderFlags);
         RemixGui::DragFloat("Blur Normalized Gaussian Weight Sigma", &disocclusionMaskBlurNormalizedGaussianWeightSigmaObject(), 0.01f, 0.0f, 3.0f, "%.3f", sliderFlags);
+        RemixGui::Checkbox("Invalidate History for Animated Water", &invalidateHistoryForAnimatedWaterObject());
 
         ImGui::Unindent();
       }
@@ -414,7 +407,7 @@ namespace dxvk {
     // Update our requested profile
     mProfile = profile;
 
-    NVSDK_NGX_PerfQuality_Value perfQuality = profileToQuality(mActualProfile);
+    NVSDK_NGX_PerfQuality_Value perfQuality = profileToQuality<NVSDK_NGX_PerfQuality_Value>(mActualProfile);
 
     if (!m_rayReconstructionContext) {
       m_rayReconstructionContext = m_device->getCommon()->metaNGXContext().createRayReconstructionContext();
@@ -438,16 +431,23 @@ namespace dxvk {
       m_rayReconstructionContext = m_device->getCommon()->metaNGXContext().createRayReconstructionContext();
     }
 
-    NVSDK_NGX_PerfQuality_Value perfQuality = profileToQuality(mActualProfile);
+    NVSDK_NGX_PerfQuality_Value perfQuality = profileToQuality<NVSDK_NGX_PerfQuality_Value>(mActualProfile);
 
     if (m_rayReconstructionContext) {
 
-      // Model to use for DLSS-RR
-      NVSDK_NGX_RayReconstruction_Hint_Render_Preset dlssdModel = (model() == RayReconstructionModel::CNN)
-        ? /* CNN */ NVSDK_NGX_RayReconstruction_Hint_Render_Preset_A
-        : enableTransformerModelD()
-          ? /* Transformer D */ NVSDK_NGX_RayReconstruction_Hint_Render_Preset_D
-          : /* Transformer E - Truthful Shrimp */ NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E;
+      // RayReconstructionPreset enum values match the NGX preset enum, so a direct cast is valid.
+      // Fall back to the default preset for any unexpected/out-of-range value.
+      NVSDK_NGX_RayReconstruction_Hint_Render_Preset dlssdModel;
+      switch (preset()) {
+      case RayReconstructionPreset::D:
+      case RayReconstructionPreset::E:
+      case RayReconstructionPreset::F:
+        dlssdModel = static_cast<NVSDK_NGX_RayReconstruction_Hint_Render_Preset>(preset());
+        break;
+      default:
+        dlssdModel = NVSDK_NGX_RayReconstruction_Hint_Render_Preset_Default;
+        break;
+      }
 
       auto optimalSettings = m_rayReconstructionContext->queryOptimalSettings(mInputSize, perfQuality);
 

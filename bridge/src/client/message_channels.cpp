@@ -24,3 +24,4 @@
 
 std::unique_ptr<bridge_util::MessageChannelClient> gpServerMessageChannel; // Message channel with the Bridge server
 std::unique_ptr<bridge_util::MessageChannelClient> gpRemixMessageChannel;  // Message channel with the Remix renderer
+std::atomic<uint32_t> gFrameRateLimit = 0;

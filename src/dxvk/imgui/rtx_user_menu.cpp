@@ -20,37 +20,44 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
+#include <algorithm>
+#include <cfloat>
+#include <cmath>
+#include <cstdio>
+#include <string>
+
 #include "dxvk_imgui.h"
-#include "dxvk_imgui_first_use_guide.h"
 #include "imgui.h"
+#include "rtx_fault_notice.h"
 #include "rtx_render/rtx_imgui.h"
 #include "dxvk_device.h"
 #include "rtx_render/rtx_context.h"
 #include "rtx_render/rtx_options.h"
 #include "rtx_render/rtx_dlss.h"
+#include "rtx_render/rtx_neural_uplift.h"
 #include "rtx_render/rtx_dlfg.h"
 #include "rtx_render/rtx_reflex.h"
 #include "rtx_render/rtx_ray_reconstruction.h"
 #include "rtx_render/rtx_xess.h"
 #include "rtx_render/rtx_fork_hooks.h"
+#include "rtx_render/rtx_host_settings.h"
 #include "rtx_render/rtx_postFx.h"
+#include "rtx_render/rtx_tone_mapping.h"
 #include "rtx_render/rtx_rtxdi_rayquery.h"
 #include "rtx_render/rtx_restir_gi_rayquery.h"
 #include "rtx_render/rtx_neural_radiance_cache.h"
-#include "rtx_render/rtx_global_volumetrics.h"
+#include "rtx_render/rtx_numos_ui.h"
 #include "rtx_render/rtx_option_layer_gui.h"
 #include "rtx_render/rtx_scene_manager.h"
+#include "rtx_render/rtx_screenshot.h"
+#include "rtx_render/rtx_color_grade.h"
 #include "../util/util_string.h"
-
-namespace ImGui {
-  // Forward declarations for TextSeparator from dxvk_imgui.cpp
-  void TextSeparator(const char* text, float pre_width = 10.0f);
-}
 
 namespace dxvk {
 
   // Combo boxes shared with dxvk_imgui.cpp
   extern RemixGui::ComboWithKey<DLSSProfile> dlssProfileCombo;
+  extern RemixGui::ComboWithKey<DxvkDLSS::DLSSPreset> dlssRenderPresetCombo;
   extern RemixGui::ComboWithKey<XeSSPreset> xessPresetCombo;
 
   // Combo boxes used only by the user menu
@@ -143,8 +150,170 @@ namespace dxvk {
     } }
   };
 
+  namespace {
+    // The color of section titles and of the frame rate limit's status: the theme's accent.
+    ImVec4 accentColor() {
+      return ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
+    }
+
+    // A tab splits its sections into two columns only from this width, in font sizes, so each column keeps
+    // room for its labels and values.
+    constexpr float kTwoColumnMinWidthInFonts = 64.0f;
+
+    // The vertical padding of the menu's buttons, in font sizes.
+    constexpr float kButtonPaddingY = 0.35f;
+
+    // Pushes the padded, rounded frame that all the menu's buttons share, so they have one height.
+    void pushButtonStyle() {
+      const float fontSize = ImGui::GetFontSize();
+      ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, fontSize * 0.3f);
+      ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(fontSize * 0.9f, fontSize * kButtonPaddingY));
+    }
+
+    void popButtonStyle() {
+      ImGui::PopStyleVar(2);
+    }
+
+    float buttonHeight() {
+      return ImGui::GetFontSize() * (1.0f + 2.0f * kButtonPaddingY);
+    }
+
+    // Edits rtx.frameRateLimit with a number box and a Set button, and states the limit in force beside them.
+    // The box keeps the typed value until Set is pressed, so typing never changes the limit.
+    // The box starts controlOffsetX from the start of the line.
+    void showFrameRateLimitControl(float controlOffsetX) {
+      static int pendingLimit = -1;
+      const uint32_t limit = RtxReflex::frameRateLimit();
+      if (pendingLimit < 0) {
+        pendingLimit = static_cast<int>(limit);
+      }
+
+      ImGui::AlignTextToFramePadding();
+      ImGui::TextUnformatted("Frame Rate Limit");
+      ImGui::SameLine(controlOffsetX);
+      ImGui::SetNextItemWidth(ImGui::GetFontSize() * 4.0f);
+      ImGui::InputInt("##frameRateLimit", &pendingLimit, 0, 0);
+      pendingLimit = std::clamp(pendingLimit, 0, 1000);
+      RemixGui::SetTooltipToLastWidgetOnHover("The highest frame rate, in frames per second. 0 turns the limit off.");
+
+      ImGui::SameLine();
+      ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ImGui::GetFontSize() * 0.3f);
+      if (ImGui::Button("Set##frameRateLimit", ImVec2(ImGui::GetFontSize() * 3.0f, 0.0f))) {
+        RtxReflex::frameRateLimitObject().setDeferred(static_cast<uint32_t>(pendingLimit));
+      }
+      ImGui::PopStyleVar();
+
+      ImGui::SameLine();
+      if (limit > 0) {
+        ImGui::TextColored(accentColor(), "Limited to %u fps", limit);
+      } else {
+        ImGui::TextDisabled("Not limited");
+      }
+    }
+
+    // Draws a section title in the accent color on a line that runs to the right edge of the column.
+    void sectionHeader(const char* text) {
+      ImGui::Spacing();
+      const ImVec2 start = ImGui::GetCursorScreenPos();
+      const float rightX = start.x + ImGui::GetContentRegionAvail().x;
+      ImGui::SetCursorScreenPos(ImVec2(start.x + ImGui::GetFontSize() * 0.5f, start.y));
+      ImGui::TextColored(accentColor(), "%s", text);
+
+      const ImVec2 textMin = ImGui::GetItemRectMin();
+      const ImVec2 textMax = ImGui::GetItemRectMax();
+      const float gap = ImGui::GetStyle().ItemInnerSpacing.x;
+      const float lineY = std::floor((textMin.y + textMax.y) * 0.5f);
+      const ImU32 lineColor = ImGui::GetColorU32(ImGuiCol_Border);
+      ImDrawList* drawList = ImGui::GetWindowDrawList();
+      drawList->AddLine(ImVec2(start.x, lineY), ImVec2(textMin.x - gap, lineY), lineColor);
+      if (textMax.x + gap < rightX) {
+        drawList->AddLine(ImVec2(textMax.x + gap, lineY), ImVec2(rightX, lineY), lineColor);
+      }
+    }
+
+    // Lays a tab's sections out in two columns when the tab is wide enough, and in one column otherwise.
+    // All labeled controls in a column get the same label width, so the controls line up.
+    class SectionColumns {
+    public:
+      SectionColumns(const char* id, bool allowSplit) {
+        const float fontSize = ImGui::GetFontSize();
+        if (allowSplit && ImGui::GetContentRegionAvail().x >= fontSize * kTwoColumnMinWidthInFonts) {
+          ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(fontSize * 0.75f, 0.0f));
+          m_split = ImGui::BeginTable(id, 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV |
+                                             ImGuiTableFlags_NoSavedSettings);
+          ImGui::PopStyleVar();
+          if (m_split) {
+            ImGui::TableNextColumn();
+          }
+        }
+        beginColumn();
+      }
+
+      ~SectionColumns() {
+        endColumn();
+        if (m_split) {
+          ImGui::EndTable();
+        }
+      }
+
+      SectionColumns(const SectionColumns&) = delete;
+      SectionColumns& operator=(const SectionColumns&) = delete;
+
+      // Moves to the second column.
+      // Does nothing in the one-column layout, so the sections continue below.
+      void nextColumn() {
+        if (m_split) {
+          endColumn();
+          ImGui::TableNextColumn();
+          beginColumn();
+        }
+      }
+
+      // Indents the rows that refine the row above them, and keeps their controls in line with the others.
+      void beginSubItems() {
+        ImGui::Indent(ImGui::GetFontSize());
+        RemixGui::PushLabelColumnFixedWidth(m_labelWidth - ImGui::GetFontSize());
+      }
+
+      void endSubItems() {
+        RemixGui::PopLabelColumnFixedWidth();
+        ImGui::Unindent(ImGui::GetFontSize());
+      }
+
+    private:
+      void beginColumn() {
+        const float fontSize = ImGui::GetFontSize();
+        const float width = ImGui::GetContentRegionAvail().x;
+        m_labelWidth = std::floor(std::min(std::clamp(width * 0.42f, fontSize * 8.0f, fontSize * 17.0f), width * 0.6f));
+        RemixGui::PushLabelColumnFixedWidth(m_labelWidth);
+
+        // Plain ImGui controls put their label after the control, so they get the width of the control column.
+        ImGui::PushItemWidth(std::max(width - m_labelWidth - fontSize * 2.5f, fontSize * 4.0f));
+      }
+
+      void endColumn() {
+        ImGui::PopItemWidth();
+        RemixGui::PopLabelColumnFixedWidth();
+      }
+
+      bool m_split = false;
+      float m_labelWidth = 0.0f;
+    };
+  } // namespace
+
   // Helper functions defined in dxvk_imgui.cpp
   RemixGui::ComboWithKey<UpscalerType>& getUpscalerCombo(DxvkDLSS& dlss, DxvkRayReconstruction& rayReconstruction);
+
+  ImFont* ImGUI::getUserMenuFont(float targetSize) const {
+    ImFont* closest = nullptr;
+    for (ImFont* font : m_userMenuFonts) {
+      // Ties go to the larger font, since the sizes are in ascending order.
+      if (font != nullptr && (closest == nullptr || std::abs(font->FontSize - targetSize) <= std::abs(closest->FontSize - targetSize))) {
+        closest = font;
+      }
+    }
+    return closest;
+  }
 
   void ImGUI::showUserMenu(const Rc<DxvkContext>& ctx) {
     // Target user.conf layer for user menu changes
@@ -152,157 +321,110 @@ namespace dxvk {
 
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
 
-    ImGui::OpenPopup(m_userGraphicsWindowTitle, ImGuiPopupFlags_NoOpenOverExistingPopup);
+    // The menu is laid out for 1080p and grows with the output height. It draws in the atlas font closest to
+    // the scaled size rather than scaling a font's glyphs, so the text stays sharp, and every other size
+    // follows the font that was picked.
+    const float outputScale = std::max(1.0f, viewport->Size.y / 1080.0f);
+    const float baseFontSize = largeUiMode() ? 24.0f : 18.0f;
+    ImFont* menuFont = getUserMenuFont(baseFontSize * outputScale);
+    const float uiScale = (menuFont != nullptr ? menuFont->FontSize : ImGui::GetFontSize()) / 16.0f;
+    if (menuFont != nullptr) {
+      ImGui::PushFont(menuFont);
+    }
 
-    ImGui::SetNextWindowPos(ImVec2(viewport->Size.x * 0.5f - m_userWindowWidth * 0.5f, viewport->Size.y * 0.5f - m_userWindowHeight * 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(m_userWindowWidth, 0));
-    ImGui::SetNextWindowSizeConstraints(ImVec2(m_userWindowWidth, 0), ImVec2(m_userWindowWidth, m_userWindowHeight));
+    const ImGuiStyle& baseStyle = ImGui::GetStyle();
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(baseStyle.FramePadding.x * uiScale, baseStyle.FramePadding.y * uiScale));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(baseStyle.ItemSpacing.x * uiScale, baseStyle.ItemSpacing.y * uiScale));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemInnerSpacing, ImVec2(baseStyle.ItemInnerSpacing.x * uiScale, baseStyle.ItemInnerSpacing.y * uiScale));
+    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, baseStyle.ScrollbarSize * uiScale);
+    ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, baseStyle.GrabMinSize * uiScale);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, baseStyle.FrameRounding * uiScale);
+    constexpr int kScaledStyleVarCount = 6;
 
-    // Note: When changing this padding consider:
-    // - Checking to ensure text including less visible instances from hover tooltips and etc do not take up more
-    // lines such that empty text lines become ineffective (to prevent jittering when text changes).
-    // - Updating Dummy elements as they currently are based on half the y padding for spacing consistency.
-    constexpr float windowPaddingX = 74.0f;
-    constexpr float windowPaddingHalfX = windowPaddingX * 0.5f;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(windowPaddingX, 10));
+    const float fontSize = ImGui::GetFontSize();
 
-    // Use the same background color and alpha as other menus, PopupBg has alpha 1 because it's used for combobox popups etc. 
-    ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
-    bool pushedPopupBg = true;
+    // The ID after "###" stays fixed, so the title can show the product name and version.
+    const std::string windowTitle = str::format(productNameWithVersion(), " Graphics Settings###", m_userGraphicsWindowTitle);
+    ImGui::OpenPopup(windowTitle.c_str(), ImGuiPopupFlags_NoOpenOverExistingPopup);
+
+    // The window opens centered at about half the screen's width and 70% of its height, and can be moved
+    // and resized while it is open.
+    const float windowWidth = std::min(viewport->Size.x * 0.95f,
+                                       std::max(std::min(viewport->Size.x * 0.5f, viewport->Size.y * 0.85f), 600.0f * uiScale));
+    const float windowHeight = viewport->Size.y * 0.7f;
+    ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x + viewport->Size.x * 0.5f, viewport->Pos.y + viewport->Size.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(windowWidth, windowHeight), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(400.0f * uiScale, 300.0f * uiScale), viewport->Size);
+
+    // The padding follows the font, so the layout keeps its proportions at every output size.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(fontSize * 0.75f, fontSize * 0.5f));
+
+    // The window uses the background color of the other menus, but nearly opaque, so the text keeps its contrast
+    // over a bright scene.
+    ImVec4 backgroundColor = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg);
+    backgroundColor.w = std::max(backgroundColor.w, 0.92f);
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, backgroundColor);
 
     bool basicMenuOpen = RtxOptions::showUI() == UIType::Basic;
-    if (ImGui::BeginPopupModal(m_userGraphicsWindowTitle, &basicMenuOpen, ImGuiWindowFlags_AlwaysAutoResize)) {
-      // Restore PopupBg
-      ImGui::PopStyleColor();
-      pushedPopupBg = false;
+    const bool menuVisible = ImGui::BeginPopupModal(windowTitle.c_str(), &basicMenuOpen);
 
-      // Always display memory stats to user.
-      showMemoryStats();
+    // The window has taken its padding and background, so combo boxes and tooltips inside it use the theme's own.
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
 
-      const int itemWidth = static_cast<int>(largeUiMode() ? m_largeUserWindowWidgeWidth : m_regularUserWindowWidgetWidth);
-      const int subItemWidth = static_cast<int>(ImCeil(itemWidth * 0.86f));
-      const int subItemIndent = (itemWidth > subItemWidth) ? (itemWidth - subItemWidth) : 0;
+    if (menuVisible) {
+      showUserMenuHeader();
+      ImGui::Spacing();
 
-      const ImVec2 childSize = ImVec2(ImGui::GetContentRegionAvail().x + windowPaddingX, m_userWindowHeight * 0.63f);
-      const static ImGuiTabBarFlags tab_bar_flags = ImGuiTabBarFlags_NoCloseWithMiddleMouseButton;
-      const static ImGuiTabItemFlags tab_item_flags = ImGuiTabItemFlags_NoCloseWithMiddleMouseButton;
-
-
-      ImGui::PopStyleVar();
-
-      auto beginTabChild = [&windowPaddingHalfX, &childSize, &itemWidth](const char* tabID) -> void {
-        // Make child window start at the same X offset as the tab bar separator
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() - windowPaddingHalfX);
-
-        // Make widgets within the child start at the same X offset as widgets outside of the child
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(windowPaddingHalfX, 10));
-        ImGui::BeginChild(tabID, childSize, true);
-
-        ImGui::PushItemWidth(static_cast<float>(itemWidth));
-        };
-
-      auto endTabChild = []() -> void {
-        ImGui::PopItemWidth();
-        ImGui::PopStyleVar();
+      // Each tab's page fills the height that the footer buttons leave free.
+      const float footerHeight = buttonHeight() + ImGui::GetStyle().ItemSpacing.y;
+      auto beginTabPage = [footerHeight, fontSize](const char* id) {
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(fontSize * 0.6f, fontSize * 0.4f));
+        const float height = std::max(ImGui::GetContentRegionAvail().y - footerHeight, ImGui::GetFrameHeight() * 4.0f);
+        ImGui::BeginChild(id, ImVec2(0.0f, height), true);
+      };
+      auto endTabPage = []() {
         ImGui::EndChild();
-        };
+        ImGui::PopStyleVar();
+      };
 
-
-      if (ImGui::BeginTabBar("Settings Tabs", tab_bar_flags)) {
-        if (ImGui::BeginTabItem("General", nullptr, tab_item_flags)) {
-          beginTabChild("##tab_child_general");
-          showUserGeneralSettings(ctx, subItemWidth, subItemIndent);
-          endTabChild();
+      constexpr ImGuiTabBarFlags kTabBarFlags = ImGuiTabBarFlags_NoCloseWithMiddleMouseButton;
+      constexpr ImGuiTabItemFlags kTabItemFlags = ImGuiTabItemFlags_NoCloseWithMiddleMouseButton;
+      if (ImGui::BeginTabBar("Settings Tabs", kTabBarFlags)) {
+        if (ImGui::BeginTabItem("General", nullptr, kTabItemFlags)) {
+          beginTabPage("##tab_child_general");
+          showUserGeneralSettings(ctx);
+          endTabPage();
           ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Graphics", nullptr, tab_item_flags)) {
-          beginTabChild("##tab_child_graphics");
-          showUserRenderingSettings(ctx, subItemWidth, subItemIndent);
-          endTabChild();
+        if (ImGui::BeginTabItem("Graphics", nullptr, kTabItemFlags)) {
+          beginTabPage("##tab_child_graphics");
+          showUserRenderingSettings(ctx);
+          endTabPage();
           ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Content", nullptr, tab_item_flags)) {
-          beginTabChild("##tab_child_content");
-          showUserContentSettings(ctx, subItemWidth, subItemIndent);
-          endTabChild();
+        if (ImGui::BeginTabItem("Content", nullptr, kTabItemFlags)) {
+          beginTabPage("##tab_child_content");
+          showUserContentSettings();
+          endTabPage();
           ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Permissions", nullptr, tab_item_flags)) {
-          beginTabChild("##tab_child_permissions");
-          ImGuiFirstUseGuide::showPermissionsUI();
-          endTabChild();
+        if (ImGui::BeginTabItem("Developer Menu Guide", nullptr, kTabItemFlags)) {
+          beginTabPage("##tab_child_guide");
+          showUserDeveloperMenuGuide();
+          endTabPage();
           ImGui::EndTabItem();
         }
 
         ImGui::EndTabBar();
       }
 
-      ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(windowPaddingHalfX, 10));
-      ImGui::Dummy(ImVec2(0.0f, 0.0f));
-
-      // Center align - 3 buttons now
-      const ImVec2 buttonSize = ImVec2((ImGui::GetWindowSize().x - windowPaddingX) / 3 - ImGui::GetStyle().ItemSpacing.x * 2 / 3, 36);
-
-      // Make child window start at X offset of tab bar separator
-      ImGui::SetCursorPosX(ImGui::GetCursorPosX() - windowPaddingHalfX);
-
-      if (ImGui::Button("Developer Settings Menu", buttonSize)) {
-        switchMenu(UIType::Advanced);
-      }
-
-      ImGui::SameLine();
-
-      const RtxOptionLayer* userLayer = RtxOptionLayer::getUserLayer();
-      const bool unsavedChanges = userLayer && userLayer->hasUnsavedChanges();
-      
-      // Disable button when no unsaved changes
-      ImGui::BeginDisabled(!unsavedChanges);
-      
-      if (unsavedChanges) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.35f, 0.14f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.78f, 0.43f, 0.22f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::GetStyle().Colors[ImGuiCol_ButtonHovered]);
-      }
-
-      if (ImGui::Button("Save Settings", buttonSize)) {
-        const_cast<RtxOptionLayer*>(userLayer)->save();
-      }
-
-      if (unsavedChanges) {
-        ImGui::PopStyleColor(3);
-      }
-      
-      ImGui::EndDisabled();
-      
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-        if (unsavedChanges) {
-          // Only build the expensive tooltip when hovered
-          std::string tooltip = OptionLayerUI::renderToString(userLayer, "user.conf");
-          tooltip += "\nSome settings may only take effect on next launch.";
-          RemixGui::SetTooltipUnformatted(tooltip.c_str());
-        } else {
-          RemixGui::SetTooltipUnformatted("No unsaved changes in user.conf.\nSome settings may only take effect on next launch.");
-        }
-      }
-      
-      ImGui::SameLine();
-      
-      // Clear User Settings button
-      if (ImGui::Button("Delete All User Settings", buttonSize)) {
-        if (userLayer) {
-          userLayer->removeFromAllOptions();
-        }
-      }
-      RemixGui::SetTooltipToLastWidgetOnHover("Resets all user settings to their default values.");
+      showUserMenuFooter();
 
       ImGui::EndPopup();
-    }
-
-    if (pushedPopupBg) {
-      ImGui::PopStyleColor();
     }
 
     // Close via titlebar close button
@@ -310,13 +432,132 @@ namespace dxvk {
       switchMenu(UIType::None);
     }
 
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(kScaledStyleVarCount);
+    if (menuFont != nullptr) {
+      ImGui::PopFont();
+    }
   }
 
-  void ImGUI::showUserGeneralSettings(
-    const Rc<DxvkContext>& ctx,
-    const int subItemWidth,
-    const int subItemIndent) {
+  void ImGUI::showUserMenuHeader() const {
+    // The frame rate box and the memory bar start at the same distance from the line start.
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float controlOffsetX = std::max(ImGui::CalcTextSize("Frame Rate Limit").x, ImGui::CalcTextSize("Video Memory").x) +
+                                 style.ItemSpacing.x * 3.0f;
+
+    // The Donate button sits beside the settings, in the part of the window that never scrolls.
+    if (hasDonateLink()) {
+      ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(ImGui::GetFontSize() * 0.75f, 0.0f));
+      const bool table = ImGui::BeginTable("##userMenuHeader", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings);
+      ImGui::PopStyleVar();
+      if (table) {
+        ImGui::TableSetupColumn("##settings", ImGuiTableColumnFlags_WidthStretch, 3.0f);
+        ImGui::TableSetupColumn("##donate", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableNextColumn();
+        showFrameRateLimitControl(controlOffsetX);
+        showCompactMemoryStats(controlOffsetX);
+
+        // The button fills its column, and with its text line it is as tall as the two rows beside it.
+        ImGui::TableNextColumn();
+        const float height = std::max(ImGui::GetFrameHeight() * 2.0f - ImGui::GetTextLineHeight(), ImGui::GetFrameHeight());
+        showDonateButton(ImVec2(ImGui::GetContentRegionAvail().x, height));
+        ImGui::EndTable();
+        return;
+      }
+    }
+
+    showFrameRateLimitControl(controlOffsetX);
+    showCompactMemoryStats(controlOffsetX);
+  }
+
+  void ImGUI::showCompactMemoryStats(float controlOffsetX) const {
+    if (RtxOptions::Automation::disableDisplayMemoryStatistics()) {
+      return;
+    }
+
+    const VideoMemoryUsage usage = getVideoMemoryUsage();
+    const float fraction = usage.totalMiB > 0.0f ? usage.usedMiB / usage.totalMiB : 0.0f;
+    char overlay[64];
+    std::snprintf(overlay, sizeof(overlay), "%.f / %.f MiB (%.f%%)", usage.usedMiB, usage.totalMiB, fraction * 100.0f);
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Video Memory");
+    ImGui::SameLine(controlOffsetX);
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, usage.barColor);
+    ImGui::ProgressBar(fraction, ImVec2(-FLT_MIN, ImGui::GetFrameHeight()), overlay);
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) {
+      const std::string tooltip = str::format(productName(), " dynamically uses available VRAM to maximize texture quality.\n",
+                                              static_cast<uint32_t>(usage.freeMiB), " MiB are free.");
+      RemixGui::SetTooltipUnformatted(tooltip.c_str());
+    }
+  }
+
+  void ImGUI::showUserMenuFooter() {
+    const RtxOptionLayer* userLayer = RtxOptionLayer::getUserLayer();
+    const bool unsavedChanges = userLayer && userLayer->hasUnsavedChanges();
+
+    pushButtonStyle();
+
+    if (ImGui::Button("Developer Settings Menu")) {
+      switchMenu(UIType::Advanced);
+    }
+
+    // Delete and Save sit at the right edge, or on a line of their own when the window is too narrow.
+    constexpr const char* kDeleteLabel = "Delete All User Settings";
+    constexpr const char* kSaveLabel = "Save Settings";
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float rightWidth = ImGui::CalcTextSize(kDeleteLabel).x + ImGui::CalcTextSize(kSaveLabel).x +
+                             style.FramePadding.x * 4.0f + style.ItemSpacing.x;
+    ImGui::SameLine();
+    const float available = ImGui::GetContentRegionAvail().x;
+    if (available >= rightWidth) {
+      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + available - rightWidth);
+    } else {
+      ImGui::NewLine();
+    }
+
+    // Delete turns red under the mouse, since it discards every user setting.
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.62f, 0.22f, 0.20f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.50f, 0.16f, 0.15f, 1.0f));
+    if (ImGui::Button(kDeleteLabel) && userLayer) {
+      userLayer->removeFromAllOptions();
+    }
+    ImGui::PopStyleColor(2);
+    RemixGui::SetTooltipToLastWidgetOnHover("Resets all user settings to their default values.");
+
+    // Save takes the theme's accent color while there are unsaved changes, and is disabled otherwise.
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!unsavedChanges);
+    if (unsavedChanges) {
+      const ImVec4 accent = ImGui::GetStyleColorVec4(ImGuiCol_TabActive);
+      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(accent.x, accent.y, accent.z, 1.0f));
+      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(std::min(accent.x * 1.25f, 1.0f), std::min(accent.y * 1.25f, 1.0f), std::min(accent.z * 1.25f, 1.0f), 1.0f));
+      ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(accent.x * 0.8f, accent.y * 0.8f, accent.z * 0.8f, 1.0f));
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+    }
+    if (ImGui::Button(kSaveLabel)) {
+      const_cast<RtxOptionLayer*>(userLayer)->save();
+    }
+    if (unsavedChanges) {
+      ImGui::PopStyleColor(4);
+    }
+    ImGui::EndDisabled();
+
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+      if (unsavedChanges) {
+        // Only build the expensive tooltip when hovered
+        std::string tooltip = OptionLayerUI::renderToString(userLayer, "user.conf");
+        tooltip += "\nSome settings may only take effect on next launch.";
+        RemixGui::SetTooltipUnformatted(tooltip.c_str());
+      } else {
+        RemixGui::SetTooltipUnformatted("No unsaved changes in user.conf.\nSome settings may only take effect on next launch.");
+      }
+    }
+
+    popButtonStyle();
+  }
+
+  void ImGUI::showUserGeneralSettings(const Rc<DxvkContext>& ctx) {
     auto common = ctx->getCommonObjects();
     DxvkDLSS& dlss = common->metaDLSS();
     DxvkRayReconstruction& rayReconstruction = common->metaRayReconstruction();
@@ -337,16 +578,16 @@ namespace dxvk {
       tabDescriptionText = "General performance settings. Enabling the DLSS preset is recommended to significantly increase performance.";
     }
 
-    ImGui::TextWrapped(tabDescriptionText);
+    ImGui::TextWrapped("%s", tabDescriptionText);
 
-    ImGui::Dummy(ImVec2(0.0f, 5.0f));
+    SectionColumns columns("##generalColumns", true);
 
     // Preset Settings
 
     if (dlssSupported) {
       const DlssPreset prevDlssPreset = RtxOptions::dlssPreset();
 
-      ImGui::TextSeparator("Preset Settings");
+      sectionHeader("Preset Settings");
 
       dlssPresetCombo.getKey(&RtxOptions::dlssPresetObject());
 
@@ -366,8 +607,7 @@ namespace dxvk {
 
     // Upscaling Settings
 
-    ImGui::Dummy(ImVec2(0.0f, 3.0f));
-    ImGui::TextSeparator("Upscaling Settings");
+    sectionHeader("Upscaling Settings");
 
     {
       ImGui::BeginDisabled(disableNonPresetSettings);
@@ -381,9 +621,8 @@ namespace dxvk {
       if (dlss.supportsDLSS()) {
         getUpscalerCombo(dlss, rayReconstruction).getKey(&RtxOptions::upscalerTypeObject());
       }
-      
-      ImGui::PushItemWidth(static_cast<float>(subItemWidth));
-      ImGui::Indent(static_cast<float>(subItemIndent));
+
+      columns.beginSubItems();
 
       if (dlss.supportsDLSS()) {
         showRayReconstructionEnable(dlssRRSupported);
@@ -401,6 +640,12 @@ namespace dxvk {
 
       switch (RtxOptions::upscalerType()) {
         case UpscalerType::DLSS: {
+          // Preset is shown before the mode. Ray Reconstruction has its own preset selector
+          // (rendered by showRayReconstructionEnable above), so only show the SR preset here.
+          if (!RtxOptions::enableRayReconstruction()) {
+            dlssRenderPresetCombo.getKey(&DxvkDLSS::presetObject());
+          }
+
           dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());
 
           // Display DLSS Upscaling Information
@@ -472,24 +717,20 @@ namespace dxvk {
 
       fork_hooks::showSharedSharpnessSlider();
 
-      ImGui::Unindent(static_cast<float>(subItemIndent));
-      ImGui::PopItemWidth();
+      columns.endSubItems();
 
       ImGui::EndDisabled();
     }
 
-    // Latency Reduction Settings
     if (fork_hooks::anyFrameGenerationSupported(ctx, dlfgSupported)) {
-      ImGui::Dummy(ImVec2(0.0f, 3.0f));
-      ImGui::TextSeparator("Frame Generation Settings");
-      // NV-DXVK start: fork frame-generation panel (DLSS-G / FSR-FG selector)
+      sectionHeader("Frame Generation Settings");
+      // NV-DXVK start: frame-generation panel (DLSS-G / FSR-FG selector)
       fork_hooks::showFrameGenerationOptions(ctx, dlfgSupported);
       // NV-DXVK end
     }
 
     if (reflexInitialized) {
-      ImGui::Dummy(ImVec2(0.0f, 3.0f));
-      ImGui::TextSeparator("Latency Reduction Settings");
+      sectionHeader("Latency Reduction Settings");
 
       {
         ImGui::BeginDisabled(disableNonPresetSettings);
@@ -502,27 +743,60 @@ namespace dxvk {
       }
     }
 
-    ImGui::Dummy(ImVec2(0.0f, 5.0f));
+    columns.nextColumn();
+
+    // DLSS-NR is an opt-in effect, so the DLSS preset and the graphics presets leave it alone.
+    {
+      sectionHeader("Neural Generation Settings");
+
+      DxvkNeuralUplift& neuralUplift = common->metaNeuralUplift();
+      if (neuralUplift.isSupported()) {
+        ImGui::TextWrapped("Neural enhancement of the final image. It costs significant GPU time.");
+        ImGui::PushID("DLSS 3D-Guided Neural Generation");
+        neuralUplift.showImguiSettings(false);
+        ImGui::PopID();
+      } else {
+        ImGui::BeginDisabled();
+        ImGui::TextWrapped("DLSS 3D-Guided Neural Generation is not supported on this GPU or driver. It needs an NVIDIA RTX GPU and a driver with DLSS-NR support.");
+        ImGui::EndDisabled();
+      }
+    }
+
+    if (host_settings::hasUserMenuSettings()) {
+      sectionHeader("Game Settings");
+      host_settings::showUserMenuSettings();
+    }
+    sectionHeader("Screenshots");
+
+    if (ImGui::Button("Take Screenshot")) {
+      common->metaScreenshot().request();
+    }
+    RemixGui::SetTooltipToLastWidgetOnHover("Saves the next frame as a PNG, with the game's interface and without this menu. "
+                                            "With HDR output active, an HDR PNG and an SDR PNG are saved.");
+    RemixGui::InputKeyBind("Screenshot Key", &RtxScreenshot::hotkeyObject());
+    RemixGui::InputText("Screenshot Folder", &RtxScreenshot::folderObject());
+    ImGui::TextWrapped("Saved to: %s", RtxScreenshot::resolveFolder().c_str());
+
+    sectionHeader("Problems");
+    FaultNotice::showSection();
+
+    sectionHeader("Logs");
+    showLogFolder();
   }
 
-  void ImGUI::showUserRenderingSettings(
-    const Rc<DxvkContext>& ctx,
-    const int subItemWidth,
-    const int subItemIndent) {
+  void ImGUI::showUserRenderingSettings(const Rc<DxvkContext>& ctx) {
     auto common = ctx->getCommonObjects();
     DxvkPostFx& postFx = common->metaPostFx();
-    DxvkRtxdiRayQuery& rtxdiRayQuery = common->metaRtxdiRayQuery();
-    DxvkReSTIRGIRayQuery& restirGiRayQuery = common->metaReSTIRGIRayQuery();
 
     // Describe the tab
 
     ImGui::TextWrapped("Rendering-specific settings. Complexity of rendering may be adjusted to balance between performance and quality.");
 
-    ImGui::Dummy(ImVec2(0.0f, 5.0f));
+    SectionColumns columns("##graphicsColumns", true);
 
     // Preset Settings
 
-    ImGui::TextSeparator("Preset Settings");
+    sectionHeader("Preset Settings");
 
     graphicsPresetCombo.getKey(&RtxOptions::graphicsPresetObject());
 
@@ -534,8 +808,7 @@ namespace dxvk {
 
     // Path Tracing Settings
 
-    ImGui::Dummy(ImVec2(0.0f, 3.0f));
-    ImGui::TextSeparator("Path Tracing Settings");
+    sectionHeader("Path Tracing Settings");
 
     {
       // Note: Disabled flags should match preset mapping above to prevent changing settings when a preset overrides them.
@@ -568,25 +841,19 @@ namespace dxvk {
       ImGui::EndDisabled();
     }
 
-    // Volumetrics Settings
-
-    ImGui::Dummy(ImVec2(0.0f, 3.0f));
-    ImGui::TextSeparator("RTX Volumetrics Settings");
-    {
-      // Volumetrics being enabled/disabled is not controlled by the graphics preset, so show the user settings regardless of preset.
-      RemixGui::Checkbox("Enable Volumetric Lighting", &RtxGlobalVolumetrics::enableObject());
-      // Volumetrics quality settings are set by the graphics preset, so only show the user settings if the preset is Custom and the volumetrics are enabled.
-      ImGui::BeginDisabled(!RtxGlobalVolumetrics::enable() || RtxOptions::graphicsPreset() != GraphicsPreset::Custom);
-      ImGui::Indent(static_cast<float>(subItemIndent));
-      common->metaGlobalVolumetrics().showImguiUserSettings();
-      ImGui::EndDisabled();
-      ImGui::Unindent(static_cast<float>(subItemIndent));
+    // Haze and cloud settings belong to the NUMOS atmosphere, so they show only while it draws the sky.
+    // They fill the second column when they show, and the post effects move there otherwise.
+    const bool numosSky = RtxOptions::skyMode() == SkyMode::Numos;
+    if (!numosSky) {
+      columns.nextColumn();
     }
 
     // Post Effect Settings
 
-    ImGui::Dummy(ImVec2(0.0f, 3.0f));
-    ImGui::TextSeparator("Post Effect Settings");
+    sectionHeader("Post Effect Settings");
+
+    // The grade is a look, not a quality setting, so the graphics presets leave it alone.
+    ColorGrade::showUserPresetPicker();
 
     {
       {
@@ -600,19 +867,21 @@ namespace dxvk {
       // High and Ultra allow these to be changed without requiring Custom, so leave enabled for those.
       ImGui::BeginDisabled(RtxOptions::graphicsPreset() == GraphicsPreset::Medium || RtxOptions::graphicsPreset() == GraphicsPreset::Low);
       {
-        ImGui::PushItemWidth(static_cast<float>(subItemWidth));
-        ImGui::Indent(static_cast<float>(subItemIndent));
+        columns.beginSubItems();
 
         ImGui::BeginDisabled(!postFx.enable());
 
         RemixGui::Checkbox("Enable Motion Blur", &postFx.enableMotionBlurObject());
+        // NV-DXVK start: depth-of-field quick setting
+        RemixGui::Checkbox("Enable Depth of Field", &postFx.dofEnableObject());
+        RemixGui::Checkbox("DoF Auto Focus", &postFx.autoFocusEnableObject());
+        // NV-DXVK end
         RemixGui::Checkbox("Enable Chromatic Aberration", &postFx.enableChromaticAberrationObject());
         RemixGui::Checkbox("Enable Vignette", &postFx.enableVignetteObject());
 
         ImGui::EndDisabled();
 
-        ImGui::Unindent(static_cast<float>(subItemIndent));
-        ImGui::PopItemWidth();
+        columns.endSubItems();
       }
 
       ImGui::EndDisabled();
@@ -620,11 +889,26 @@ namespace dxvk {
 
     // Other Settings
 
-    ImGui::Dummy(ImVec2(0.0f, 3.0f));
-    ImGui::TextSeparator("Other Settings");
+    sectionHeader("Other Settings");
 
     {
       showVsyncOptions(true);
+      // The swap chain is made when the game starts, so a change applies after a restart.
+      RemixGui::Checkbox("Allow HDR Output (after restart)", &DxvkToneMapping::hdrEnabledObject());
+    }
+
+    // The graphics presets do not set the haze and cloud settings.
+    if (numosSky) {
+      columns.nextColumn();
+
+      sectionHeader("Night Settings");
+      showNumosUserNight(ctx.ptr());
+
+      sectionHeader("Haze Settings");
+      showNumosUserHaze(ctx.ptr());
+
+      sectionHeader("Cloud Settings");
+      showNumosUserClouds(ctx.ptr());
     }
 
     // Map indirect particle level back to settings
@@ -644,29 +928,75 @@ namespace dxvk {
         break;
       }
     }
-
-    ImGui::Dummy(ImVec2(0.0f, 5.0f));
   }
 
-  void ImGUI::showUserContentSettings(
-    const Rc<DxvkContext>& ctx,
-    const int subItemWidth,
-    const int subItemIndent) {
-    auto common = ctx->getCommonObjects();
+  void ImGUI::showUserDeveloperMenuGuide() {
+    auto bullet = [](const char* text) {
+      ImGui::Bullet();
+      ImGui::SameLine();
+      ImGui::TextWrapped("%s", text);
+    };
 
+    ImGui::TextWrapped("The developer menu holds every renderer setting, far more than this menu. Use it to fine-tune "
+                       "the look or the performance yourself.");
+
+    sectionHeader("Opening and Closing");
+    bullet("Click Developer Settings Menu at the bottom of this window to open it. Click Graphics Settings Menu at the "
+           "top of the developer menu to come back here.");
+    bullet("Alt+X (the default key) opens and closes the menus. It opens this menu, unless you tick Default Menu at the "
+           "top of the developer menu.");
+    bullet("The << or >> button at the end of the developer menu's tab row moves it to the other side of the screen.");
+
+    sectionHeader("Developer Menu Tabs");
+    bullet("Rendering: almost every renderer setting, in sections you open by clicking their headers. General has "
+           "upscaling, frame generation and DLSS 3D-Guided Neural Generation. Pathtracing, Lighting, RTX Volumetrics "
+           "and Denoising control how light is traced and cleaned up. Post-Processing has tone mapping, auto exposure, "
+           "bloom, motion blur and the order the effects run in.");
+    bullet("Host Settings: appears only when the game's integration adds settings of its own.");
+    bullet("Game Setup: how the renderer reads the game. Step 1 sorts the game's textures into categories. Step 2 holds "
+           "scene parameters, and its Sky section has the sky, clouds, haze, night and weather pages.");
+    bullet("Enhancements: the replacement asset mods that are loaded, and the capture tools.");
+    bullet("About: the version, the credits and the licenses.");
+    bullet("Dev Settings: tools for developers, such as performance logging, camera controls, option layers and UI "
+           "options.");
+    bullet("Plugin: appears only when a plugin adds a page of its own.");
+
+    sectionHeader("What to Change");
+    bullet("Safe to try: Rendering > General, Rendering > Post-Processing, and the Sky, Clouds, Haze and Night pages "
+           "under Game Setup > Step 2 > Sky. They change the look or the performance, and you can always reset them.");
+    bullet("Advanced: Pathtracing, Lighting, Denoising, Game Setup's texture categories and scene parameters, the "
+           "Sky section's Setup page, Host Settings, Rendering > Debug and Dev Settings. Wrong values there can break "
+           "the image or the lighting, so change them only if you know what they do.");
+
+    sectionHeader("Saving and Resetting");
+    bullet("Changes apply at once, but they are lost when you quit unless you save them.");
+    bullet("In this menu, Save Settings writes your settings to user.conf in the game folder. In the developer menu, "
+           "Settings Management at the bottom has a Save button for each file.");
+    bullet("Player settings, such as the ones in this menu, go to user.conf. Other developer menu settings go to "
+           "rtx.conf, the game's own renderer configuration. Back up rtx.conf before you save it.");
+    bullet("The round button at the right of a setting resets that setting. Delete All User Settings at the bottom of "
+           "this window resets everything in user.conf, and Save Settings makes that permanent. Deleting user.conf "
+           "while the game is closed does the same.");
+
+    sectionHeader("Mouse and Keyboard");
+    bullet("Hover over any setting to see what it does.");
+    bullet("Drag a slider or a number to change it, or Ctrl+click it to type an exact value.");
+    bullet("Click a section header to open or close it, and scroll with the mouse wheel.");
+    bullet("Alt+Delete shows or hides the mouse cursor if it is missing.");
+  }
+
+  void ImGUI::showUserContentSettings() {
     // Describe the tab
 
     ImGui::TextWrapped("Content-specific settings. Allows control of what types of assets Remix should replace (if any).");
 
-    ImGui::Dummy(ImVec2(0.0f, 5.0f));
+    SectionColumns columns("##contentColumns", false);
 
-    ImGui::BeginDisabled(!common->getSceneManager().areAllReplacementsLoaded());
-
+    sectionHeader("Enhanced Assets");
     RemixGui::Checkbox("Enable All Enhanced Assets", &RtxOptions::enableReplacementAssetsObject());
 
     {
-      ImGui::PushItemWidth(static_cast<float>(subItemWidth));
-      ImGui::Indent(static_cast<float>(subItemIndent));
+      columns.beginSubItems();
 
       ImGui::BeginDisabled(!RtxOptions::enableReplacementAssets());
 
@@ -676,13 +1006,8 @@ namespace dxvk {
 
       ImGui::EndDisabled();
 
-      ImGui::Unindent(static_cast<float>(subItemIndent));
-      ImGui::PopItemWidth();
+      columns.endSubItems();
     }
-
-    ImGui::EndDisabled();
-
-    ImGui::Dummy(ImVec2(0.0f, 5.0f));
   }
 
 } // namespace dxvk

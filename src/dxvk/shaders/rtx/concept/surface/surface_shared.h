@@ -90,7 +90,9 @@ enum class TexGenMode : uint8_t {
 enum class DisplacementMode : uint32_t {
   Off = 0,
   RaymarchPOM = 1,
-  QuadtreePOM = 2
+  QuadtreePOM = 2,
+  // Silhouette Curvature-Corrected Cone Relief (pom_sccr.slangh).
+  SCCR = 3
 };
 
 enum class RussianRouletteMode : uint32_t {

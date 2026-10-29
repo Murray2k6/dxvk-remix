@@ -82,6 +82,8 @@ namespace dxvk {
 
   private:
     Rc<DxvkContext> m_ctx;
+    // The GpuBreadcrumbs sequence number, or 0 when no marker was written.
+    uint32_t m_breadcrumb = 0;
   };
 
   class __ScopedQueueAnnotation {
@@ -92,5 +94,7 @@ namespace dxvk {
   private:
     DxvkDevice* m_device;
     VkCommandBuffer m_cmdBuf;
+    // The GpuBreadcrumbs sequence number, or 0 when no marker was written.
+    uint32_t m_breadcrumb = 0;
   };
 }

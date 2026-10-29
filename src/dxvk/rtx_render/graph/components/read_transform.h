@@ -64,19 +64,19 @@ void ReadTransform::updateRange(const Rc<DxvkContext>& context, const size_t sta
     Vector4 rotation(0.0f, 0.0f, 0.0f, 1.0f);
     Vector3 scale(1.0f, 1.0f, 1.0f);
     
-    const PrimInstance* prim = m_batch.resolvePrimTarget(context, i, m_target[i]);
+    const PrimInstance prim = m_batch.resolvePrimTarget(context, i, m_target[i]);
     
-    if (prim != nullptr) {
-      if (prim->getType() == PrimInstance::Type::Instance) {
+    if (prim.getType() != PrimInstance::Type::None) {
+      if (prim.getType() == PrimInstance::Type::Instance) {
         // Mesh instance
-        RtInstance* rtInstance = prim->getInstance();
+        RtInstance* rtInstance = prim.getInstance();
         if (rtInstance != nullptr) {
           const Matrix4 transform = rtInstance->getTransform();
           decomposeMatrix(transform, position, rotation, scale);
         }
-      } else if (prim->getType() == PrimInstance::Type::Light) {
+      } else if (prim.getType() == PrimInstance::Type::Light) {
         // Light instance
-        const RtLight* light = prim->getLight();
+        const RtLight* light = prim.getLight();
         if (light != nullptr) {
           position = light->getPosition();
           // For lights, we can extract orientation from direction/axes if available

@@ -64,6 +64,7 @@ enum class RtLightAntiCullingType {
 };
 
 constexpr uint64_t kInvalidExternallyTrackedLightId = std::numeric_limits<uint64_t>::max();
+constexpr uint32_t kInvalidLightIdentity = 0;
 
 struct RtLightShaping {
 public:
@@ -222,6 +223,11 @@ struct RtRectLight {
     return m_yAxis;
   }
 
+  // The emission direction, read by the light BVH bounds.
+  Vector3 getDirection() const {
+    return m_direction;
+  }
+
   Vector3 getRadiance() const {
     return m_radiance;
   }
@@ -298,6 +304,11 @@ struct RtDiskLight {
 
   Vector3 getYAxis() const {
     return m_yAxis;
+  }
+
+  // The emission direction, read by the light BVH bounds.
+  Vector3 getDirection() const {
+    return m_direction;
   }
 
   Vector3 getRadiance() const {
@@ -500,6 +511,14 @@ struct RtLight {
     return m_cachedInitialHash;
   }
 
+  uint32_t getStableIdentity() const {
+    return m_stableIdentity;
+  }
+
+  void setStableIdentity(uint32_t identity) {
+    m_stableIdentity = identity;
+  }
+
   XXH64_hash_t getTransformedHash() const;
 
   Vector3 getRadiance() const;
@@ -644,10 +663,12 @@ struct RtLight {
 
   uint32_t isStaticCount = 0;
   bool isDynamic = false;
+  // A sky provider's own light (NUMOS sun, moons, lightning): physical already, so the host calibration
+  // (rtx.hostCalibration.lightsEv) does not apply to it.
+  bool isSkyProviderLight = false;
   bool ignoreViewModel = false;
-  // fork — 2026-06-21: when set, the NEE multiplies this light's contribution by
-  // the per-pixel atmosphere cloud-on-terrain transmittance (used for the
-  // injected sun distant light). Encoded as distant-light GPU flags bit 2.
+  // When set, NEE multiplies this light's contribution by the per-pixel atmosphere cloud-on-terrain
+  // transmittance (for the injected sun distant light). Encoded as distant-light GPU flags bit 2.
   bool atmosphereCloudShadowed = false;
 
 private:
@@ -663,6 +684,7 @@ private:
   };
 
   XXH64_hash_t m_cachedInitialHash = 0;
+  uint32_t m_stableIdentity = kInvalidLightIdentity;
 
   // Used to associate parts of a replacement heirarchy.
   PrimInstanceOwner m_primInstanceOwner;

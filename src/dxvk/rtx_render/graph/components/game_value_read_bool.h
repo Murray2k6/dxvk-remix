@@ -1,9 +1,8 @@
 #pragma once
 
-// game_value_read_bool.h — fork-owned Sense component that reads a plugin-
-// injected game-state value (written via remixapi_SetGameValue) and emits it
-// as a Bool. See rtx_fork_game_state.h for the backing store and
-// docs/fork-touchpoints.md for the associated upstream touches.
+// A Sense component that reads a plugin-injected game-state value
+// (written via remixapi_SetGameValue) and emits it as a Bool.
+// See rtx_fork_game_state.h for the backing store.
 
 #include <cctype>
 #include <string>

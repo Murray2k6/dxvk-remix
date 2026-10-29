@@ -43,19 +43,9 @@ StructuredBuffer<GpuSpawnContext> SpawnContexts;
 layout(binding = PARTICLE_SYSTEM_BINDING_PARTICLES_BUFFER_INPUT_OUTPUT)
 RWStructuredBuffer<GpuParticle> Particles;
 
-// Spawn-occlusion diagnostics (fork - 2026-07-25). Four counters, cleared by
-// the CPU every frame and read back on a delay (see RtxParticleSystemManager::
-// simulate): [0] = particles that ran the occlusion trace, [1] = particles
-// killed at birth because EVERY relocation attempt found cover overhead,
-// [2] = particles whose lifetime was shortened by the downward landing trace,
-// [3] = particles rescued by shelter relocation (first candidate was covered,
-// a retry found open sky). Surfaced read-only in the Precipitation dev panel
-// so "occlusion doesn't work" stops being a guessing game: rays > 0 with both
-// hit counters at 0 while standing under a roof means the roof is not
-// reachable in the TLAS under OBJECT_MASK_OPAQUE (not submitted, culled, or
-// non-opaque) - a completely different bug class than the trace not running at
-// all (rays == 0). Relocations > 0 while sheltered with rain visible outside
-// means the relocation fix is doing its job.
+// Spawn-occlusion counters, cleared every frame and read back on a delay (RtxParticleSystemManager::simulate):
+// [0] particles that ran the occlusion trace, [1] particles killed at birth because every candidate was covered,
+// [2] particles whose life the landing trace shortened, [3] particles moved to open sky by relocation.
 layout(binding = PARTICLE_SYSTEM_BINDING_SPAWN_TRACE_STATS_OUTPUT)
 RWStructuredBuffer<uint> SpawnTraceStats;
 
@@ -73,11 +63,8 @@ f16vec3 sampleDirectionInCone(f16vec3 axis, float cosConeHalfAngle, float2 rndUV
   return localDir.x * tangent + localDir.y * bitangent + localDir.z * axis;
 }
 
-// Everything random about one spawn candidate: a triangle + barycentric point
-// on the emitter mesh, the smear along the emitter's frame-to-frame motion, and
-// the emission-cone direction. Factored out of respawn() (fork - 2026-07-25) so
-// the shelter relocation loop there can draw a fresh, fully independent
-// candidate per attempt.
+// Everything random about one spawn candidate: a point on the emitter mesh, the smear along the emitter's
+// motion, and the emission-cone direction. The shelter relocation loop draws an independent one per attempt.
 struct SpawnSample
 {
   float3 spawnPosition;
@@ -132,11 +119,19 @@ SpawnSample sampleSpawnPoint(const GpuSpawnContext spawnCtx, const GpuParticleSy
       color += unorm4x8ToFloat4x32(colorBits).zyxw * randomBary[i];
     }
     
-    const uint baseSrcTexcoordOffset = (spawnCtx.spawnMeshTexcoordsOffset + index * spawnCtx.spawnMeshTexcoordsStride) / 4;
-    float2 texcoord = float2(BUFFER_ARRAY(geometries, (uint)spawnCtx.spawnMeshTexcoordsIdx, baseSrcTexcoordOffset + 0),
-                             BUFFER_ARRAY(geometries, (uint)spawnCtx.spawnMeshTexcoordsIdx, baseSrcTexcoordOffset + 1));
+    // Only fetch emitter UVs when a valid texcoord buffer is bound. For a mesh without UVs,
+    // spawnMeshTexcoordsIdx == BINDING_INDEX_INVALID (0xFFFF); reading geometries[0xFFFF] is an
+    // out-of-range bindless descriptor access and faults the GPU (device loss). Mirrors the
+    // existing guards on the color and prev-position reads above.
+    float2 texcoord = float2(0.0f, 0.0f);
+    if (spawnCtx.spawnMeshTexcoordsIdx != BINDING_INDEX_INVALID)
+    {
+      const uint baseSrcTexcoordOffset = (spawnCtx.spawnMeshTexcoordsOffset + index * spawnCtx.spawnMeshTexcoordsStride) / 4;
+      texcoord = float2(BUFFER_ARRAY(geometries, (uint)spawnCtx.spawnMeshTexcoordsIdx, baseSrcTexcoordOffset + 0),
+                        BUFFER_ARRAY(geometries, (uint)spawnCtx.spawnMeshTexcoordsIdx, baseSrcTexcoordOffset + 1));
+    }
     
-    if (particleSystem.desc.useSpawnTexcoords)
+    if (particleSystem.desc.useSpawnTexcoords && spawnCtx.spawnMeshTexcoordsIdx != BINDING_INDEX_INVALID)
     {
       if (i == 0)
       {
@@ -174,11 +169,8 @@ SpawnSample sampleSpawnPoint(const GpuSpawnContext spawnCtx, const GpuParticleSy
   return result;
 }
 
-// How many spawn candidates the shelter probe may try before giving up on a
-// particle (fork - 2026-07-25). 1 would be the old kill-at-birth behaviour;
-// 8 lets a spawn volume that is 95% covered still land ~1/3 of its budget in
-// the open 5% (1 - 0.95^8). Worst case cost is 8 short upward rays per spawned
-// particle, and only in fully-enclosed spaces where that upper bound is hit.
+// How many spawn candidates the shelter probe may try before killing a particle.
+// With 8, a spawn volume that is 95% covered still lands ~1/3 of its budget in the open 5% (1 - 0.95^8).
 static const uint kShelterRelocationAttempts = 8;
 
 // Generate a new particle in-place with random properties
@@ -188,78 +180,24 @@ GpuParticle respawn(uint particleIdx, uint spawnCtxIdx, const GpuParticleSystem 
 
   SpawnSample candidate = sampleSpawnPoint(spawnCtx, particleSystem, particleIdx);
 
-  // Occlusion traces (fork - 2026-07-25). Ask the actual scene geometry
-  // whether this particle should exist at all, and if so, where it should die.
+  // Occlusion traces against the scene, which unlike the screen-space collision test also see
+  // off-screen roofs and overhangs.
   //
-  // The alternative already in the codebase (enableCollisionDetection) samples
-  // the previous frame's G-buffer, which is screen-space: it sees nothing
-  // off-screen, behind the camera, or outside the view frustum. That is exactly
-  // the geometry that matters for sheltering - the roof over the player's head
-  // is usually not on screen. Tracing the TLAS answers it properly, so rain
-  // stops under roofs, bridges and overhangs whether or not they are in view.
+  //  1. The shelter probe traces up, against the fall direction, from each candidate. Geometry above
+  //     the spawn plane is behind a downward ray's origin, so only an upward probe can see it.
+  //     A covered candidate is redrawn, up to kShelterRelocationAttempts times, so the spawn budget
+  //     moves to open sky. Only when every candidate is covered is the particle born sleeping
+  //     (timeToLive = 0), which is never rendered and retires through the normal counter path.
+  //     Relocation keeps the spawn rate, so rain in a doorway can look denser than outside.
   //
-  //  1. SHELTER PROBE with RELOCATION - upward, against the fall direction,
-  //     from each candidate spawn position. The spawn plane hangs
-  //     spawnHeightMeters * meterToWorldUnitScale above the CAMERA, and
-  //     whenever the sheltering geometry sits ABOVE that plane the drop is
-  //     born already inside the sheltered space: a downward ray can never see
-  //     the roof, because the roof is behind the ray's origin. Probing UP from
-  //     the spawn position is correct at ANY scale: if opaque geometry hangs
-  //     anywhere overhead, this drop would have been stopped up there, so it
-  //     must not exist down here.
+  //  2. The landing trace follows the spawn velocity for the whole life and shortens timeToLive so the
+  //     particle dies at the surface. It is exact for straight paths and approximate with turbulence or drag.
   //
-  //     A sheltered candidate is NOT killed outright. The first shipped
-  //     version did that, and it produced the second reported bug ("step
-  //     under a roof and ALL rain stops, even the rain outside the door"):
-  //     the whole spawn volume is a camera-centred disc, and with the
-  //     integration's understated scene scale (FO4 runs rtx.sceneScale = 0.1
-  //     => 10 units per authored meter, against a world that is really ~70
-  //     units/m) that disc is only a ~3 REAL meter bubble around the player's
-  //     head - so any porch, canopy or awning covers ALL of it, every drop
-  //     died at birth, and nothing was left to fall ANYWHERE, including in
-  //     the open air visible through the doorway. Instead, a sheltered
-  //     candidate REROLLS: draw a fresh random point on the emitter (up to
-  //     kShelterRelocationAttempts in all) and keep the first one with open
-  //     sky. The particle budget migrates to wherever the sky is actually
-  //     visible - exactly the rain you can see from inside a shelter - at any
-  //     scene scale, with no dependence on how big the covering geometry is.
-  //     Only when every attempt is covered (a genuinely enclosed interior) is
-  //     the drop killed at birth: timeToLive = 0 means born sleeping, the
-  //     geometry pass skips sleeping particles (never rendered for even a
-  //     frame), and evolve retires it through the normal conservative-counter
-  //     path - the exact lifecycle upstream's Kill collision mode already
-  //     uses.
+  // All rays are opaque-only (OBJECT_MASK_OPAQUE and RAY_FLAG_CULL_NON_OPAQUE), so alpha-blended and
+  // alpha-tested surfaces do not stop precipitation. Every in-mask candidate is then opaque,
+  // so a single Proceed() completes the traversal.
   //
-  //     DENSITY CAVEAT, accepted deliberately: relocation conserves the spawn
-  //     rate, so when most of the disc is covered the surviving fraction
-  //     concentrates in the uncovered part, which can read as up-to-Kx denser
-  //     rain framed in a doorway. That errs on the visible side, which is the
-  //     point of the fix; the alternative (kill proportionally) is exactly
-  //     the starvation this replaces.
-  //
-  //  2. LANDING TRACE - along the accepted candidate's spawn velocity for the
-  //     whole ballistic path, shortening timeToLive so the drop dies at the
-  //     surface it would land on. For rain (no drag, no turbulence) the path
-  //     IS a straight line, so this is exact; heavy turbulence/drag curves it
-  //     and makes this an approximation, which is an acceptable trade for the
-  //     cost. Skipped when the shelter probe killed the particle.
-  //
-  // All rays are opaque-only (OBJECT_MASK_OPAQUE + RAY_FLAG_CULL_NON_OPAQUE):
-  // alpha-blended and translucent surfaces (glass, decals, particles) and
-  // alpha-TESTED cards (foliage, chain fences, gratings) do not stop
-  // precipitation, and skipping them keeps traversal single-pass with no
-  // any-hit. This is a verified-safe combination in this integration: fully
-  // opaque draws get VK_GEOMETRY_OPAQUE_BIT_KHR + OBJECT_MASK_OPAQUE
-  // (rtx_instance_manager.cpp, determine-geometry-flags block), so solid world
-  // geometry is never culled by RAY_FLAG_CULL_NON_OPAQUE; and because every
-  // in-mask candidate is opaque (and the Opaque TLAS carries no in-mask AABB
-  // primitives), a single Proceed() completes the whole traversal - the
-  // "while (Proceed()) commit candidates" idiom is only needed when non-opaque
-  // candidates can occur.
-  //
-  // topLevelAS is LAST frame's structure (particle simulation runs before this
-  // frame's TLAS build) and may not exist at all early in a scene - hence the
-  // sceneTlasValid gate.
+  // topLevelAS is last frame's structure and may not exist early in a scene, hence the sceneTlasValid gate.
   const bool traceOcclusion = particleSystem.desc.traceSpawnOcclusion && particleCb.sceneTlasValid != 0;
   bool sheltered = false;
 
@@ -267,13 +205,8 @@ GpuParticle respawn(uint particleIdx, uint spawnCtxIdx, const GpuParticleSystem 
   {
     InterlockedAdd(SpawnTraceStats[0], 1);
 
-    // Shelter probe reach: 1 km of AUTHORED distance (100000 cm scaled by
-    // sceneScale, the same units-per-centimeter factor every other spatial
-    // particle parameter uses). Deliberately far: with a mis-stated scene
-    // scale the authored meter shrinks relative to the real world (FO4: 7x),
-    // and the probe must still clear real-world bridge decks. Sky-bound rays
-    // leave the TLAS bounds almost immediately, so the long TMax costs
-    // nothing in the common uncovered case.
+    // The probe reaches 1 km of authored distance (100000 cm times sceneScale), so it still clears
+    // high geometry when the scene scale is understated. Sky-bound rays leave the TLAS bounds quickly.
     const float shelterProbeDistance = 100000.0f * particleCb.sceneScale;
 
     bool relocated = false;
@@ -281,10 +214,8 @@ GpuParticle respawn(uint particleIdx, uint spawnCtxIdx, const GpuParticleSystem 
     {
       if (attempt > 0)
       {
-        // Fresh candidate. The seed base strides by maxNumParticles so a
-        // retry can never replay the seed window of another particle's first
-        // attempt in the same frame, which would spawn two drops at the
-        // identical position.
+        // The seed base strides by maxNumParticles, so a retry never replays another particle's seeds
+        // and spawns two drops at the same position.
         candidate = sampleSpawnPoint(spawnCtx, particleSystem,
                                   particleIdx + attempt * particleSystem.desc.maxNumParticles);
       }
@@ -292,8 +223,7 @@ GpuParticle respawn(uint particleIdx, uint spawnCtxIdx, const GpuParticleSystem 
       const float speed = length(candidate.initialVelocity);
       if (!(speed > 1e-6f))
       {
-        // Motionless particle: no fall direction to probe against. Accept it
-        // untraced, matching the pre-relocation behaviour.
+        // A motionless particle has no fall direction to probe against, so it is accepted untraced.
         sheltered = false;
         break;
       }
@@ -322,8 +252,7 @@ GpuParticle respawn(uint particleIdx, uint spawnCtxIdx, const GpuParticleSystem 
     }
   }
 
-  // Spawn the particle from the accepted candidate (or from the last sheltered
-  // candidate, which is about to be killed and never rendered).
+  // Spawn from the accepted candidate, or from the last covered one, which is killed below.
   GpuParticle newParticle;
   newParticle.reset(particleSystem, candidate.spawnPosition, candidate.initialVelocity, candidate.uvMinMax, candidate.color, candidate.randSeed);
 
@@ -331,8 +260,7 @@ GpuParticle respawn(uint particleIdx, uint spawnCtxIdx, const GpuParticleSystem 
   {
     if (sheltered)
     {
-      // Every candidate had cover overhead: a genuinely enclosed space. Born
-      // sleeping - see the block comment.
+      // Every candidate was covered, so the particle is born sleeping.
       newParticle.timeToLive = 0.0f;
       InterlockedAdd(SpawnTraceStats[1], 1);
     }
@@ -355,9 +283,7 @@ GpuParticle respawn(uint particleIdx, uint spawnCtxIdx, const GpuParticleSystem 
 
         if (rayQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
         {
-          // Die at the surface. Nudged slightly short so the final frame of
-          // the particle is just above the geometry rather than intersecting
-          // it.
+          // Die slightly short of the surface, so the last frame does not intersect it.
           const float hitDistance = rayQuery.CommittedRayT();
           newParticle.timeToLive = min(newParticle.timeToLive, max(hitDistance * 0.98f, 0.0f) / speed);
           InterlockedAdd(SpawnTraceStats[2], 1);

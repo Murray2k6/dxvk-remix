@@ -34,15 +34,12 @@ namespace dxvk {
       friend class DxvkRCAS;
       friend class ImGUI;
 
-      // Note: this lives in its own `rtx.sharpening` namespace rather than under
-      // `rtx.fsr`. It drives the standalone RCAS pass that runs after DLSS,
-      // DLSS-RR, XeSS and TAA-U, and is also forwarded to FSR's own built-in
-      // RCAS stage. An FSR-namespaced key silently owning four non-FSR
-      // upscaler paths would be a trap for anyone later reworking FSR.
+      // This key is not under `rtx.fsr` because it drives the standalone RCAS pass for every
+      // non-FSR upscaler and is only forwarded to FSR's built-in RCAS stage.
       RTX_OPTION("rtx.sharpening", float, sharpness, 0.0f,
-                 "Post-upscale RCAS sharpening amount. 0.0 = off (no sharpening pass is dispatched), 1.0 = maximum. "
-                 "Applies to DLSS, DLSS Ray Reconstruction, XeSS and TAA-U through a standalone RCAS pass, and is "
-                 "forwarded to FSR's built-in sharpener when FSR is the active upscaler.");
+                 "The amount of RCAS sharpening after upscaling, from 0 (off, no sharpening pass runs) to 1 (maximum). "
+                 "Applies to DLSS, DLSS Ray Reconstruction, XeSS and TAA-U through a separate RCAS pass, and is passed "
+                 "to FSR's own sharpener when FSR is the upscaler.");
     };
 
     explicit DxvkRCAS(DxvkDevice* device);

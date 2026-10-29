@@ -81,3 +81,50 @@ bool loadPixelCoordinate(
   gbufferPixelCoordinate = threadIndex;
   return true;
 }
+
+// Unpacks an active-pixel list entry, which holds x in the low 16 bits and y in the high 16 bits.
+uvec2 unpackActiveListPixelCoordinate(uint packedCoordinate)
+{
+  return uvec2(packedCoordinate & 0xFFFFu, packedCoordinate >> 16);
+}
+
+// Loads the pixel a thread handles, for a pass that may be launched over the active-pixel list.
+// A launch over the list runs groups of COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE threads along x only,
+// so neighboring lanes take neighboring list entries.
+// Returns true for an active pixel.
+// Returns false for an inactive pixel, a thread past the end of the list or a thread outside the ray tracing resolution.
+bool loadLaunchPixelCoordinate(
+  uint2 threadIndex,
+  Texture2D<uint16_t> ActiveLocalPixelCoords,
+  StructuredBuffer<uint> ActivePixelList,
+  uvec2 raytracingResolution,
+  SparseRenderingArgs args,
+  uint launchBit,
+  out uvec2 gbufferPixelCoordinate)
+{
+  gbufferPixelCoordinate = threadIndex;
+
+  if (args.mode != SparseRenderingMode::Off && (args.compactedLaunchMask & launchBit) != 0)
+  {
+    const uint listIndex =
+      (threadIndex.x / COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE_X) * COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE +
+      threadIndex.y * COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE_X +
+      threadIndex.x % COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE_X;
+
+    if (listIndex >= ActivePixelList[COMPACT_ACTIVE_PIXELS_LIST_COUNT_SLOT])
+    {
+      return false;
+    }
+
+    gbufferPixelCoordinate = unpackActiveListPixelCoordinate(ActivePixelList[COMPACT_ACTIVE_PIXELS_LIST_HEADER_SIZE + listIndex]);
+
+    return all(gbufferPixelCoordinate < raytracingResolution);
+  }
+
+  if (any(threadIndex >= raytracingResolution))
+  {
+    return false;
+  }
+
+  return loadPixelCoordinate(threadIndex, ActiveLocalPixelCoords, raytracingResolution, args, gbufferPixelCoordinate);
+}

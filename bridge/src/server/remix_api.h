@@ -26,12 +26,44 @@
 #include "util_devicecommand.h"
 #include "util_remixapi.h"
 
+#include <cstring>
 #include <mutex>
+#include <string>
 
 namespace remixapi {
   extern remixapi_Interface g_remix;
   extern bool g_remix_initialized;
   extern HMODULE g_remix_dll;
+
+  // A color grading export of the runtime, looked up by name once. Returns null, and logs once, when the runtime
+  // has no such export.
+  template<typename Pfn>
+  Pfn colorGradeFn(const char* name) {
+    static Pfn fn = nullptr;
+    static bool looked = false;
+    if (!looked && g_remix_dll != nullptr) {
+      looked = true;
+      fn = reinterpret_cast<Pfn>(GetProcAddress(g_remix_dll, name));
+      if (fn == nullptr) {
+        Logger::err(std::string("[RemixApi] the runtime has no ") + name + " export");
+      }
+    }
+    return fn;
+  }
+
+  // The grade from the 16 floats the client sends: the matrix, the balance, saturation, contrast, anchor and shoulder.
+  inline remixapi_ColorGradeEXT colorGradeFromFields(const float* f) {
+    remixapi_ColorGradeEXT grade = {};
+    grade.sType = REMIXAPI_STRUCT_TYPE_COLOR_GRADE_EXT;
+    grade.version = REMIXAPI_COLOR_GRADE_VERSION;
+    memcpy(grade.matrix, f, sizeof(float) * 9);
+    memcpy(grade.balance, f + 9, sizeof(float) * 3);
+    grade.saturation = f[12];
+    grade.contrast = f[13];
+    grade.anchor = f[14];
+    grade.shoulder = f[15];
+    return grade;
+  }
   extern IDirect3DDevice9Ex* g_device;
   extern std::mutex g_device_mutex;
   extern IDirect3DDevice9Ex* getDevice();

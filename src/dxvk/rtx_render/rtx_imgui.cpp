@@ -21,18 +21,25 @@
 */
 #include "rtx_imgui.h"
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <optional>
+#include <string>
 
 namespace RemixGui {
 
   constexpr float kFixedTooltipWidth = 540; // so the text doesn't spread too wide
 
   void SetTooltipUnformatted(const char* text) {
-    // fixed size tooltip for readability
+    // A fixed width keeps tooltips readable. It grows with the current font when a menu draws in a font
+    // larger than the default one.
+    const ImFont* defaultFont = ImGui::GetIO().FontDefault;
+    const float fontRatio = defaultFont != nullptr ? std::max(1.0f, ImGui::GetFontSize() / defaultFont->FontSize) : 1.0f;
+    const float tooltipWidth = kFixedTooltipWidth * fontRatio;
     // -1 to preserve automatic resize on Y
     ImGui::SetNextWindowSizeConstraints(
-      ImVec2(kFixedTooltipWidth, -1),
-      ImVec2(kFixedTooltipWidth, -1)
+      ImVec2(tooltipWidth, -1),
+      ImVec2(tooltipWidth, -1)
     );
     ImGui::BeginTooltipEx(ImGuiTooltipFlags_OverridePreviousTooltip, ImGuiWindowFlags_None);
     // NOTE: imgui has an optimization for "%s" format string that directly puts 'text' without formatting
@@ -215,6 +222,45 @@ namespace RemixGui {
 
   bool Checkbox(const char* label, dxvk::RtxOption<bool>* rtxOption) {
     IMGUI_RTXOPTION_WIDGET(Checkbox(label, &value, 0.9f))
+  }
+
+  bool InputKeyBind(const char* label, dxvk::RtxOption<dxvk::VirtualKeys>* rtxOption) {
+    RemixGui::RtxOptionUxWrapper wrapper(rtxOption);
+    std::array<char, 256> textBuffer {};
+    const std::string current = dxvk::buildKeyBindDescriptorString(rtxOption->get(), ',');
+    const size_t clampedSize = std::min(current.size(), textBuffer.size() - 1);
+    std::memcpy(textBuffer.data(), current.data(), clampedSize);
+    textBuffer[clampedSize] = '\0';
+
+    const bool entered = RemixGui::InputText(label, textBuffer.data(), textBuffer.size(), ImGuiInputTextFlags_EnterReturnsTrue);
+    if (!entered && !ImGui::IsItemDeactivated()) {
+      return false;
+    }
+
+    dxvk::VirtualKeys keys;
+    if (!dxvk::Config::parseOptionValue(std::string(textBuffer.data()), keys) || keys == rtxOption->get()) {
+      return false;
+    }
+    CheckRtxOptionPopups(rtxOption);
+    rtxOption->setDeferred(keys);
+    return true;
+  }
+
+  bool CheckboxNoLabel(const char* id, dxvk::RtxOption<bool>* rtxOption, float boxScale) {
+    bool value = rtxOption->get();
+    const bool changed = RemixGui::CheckboxNoLabel(id, &value, boxScale);
+
+    if (changed) {
+      CheckRtxOptionPopups(rtxOption);
+      rtxOption->setDeferred(value);
+    }
+
+    if (ImGui::IsItemHovered()) {
+      const std::string tooltip = RemixGui::BuildRtxOptionTooltip(rtxOption);
+      RemixGui::SetTooltipUnformatted(tooltip.c_str());
+    }
+
+    return changed;
   }
 
   static bool Items_PairGetter(void* data, int idx, const char** out_text, const char** out_tooltip) {

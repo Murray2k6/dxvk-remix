@@ -132,7 +132,18 @@ SubsurfaceMaterialInteraction subSurfaceMaterialReadHelper(
   SurfaceInteraction surfaceInteraction,
   uint16_t samplerIndex)
 {
-  if ((!cb.sssArgs.enableThinOpaque && !cb.sssArgs.enableDiffusionProfile) || subsurfaceMaterialIndex == SURFACE_INDEX_INVALID)
+  // An extension entry may exist only to carry an albedo tint (SURFACE_MATERIAL_EXTENSION_FLAG_NO_SUBSURFACE).
+  bool hasSubsurfaceEntry = false;
+  // rtx.gbuffer.slimVariants. GBUFFER_SLIM_NO_SSS variants take the no-entry result below for every material.
+  // The host binds them only while no material decoded by the G-buffer passes can have a subsurface entry this frame,
+  // where the runtime test is false for every pixel, so the returned and written zeros are the same.
+#ifndef GBUFFER_SLIM_NO_SSS
+  if ((cb.sssArgs.enableThinOpaque || cb.sssArgs.enableDiffusionProfile) && subsurfaceMaterialIndex != SURFACE_INDEX_INVALID)
+  {
+    hasSubsurfaceEntry = (surfaceMaterialExtensions[subsurfaceMaterialIndex].data[0].x & SURFACE_MATERIAL_EXTENSION_FLAG_NO_SUBSURFACE) == 0;
+  }
+#endif
+  if (!hasSubsurfaceEntry)
   {
     SubsurfaceMaterialInteraction subsurfaceMaterialInteraction;
     subsurfaceMaterialInteraction.measurementDistance = 0.0h;
@@ -154,10 +165,20 @@ SubsurfaceMaterialInteraction subSurfaceMaterialReadHelper(
   const uint2 subsurfaceDiffusionProfileData)
 {
   SubsurfaceMaterialInteraction subsurfaceMaterialInteraction;
+#ifdef GBUFFER_SLIM_NO_SSS
+  // rtx.gbuffer.slimVariants. In a GBUFFER_SLIM_NO_SSS frame the G-buffer pass wrote uint2(0, 0)
+  // to both textures for every hit (polymorphicSurfaceMaterialInteractionWriteToGBuffer), and this is their decode.
+  subsurfaceMaterialInteraction.measurementDistance = 0.0h;
+  subsurfaceMaterialInteraction.packedTransmittanceColor = 0;
+  subsurfaceMaterialInteraction.packedSingleScatteringAlbedo = 0;
+  subsurfaceMaterialInteraction.volumetricAnisotropy = uint8_t(0);
+  subsurfaceMaterialInteraction.maxSampleRadius = uint8_t(0);
+#else
   subsurfaceMaterialInteraction.measurementDistance = uint16BitsToHalf(uint16_t(subsurfaceData.x));
   subsurfaceMaterialInteraction.packedTransmittanceColor = subsurfaceDiffusionProfileData.x;
   subsurfaceMaterialInteraction.packedSingleScatteringAlbedo = subsurfaceDiffusionProfileData.y;
   subsurfaceMaterialInteraction.volumetricAnisotropy = uint8_t(subsurfaceData.y & 0xFF);
   subsurfaceMaterialInteraction.maxSampleRadius = uint8_t(subsurfaceData.y >> 8);
+#endif
   return subsurfaceMaterialInteraction;
 }

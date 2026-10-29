@@ -324,7 +324,10 @@ namespace dxvk
     void setResolution(const uint32_t renderResolution[2], const uint32_t finalResolution[2]);
     bool update(
       uint32_t frameIdx, const Matrix4& newWorldToView, const Matrix4& newViewToProjection,
-      float fov, float aspectRatio, float nearPlane, float farPlane, bool isLHS, uint32_t flags = (uint32_t)UpdateFlag::UpdateNormal
+      float fov, float aspectRatio, float nearPlane, float farPlane, bool isLHS, uint32_t flags = (uint32_t)UpdateFlag::UpdateNormal,
+      // rtx.worldOrigin.preciseCamera: the same world-to-view matrix in double precision. When set it
+      // replaces newWorldToView for the camera's matrices (newWorldToView still fills the float context).
+      const Matrix4d* preciseWorldToView = nullptr
     );
     bool updateFromSetting(uint32_t frameIdx, const RtCameraSetting& setting, uint32_t flags = (uint32_t) UpdateFlag::UpdateNormal);
     void getJittering(float jitter[2]) const;

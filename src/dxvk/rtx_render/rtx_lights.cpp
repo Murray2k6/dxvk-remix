@@ -20,10 +20,19 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
+#include "rtx_pre_exposure.h"
 #include "rtx_lights.h"
 #include "rtx_light_manager.h"
 #include "rtx_light_utils.h"
 #include "rtx_global_volumetrics.h"
+#include "rtx_host_calibration.h"
+
+namespace {
+  // The factor this light's radiance is encoded with (RtLight::writeGPUData sets it before dispatching to the
+  // typed light): the renderer's pre-exposure (rtx_pre_exposure.h), times the host calibration
+  // (rtx_host_calibration.h) for every light but the sky provider's own. The light upload is single-threaded.
+  float s_radianceEncodeScale = 1.0f;
+}
 
 namespace dxvk {
 
@@ -248,7 +257,7 @@ void RtSphereLight::writeGPUData(unsigned char* data, std::size_t& offset, bool 
   writeGPUHelper(data, offset, glm::packHalf1x16(m_radius));
   writeGPUPadding<2>(data, offset);
 
-  writeGPUHelper(data, offset, packLogLuv32(m_radiance));
+  writeGPUHelper(data, offset, packLogLuv32(m_radiance * s_radianceEncodeScale));  // pre-exposure x calibration
 
   m_shaping.writeGPUData(data, offset);
 
@@ -382,7 +391,7 @@ void RtRectLight::writeGPUData(unsigned char* data, std::size_t& offset, bool ig
   writeGPUHelper(data, offset, glm::packHalf1x16(m_dimensions.x));
   writeGPUHelper(data, offset, glm::packHalf1x16(m_dimensions.y));
 
-  writeGPUHelper(data, offset, packLogLuv32(m_radiance));
+  writeGPUHelper(data, offset, packLogLuv32(m_radiance * s_radianceEncodeScale));  // pre-exposure x calibration
 
   m_shaping.writeGPUData(data, offset);
 
@@ -565,7 +574,7 @@ void RtDiskLight::writeGPUData(unsigned char* data, std::size_t& offset, bool ig
   writeGPUHelper(data, offset, glm::packHalf1x16(m_halfDimensions.x));
   writeGPUHelper(data, offset, glm::packHalf1x16(m_halfDimensions.y));
 
-  writeGPUHelper(data, offset, packLogLuv32(m_radiance));
+  writeGPUHelper(data, offset, packLogLuv32(m_radiance * s_radianceEncodeScale));  // pre-exposure x calibration
 
   m_shaping.writeGPUData(data, offset);
 
@@ -730,7 +739,7 @@ void RtCylinderLight::writeGPUData(unsigned char* data, std::size_t& offset, boo
   assert(m_axisLength < FLOAT16_MAX);
   writeGPUHelper(data, offset, glm::packHalf1x16(m_axisLength));
 
-  writeGPUHelper(data, offset, packLogLuv32(m_radiance));
+  writeGPUHelper(data, offset, packLogLuv32(m_radiance * s_radianceEncodeScale));  // pre-exposure x calibration
   writeGPUPadding<12>(data, offset); // no shaping
 
   // Note: Ensure the axis vector is normalized as this is a requirement for the GPU encoding.
@@ -866,7 +875,7 @@ void RtDistantLight::writeGPUData(unsigned char* data, std::size_t& offset, bool
   writeGPUHelper(data, offset, m_orientation.z);
   writeGPUHelper(data, offset, m_orientation.w);
 
-  writeGPUHelper(data, offset, packLogLuv32(m_radiance));
+  writeGPUHelper(data, offset, packLogLuv32(m_radiance * s_radianceEncodeScale));  // pre-exposure x calibration
   writeGPUPadding<12>(data, offset); // no shaping
 
   assert(isApproxNormalized(m_direction, kNormalizationThreshold));
@@ -884,7 +893,7 @@ void RtDistantLight::writeGPUData(unsigned char* data, std::size_t& offset, bool
   // Todo: Ideally match this with GPU light type constants
   uint32_t flags = lightTypeDistant << 29;
   if (ignoreViewModel) flags |= 1 << 1; // ignoreViewModel flag at bit 1
-  if (atmosphereCloudShadowed) flags |= 1 << 2; // atmosphere cloud-shadow flag at bit 2 (fork)
+  if (atmosphereCloudShadowed) flags |= 1 << 2; // atmosphere cloud-shadow flag at bit 2
   writeGPUHelper(data, offset, flags);
 
   assert(offset - oldOffset == kLightGPUSize);
@@ -984,6 +993,7 @@ void RtLight::copyFrom(const RtLight& light) {
   isDynamic = light.isDynamic;
   ignoreViewModel = light.ignoreViewModel;
   atmosphereCloudShadowed = light.atmosphereCloudShadowed;
+  isSkyProviderLight = light.isSkyProviderLight;
   m_type = light.m_type;
   
   // Copy only the active union member based on the light type
@@ -1006,6 +1016,7 @@ void RtLight::copyFrom(const RtLight& light) {
   }
   
   m_cachedInitialHash = light.m_cachedInitialHash;
+  m_stableIdentity = light.m_stableIdentity;
   m_frameLastTouched = light.m_frameLastTouched;
   m_isInsideFrustum = light.m_isInsideFrustum;
   m_bufferIdx = light.m_bufferIdx;
@@ -1038,7 +1049,7 @@ void RtLight::copyFrom(const RtLight& light) {
 namespace {
   template<int RtLightSize> struct CheckRtLightSize {
     // The second line of the build error should contain the new size of RtLight in the template argument, i.e. `dxvk::CheckRtLightSize<newSize>`
-    static_assert(RtLightSize == 264, "RtLight size has changed.  Fix the copyFrom function above this message, then update the expected size.");
+    static_assert(RtLightSize == 272, "RtLight size has changed.  Fix the copyFrom function above this message, then update the expected size.");
   };
   CheckRtLightSize<sizeof(RtLight)> _rtLightSizeTest;
 }
@@ -1104,6 +1115,7 @@ void RtLight::applyTransform(const Matrix4& lightToWorld) {
 }
 
 void RtLight::writeGPUData(unsigned char* data, std::size_t& offset) const {
+  s_radianceEncodeScale = PreExposure::get() * (isSkyProviderLight ? 1.0f : HostCalibration::lightScale());
   switch (m_type) {
   default:
     assert(false);
@@ -1222,4 +1234,4 @@ Vector3 RtLight::getRadiance() const {
   }
 }
 
-} // namespace dxvk 
+} // namespace dxvk

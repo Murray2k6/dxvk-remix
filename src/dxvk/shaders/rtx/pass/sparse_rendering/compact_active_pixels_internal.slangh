@@ -86,3 +86,9 @@ uint16_t packLocalPixelCoordinate(uint2 localPixelCoordinate, bool isActive)
     ((localPixelCoordinate.y & 0x7F) << 8) |
     (isActive ? kPackedLocalPixelActiveFlag : 0));
 }
+
+// Packs a pixel coordinate into an active-pixel list entry. See unpackActiveListPixelCoordinate.
+uint packActiveListPixelCoordinate(uint2 pixelCoordinate)
+{
+  return (pixelCoordinate.x & 0xFFFFu) | (pixelCoordinate.y << 16);
+}

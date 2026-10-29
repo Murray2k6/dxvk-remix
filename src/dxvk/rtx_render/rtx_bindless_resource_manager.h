@@ -66,7 +66,15 @@ namespace dxvk {
       VkDescriptorSet bindlessDescSet = VK_NULL_HANDLE;
 
       void createLayout(const VkDescriptorType type);
-      void updateDescriptors(VkWriteDescriptorSet set);
+      bool updateDescriptors(uint32_t count, VkWriteDescriptorSet* writes);
+
+      std::vector<VkDescriptorImageInfo> imageDescriptors;
+      // rtx.parallelBindlessUpdate scratch: per-slot change flags and the slot's new resource.
+      std::vector<uint8_t> changeFlags;
+      std::vector<DxvkResource*> changedResources;
+      std::vector<VkDescriptorBufferInfo> bufferDescriptors;
+      // Keep handles alive while cached, including when the driver recycles handle values.
+      std::vector<Rc<DxvkResource>> descriptorResources;
 
     private:
       const Rc<vk::DeviceFn> vkd() const;

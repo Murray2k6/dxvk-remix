@@ -26,6 +26,7 @@
 #ifndef _M_ARM64
 
 #include "rtx.h"
+#include "rtx_pre_exposure.h"
 #include "rtx_context.h"
 #include "rtx_options.h"
 #include "dxvk_device.h"
@@ -35,6 +36,8 @@
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx_imgui.h"
 #include "rtx_auto_exposure.h"
+#include "rtx_matrix_helpers.h"
+#include "rtx_scene_manager.h"
 #include "../../util/util_math.h"
 #include "../util/util_string.h"
 #include "../util/log/log.h"
@@ -166,6 +169,12 @@ namespace dxvk {
       Logger::debug("XeSS: Non-Intel GPU detected - using generic XeSS path");
     }
 
+    // XeSS builds its descriptor set layouts with mutable descriptors, which are invalid without the feature.
+    if (!device->features().extMutableDescriptorType.mutableDescriptorType) {
+      Logger::warn("XeSS: the device does not support VK_EXT_mutable_descriptor_type, which XeSS needs");
+      return false;
+    }
+
     // Test context creation
     xess_context_handle_t testContext = nullptr;
     result = xessVKCreateContext(
@@ -259,10 +268,11 @@ namespace dxvk {
 
     // Check if we need to recreate the context
     XeSSPreset currentPreset = XessOptions::preset();
-    if (m_initialized && 
+    if (m_initialized &&
         m_targetExtent.width == targetExtent.width &&
         m_targetExtent.height == targetExtent.height &&
-        m_currentPreset == currentPreset) {
+        m_currentPreset == currentPreset &&
+        m_initFlags == m_wantedInitFlags) {
       return; // Already initialized with correct settings
     }
 
@@ -336,8 +346,9 @@ namespace dxvk {
     initParams.outputResolution.y = targetExtent.height;
     initParams.qualitySetting = presetToQuality(m_currentPreset);
 
-    // Set initialization flags based on renderer state and user options
-    initParams.initFlags = XESS_INIT_FLAG_NONE;
+    // Low-resolution, unjittered pixel motion vectors and HDR color are XeSS's defaults.
+    // The flags add inverted depth and the responsive mask when the frame has them.
+    initParams.initFlags = m_wantedInitFlags;
     
     initParams.creationNodeMask = 1;
     initParams.visibleNodeMask = 1;
@@ -354,6 +365,10 @@ namespace dxvk {
       m_xessContext = nullptr;
       return;
     }
+    m_initFlags = m_wantedInitFlags;
+    Logger::info(str::format("[XeSS] context created: output=", targetExtent.width, "x", targetExtent.height,
+      " invertedDepth=", (m_initFlags & XESS_INIT_FLAG_INVERTED_DEPTH) != 0,
+      " responsiveMask=", (m_initFlags & XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK) != 0));
   }
 
   uint32_t DxvkXeSS::calcRecommendedJitterSequenceLength() const {
@@ -394,14 +409,6 @@ namespace dxvk {
     }
   }
 
-  float DxvkXeSS::calcRecommendedMipBias() const {
-    // XeSS 2.1 formula: -log2(upscale_factor)
-    float upscaleFactor = calcUpscaleFactor();
-    float mipBias = -std::log2(upscaleFactor);
-
-    return mipBias;
-  }
-
   void DxvkXeSS::destroyXeSSContext() {
     if (m_xessContext) {
       xess_result_t result = xessDestroyContext(m_xessContext);
@@ -431,6 +438,29 @@ namespace dxvk {
       return;
     }
 
+    auto& sceneManager = device()->getCommon()->getSceneManager();
+    RtCamera& camera = sceneManager.getCamera();
+
+    // NUMOS's clouds and aerial perspective move with the wind rather than the motion vectors. Its bias mask is the
+    // share of each pixel to take from this frame, which is what XeSS's responsive mask means (DLSS and FSR get it too).
+    Rc<DxvkImageView> responsiveView;
+    if (device()->getCommon()->metaNumos().writesUpscalerBiasMask()) {
+      responsiveView = rtOutput.m_sharedBiasCurrentColorMask.view(Resources::AccessType::Read);
+    }
+
+    DecomposeProjectionParams projection;
+    decomposeProjection(camera.getViewToProjectionf(), projection);
+    m_wantedInitFlags = XESS_INIT_FLAG_NONE;
+    if (projection.isReverseZ) {
+      m_wantedInitFlags |= XESS_INIT_FLAG_INVERTED_DEPTH;
+    }
+    if (responsiveView != nullptr) {
+      m_wantedInitFlags |= XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK;
+    }
+    if (m_initialized && m_wantedInitFlags != m_initFlags) {
+      m_recreate = true;
+    }
+
     // Initialize XeSS if needed (similar to DLSS pattern)
     if (m_recreate || !m_initialized) {
       // Use the target extent that was already calculated in setSetting()
@@ -453,6 +483,7 @@ namespace dxvk {
       }
       initialize(renderContext, targetExtent);
       m_recreate = false;
+      resetHistory = true;
     }
 
     if (!m_initialized || !m_xessContext) {
@@ -473,13 +504,8 @@ namespace dxvk {
       rtOutput.m_compositeOutput.view(Resources::AccessType::Read),
       rtOutput.m_primaryScreenSpaceMotionVector.view,
       rtOutput.m_primaryDepth.view,
-      nullptr // Placeholder for auto-exposure texture
+      responsiveView
     };
-
-    auto& autoExposure = device()->getCommon()->metaAutoExposure();
-    if (autoExposure.enabled() && autoExposure.getExposureTexture().image != nullptr) {
-      inputs[3] = autoExposure.getExposureTexture().view;
-    }
 
     std::array<Rc<DxvkImageView>, 1> outputs = {
       rtOutput.m_finalOutput.view(Resources::AccessType::Write)
@@ -517,59 +543,11 @@ namespace dxvk {
 
     barriers.recordCommands(renderContext->getCommandList());
 
-    // Get jitter offset from camera
-    auto& sceneManager = device()->getCommon()->getSceneManager();
-    RtCamera& camera = sceneManager.getCamera();
+    // The pixel jitter applied to the projection, unscaled: XeSS reconstructs from the sample positions it is told,
+    // so a reported jitter that differs from the applied one misplaces every sample. The camera adds it to the
+    // projection the way the XeSS guide shows, so the sign matches too.
     float jitterOffset[2];
     camera.getJittering(jitterOffset);
-
-    // XeSS expects jitter in the range [-0.5, 0.5] in pixel units
-    // The camera jitter is already in pixel units, so we can use it directly
-    // However, we need to ensure it's properly scaled for XeSS
-    float xessJitterX = jitterOffset[0];
-    float xessJitterY = jitterOffset[1];
-    
-    if (DxvkXeSS::XessOptions::useOptimizedJitter()) {
-      // Get XeSS jitter scale to understand expected range
-      float jitterScaleX, jitterScaleY;
-      xess_result_t scaleResult = xessGetJitterScale(m_xessContext, &jitterScaleX, &jitterScaleY);
-      if (scaleResult == XESS_RESULT_SUCCESS) {
-        // Apply XeSS jitter scale if available
-        xessJitterX *= jitterScaleX;
-        xessJitterY *= jitterScaleY;
-        
-        // Applied jitter scale - debug logging removed to avoid spam
-      }
-    }
-    
-    // Apply user jitter scale multiplier
-    float userJitterScale = DxvkXeSS::XessOptions::jitterScale();
-    
-    // Apply adaptive jitter scaling for extreme upscaling scenarios
-    if (DxvkXeSS::XessOptions::useOptimizedJitter()) {
-      const float upscaleFactor = calcUpscaleFactor();
-      
-      // Adaptive jitter scaling to reduce swimming artifacts at extreme scaling
-      if (upscaleFactor > 6.0f) {
-        // Extreme scaling (e.g., 0.10x resolution = 10x upscaling): configurable jitter reduction
-        float extremeDamping = DxvkXeSS::XessOptions::scalingJitterDamping();
-        userJitterScale *= extremeDamping;
-        // Extreme scaling detected - debug logging removed to avoid spam
-      } else if (upscaleFactor > 4.0f) {
-        // Very high scaling: moderate jitter reduction
-        userJitterScale *= 0.75f;
-      } else if (upscaleFactor > 2.5f) {
-        // High scaling: light jitter reduction
-        userJitterScale *= 0.85f;
-      }
-    }
-    
-    xessJitterX *= userJitterScale;
-    xessJitterY *= userJitterScale;
-    
-    // Clamp jitter to XeSS expected range [-0.5, 0.5]
-    xessJitterX = std::clamp(xessJitterX, -0.5f, 0.5f);
-    xessJitterY = std::clamp(xessJitterY, -0.5f, 0.5f);
 
     // Set up XeSS execution parameters
     xess_vk_execute_params_t execParams = {};
@@ -583,18 +561,18 @@ namespace dxvk {
     execParams.colorTexture.width = colorView->imageInfo().extent.width;
     execParams.colorTexture.height = colorView->imageInfo().extent.height;
 
-    // Optional Exposure texture
-    if (autoExposure.enabled() && autoExposure.getExposureTexture().image != nullptr) {
-      auto exposureView = autoExposure.getExposureTexture().view;
-      execParams.exposureScaleTexture.imageView = exposureView->handle();
-      execParams.exposureScaleTexture.image = exposureView->image()->handle();
-      execParams.exposureScaleTexture.subresourceRange = exposureView->subresources();
-      execParams.exposureScaleTexture.format = exposureView->info().format;
-      execParams.exposureScaleTexture.width = exposureView->imageInfo().extent.width;
-      execParams.exposureScaleTexture.height = exposureView->imageInfo().extent.height;
+    // No exposure texture: Remix's is 1D, and the exposure goes in as a value below.
+    memset(&execParams.exposureScaleTexture, 0, sizeof(execParams.exposureScaleTexture));
+
+    if (responsiveView != nullptr) {
+      execParams.responsivePixelMaskTexture.imageView = responsiveView->handle();
+      execParams.responsivePixelMaskTexture.image = responsiveView->image()->handle();
+      execParams.responsivePixelMaskTexture.subresourceRange = responsiveView->subresources();
+      execParams.responsivePixelMaskTexture.format = responsiveView->info().format;
+      execParams.responsivePixelMaskTexture.width = responsiveView->imageInfo().extent.width;
+      execParams.responsivePixelMaskTexture.height = responsiveView->imageInfo().extent.height;
     } else {
-      // Zero out the struct if not used
-      memset(&execParams.exposureScaleTexture, 0, sizeof(execParams.exposureScaleTexture));
+      memset(&execParams.responsivePixelMaskTexture, 0, sizeof(execParams.responsivePixelMaskTexture));
     }
 
     // Motion vector texture
@@ -624,11 +602,15 @@ namespace dxvk {
     execParams.outputTexture.width = outputView->imageInfo().extent.width;
     execParams.outputTexture.height = outputView->imageInfo().extent.height;
 
-    // Always provide jitter separately as calculated above
-    execParams.jitterOffsetX = xessJitterX;
-    execParams.jitterOffsetY = xessJitterY;
+    execParams.jitterOffsetX = jitterOffset[0];
+    execParams.jitterOffsetY = jitterOffset[1];
 
-    execParams.exposureScale = 1.0f; // Default exposure scale
+    // The input is radiance times the pre-exposure P (rtx_pre_exposure.h). XeSS multiplies the input by this scale
+    // and divides its output by it, so E / P hands it radiance times the exposure E, as the XeSS guide asks for
+    // pre-exposed input, and the output keeps the input's scale.
+    const float exposure = PreExposure::trackedExposure();
+    const float safeExposure = std::isfinite(exposure) && exposure > 0.0f ? exposure : 1.0f;
+    execParams.exposureScale = safeExposure * PreExposure::inverse();
     execParams.resetHistory = resetHistory ? 1 : 0;
     // Use the input size from setSetting for all profiles
     execParams.inputWidth = m_inputSize.width;
@@ -641,10 +623,49 @@ namespace dxvk {
     execParams.inputResponsiveMaskBase = { 0, 0 };
     execParams.outputColorBase = { 0, 0 };
 
+    ++m_dispatches;
+    if (resetHistory) {
+      ++m_resets;
+    }
+    if (m_dispatches % 600 == 0) {
+      Logger::info(str::format("[XeSS] dispatches=600 resets=", m_resets,
+        " input=", m_inputSize.width, "x", m_inputSize.height,
+        " output=", outputView->imageInfo().extent.width, "x", outputView->imageInfo().extent.height,
+        " preset=", xessPresetToString(m_currentPreset),
+        " jitter=", jitterOffset[0], ",", jitterOffset[1], " mvScale=1,1",
+        " invertedDepth=", (m_initFlags & XESS_INIT_FLAG_INVERTED_DEPTH) != 0,
+        " responsiveMask=", responsiveView != nullptr,
+        " exposureScale=", execParams.exposureScale, " exposure=", safeExposure,
+        " preExposure=", PreExposure::get()));
+      m_resets = 0;
+    }
+
     // Execute XeSS
     VkCommandBuffer cmdBuffer = renderContext->getCommandList()->getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
     xess_result_t result = xessVKExecute(m_xessContext, cmdBuffer, &execParams);
-    
+
+    // XeSS reads its inputs in SHADER_READ_ONLY_OPTIMAL, but the rest of the frame binds them in the layout DXVK tracks.
+    for (auto input : inputs) {
+      if (input == nullptr) {
+        continue;
+      }
+
+      barriers.accessImage(
+        input->image(),
+        input->imageSubresources(),
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_READ_BIT,
+        input->imageInfo().layout,
+        input->imageInfo().stages,
+        input->imageInfo().access);
+
+      renderContext->getCommandList()->trackResource<DxvkAccess::None>(input);
+      renderContext->getCommandList()->trackResource<DxvkAccess::Read>(input->image());
+    }
+
+    barriers.recordCommands(renderContext->getCommandList());
+
     if (result != XESS_RESULT_SUCCESS) {
       Logger::warn(str::format("XeSS: Execute failed: ", xessResultToString(result)));
       

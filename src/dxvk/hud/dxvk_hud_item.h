@@ -7,6 +7,8 @@
 
 #include "../../util/util_time.h"
 
+#include "../dxvk_adapter.h"
+
 #include "dxvk_hud_renderer.h"
 
 namespace dxvk::hud {
@@ -103,6 +105,17 @@ namespace dxvk::hud {
       }
     }
 
+    // NV-DXVK start: HUD fallback set
+    /**
+     * \brief Whether DXVK_HUD / dxvk.hud selected no item
+     *
+     * The set then holds the items of "1" instead.
+     */
+    bool selectsNothing() const {
+      return m_selectsNothing;
+    }
+    // NV-DXVK end
+
     template<typename T>
     T getOption(const char *option, T fallback) {
       auto entry = m_options.find(option);
@@ -117,6 +130,7 @@ namespace dxvk::hud {
   private:
 
     bool                                          m_enableFull = false;
+    bool                                          m_selectsNothing = false;
     std::unordered_set<std::string>               m_enabled;
     std::unordered_map<std::string, std::string>  m_options;
     std::vector<Rc<HudItem>>                      m_items;
@@ -380,6 +394,9 @@ namespace dxvk::hud {
     Rc<DxvkDevice>                    m_device;
     VkPhysicalDeviceMemoryProperties  m_memory;
     DxvkMemoryStats                   m_heaps[VK_MAX_MEMORY_HEAPS];
+    // NV-DXVK start: report driver-side VRAM usage
+    DxvkAdapterMemoryInfo             m_driverMemInfo;
+    // NV-DXVK end
 
   };
 

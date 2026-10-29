@@ -11,7 +11,7 @@
 #include "dxvk_context.h"
 
 namespace dxvk {
-  
+
   /**
    * \brief Command stream operation
    * 

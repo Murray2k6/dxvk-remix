@@ -1,3 +1,24 @@
+/*
+* Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
 #pragma once
 
 #include <cstdint>
@@ -40,9 +61,11 @@ namespace dxvk {
     std::function<void()> m_function;
   };
 
+  // A command list on the DLSS-G queue, or on the graphics queue for FSR frame generation, whose prepare pass
+  // has to run on the queue the FFX proxy waits on at present.
   class DxvkDLFGCommandList : public RcObject {
   public:
-    DxvkDLFGCommandList(DxvkDevice* device);
+    DxvkDLFGCommandList(DxvkDevice* device, bool graphicsQueue = false);
     ~DxvkDLFGCommandList();
 
     void beginRecording();
@@ -60,7 +83,7 @@ namespace dxvk {
       return m_signalFence;
     }
     
-    // note: always submits to present queue
+    // Submits to the queue chosen at creation.
     void submit();
 
     template<DxvkAccess Access>
@@ -70,7 +93,10 @@ namespace dxvk {
 
     void reset();
   private:
+    const DxvkDeviceQueue& queue() const;
+
     DxvkDevice* m_device = nullptr;
+    bool m_graphicsQueue = false;
     VkCommandPool m_cmdPool = nullptr;
     VkCommandBuffer m_cmdBuf = nullptr;
 
@@ -93,7 +119,7 @@ namespace dxvk {
 
   class DxvkDLFGCommandListArray {
   public:
-    DxvkDLFGCommandListArray(DxvkDevice* device, uint32_t numCmdLists);
+    DxvkDLFGCommandListArray(DxvkDevice* device, uint32_t numCmdLists, bool graphicsQueue = false);
     DxvkDLFGCommandList* nextCmdList();
 
     void resizeCommandList(uint32_t numCmdLists) {
@@ -107,6 +133,7 @@ namespace dxvk {
 
   private:
     DxvkDevice* m_device;
+    bool m_graphicsQueue = false;
     std::vector<Rc<DxvkDLFGCommandList>> m_commandLists;
     std::vector<Rc<RtxFence>> m_fences;
     uint32_t m_currentCommandListIndex = 0;
@@ -212,7 +239,7 @@ namespace dxvk {
     bool swapchainAcquire(SwapchainImage& swapchainImage);
     bool interpolateFrame(DxvkDLFGCommandList* commandList, SwapchainImage& swapchainImage, const PresentJob& present, uint32_t interpolatedFrameIndex);
     void blitRenderedFrame(DxvkDLFGCommandList* commandList, SwapchainImage& renderedSwapchainImage, const PresentJob& present, bool frameInterpolated);
-    bool submitPresent(SwapchainImage& image, const PresentJob& present, uint64_t pacerSemaphoreWaitValue, VkSetPresentConfigNV*
+    bool submitPresent(SwapchainImage& image, const PresentJob& present, uint64_t pacerSemaphoreWaitValue, bool presentSemaphoreSignaled, VkSetPresentConfigNV*
                        presentMetering);
     void runPresentThread();
     void runPacerThread();
@@ -248,12 +275,16 @@ namespace dxvk {
     explicit DxvkDLFG(DxvkDevice* device);
     virtual void onDestroy();
 
+    static void onPresetChanged(DxvkDevice* device);
+    static const char* getPresetName();
+    static void requestPreset(bool useLite);
+
     bool supportsDLFG();
     const std::string& getDLFGNotSupportedReason();
     
     void setDisplaySize(uint2 displaySize);
 
-    void dispatch(Rc<DxvkContext> ctx,
+    bool dispatch(Rc<DxvkContext> ctx,
                   DxvkDLFGCommandList* commandList,
                   const RtCamera& camera,
                   Rc<DxvkImageView> outputImage,                       // VK_IMAGE_LAYOUT_GENERAL
@@ -276,9 +307,7 @@ namespace dxvk {
       return m_queryPoolDLFG;
     }
 
-    bool hasDLFGFailed() const {
-      return m_hasDLFGFailed;
-    }
+    bool hasDLFGFailed() const;
 
     bool supportsPresentMetering() const;
 
@@ -293,6 +322,10 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx.dlfg", uint32_t, maxInterpolatedFrames, 2, "For DLSS 4.5 frame generation, controls the number of interpolated frames for each rendered frame. Ignored for DLSS 3.0.",
                     args.minValue = 1, args.maxValue = 6,
                     args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dlfg", bool, litePreset, false, "Selects the DLSS Frame Generation preset. True: Preset C (lightweight model). False: Preset A (standard model). Switching recreates Frame Generation without restarting.",
+                    args.environment = "RTX_DLFG_LITE_PRESET",
+                    args.flags = RtxOptionFlags::UserSetting,
+                    args.onChangeCallback = &onPresetChanged);
     RTX_OPTION("rtx.dlfg", bool, enablePresentMetering, true, "Use hardware present metering for DLSS 4.0 frame generation instead of CPU pacing.");
 
   private:

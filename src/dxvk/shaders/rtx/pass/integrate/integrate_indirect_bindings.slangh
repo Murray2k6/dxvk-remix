@@ -20,11 +20,20 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #pragma once
+#ifndef ENABLE_SHARC
+#define ENABLE_SHARC 0
+#endif
+#ifndef SHARC_UPDATE
+#define SHARC_UPDATE 0
+#endif
 
 #include "rtx/pass/integrate/integrate_indirect_binding_indices.h"
 
 #include "rtx/algorithm/rtxdi/rtxdi.slangh"
 #include "rtx/utility/shader_types.slangh"
+#if ENABLE_SHARC
+#include "rtx/pass/sharc/sharc_bindings.slangh"
+#endif
 
 // Shared Inputs
 
@@ -40,14 +49,24 @@ Texture2D<uint16_t> SharedFlags;
 layout(r32ui, binding = INTEGRATE_INDIRECT_BINDING_SHARED_MEDIUM_MATERIAL_INDEX_INPUT)
 Texture2D<uint> SharedMediumMaterialIndex;
 
-layout(rg32f, binding = INTEGRATE_INDIRECT_BINDING_SHARED_TEXTURE_COORD_INPUT)
-Texture2D<float2> SharedTextureCoord;
+layout(rgba32f, binding = INTEGRATE_INDIRECT_BINDING_SHARED_TEXTURE_COORD_INPUT)
+Texture2D<float4> SharedTextureCoord;
 
 layout(r32ui, binding = INTEGRATE_INDIRECT_BINDING_SHARED_SURFACE_INDEX_INPUT)
 Texture2D<uint> SharedSurfaceIndex;
 
 layout(rg16ui, binding = INTEGRATE_INDIRECT_BINDING_SHARED_SUBSURFACE_DATA_INPUT)
 Texture2D<uint2> SharedSubsurfaceData;
+
+#if SHARC_UPDATE
+// The update stage tests its primary vertex with the predicate the cache hook applies to secondary hits,
+// and the primary's emission lives only in these packed words.
+layout(r32ui, binding = INTEGRATE_INDIRECT_BINDING_SHARED_MATERIAL_DATA0_INPUT)
+Texture2D<uint> SharedMaterialData0;
+
+layout(r32ui, binding = INTEGRATE_INDIRECT_BINDING_SHARED_MATERIAL_DATA1_INPUT)
+Texture2D<uint> SharedMaterialData1;
+#endif
 
 // Inputs
 
@@ -61,7 +80,7 @@ layout(rgba16f, binding = INTEGRATE_INDIRECT_BINDING_THROUGHPUT_CONE_RADIUS_INPU
 Texture2D<float4> ThroughputConeRadius;      
 
 layout(binding = INTEGRATE_INDIRECT_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
-Texture2D<uint16_t> IndirectActiveLocalPixelCoords;
+Texture2D<uint16_t> ActiveLocalPixelCoords;
 
 // Note: Needed for RTXDI sample stealing.
 layout(rgba32f, binding = INTEGRATE_INDIRECT_BINDING_PRIMARY_WORLD_POSITION_INPUT)
@@ -121,6 +140,9 @@ Texture2D<float2> NrcTrainingGBufferSurfaceRadianceRG;
 
 layout(r16f, binding = INTEGRATE_INDIRECT_BINDING_NRC_TRAINING_GBUFFER_SURFACE_RADIANCE_B_INPUT)
 Texture2D<float> NrcTrainingGBufferSurfaceRadianceB;
+
+layout(binding = INTEGRATE_INDIRECT_BINDING_NRC_TRAINING_QUERY_RESERVOIR_INPUT)
+Texture2D<uint> NrcTrainingQueryReservoir;
 
 // Inputs / Outputs
 

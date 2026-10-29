@@ -33,6 +33,7 @@ parser.add_argument('-force', action='store_true', dest='force')
 parser.add_argument('-parallel', action='store_true', dest='parallel')
 parser.add_argument('-binary', action='store_true', dest='binary')
 parser.add_argument('-debug', action='store_true', dest='debug')
+parser.add_argument('-spirvopt', required=False, type=str, dest='spirvopt', default=None)
 args = parser.parse_args()
 
 # Set to True to generate Slang repro file when compiling shaders
@@ -42,6 +43,8 @@ includePaths = ' '.join([f'-I{path}' for path in args.includes])
 slangDll = os.path.join(os.path.dirname(args.slangc), 'slang.dll')
 
 tools = [args.glslang, args.slangc, slangDll, __file__]
+if args.spirvopt:
+    tools.append(args.spirvopt)
 newestTool = max([os.path.getmtime(x) for x in tools])
 
 # Note: -Os (Optimize Size) used here as while one might typically expect optimizing for size to comprimise speed optimizations,
@@ -54,6 +57,25 @@ glslangFlags = '--quiet --target-env vulkan1.2 -Os'
 # (as otherwise -Od should be passed and be mutually exclusive with -Os), just means to generate debug info.
 if args.debug:
     glslangFlags += ' -g'
+
+# With -spirvopt, every Slang output gets an extra spirv-opt pass that also strips the debug names, then a spirv-val check.
+# The bindings and spec constants stay as declared, since the C++ side refers to them by number.
+# The passes are spirv-opt's -O recipe without combine-access-chains. That pass merges a descriptor array access into a
+# new access chain without the NonUniform decoration, and AMD drivers then read one descriptor for the whole wave.
+spirvOptPasses = [
+  'wrap-opkill', 'eliminate-dead-branches', 'merge-return', 'inline-entry-points-exhaustive', 'eliminate-dead-functions',
+  'eliminate-dead-code-aggressive', 'private-to-local', 'eliminate-local-single-block', 'eliminate-local-single-store',
+  'eliminate-dead-code-aggressive', 'scalar-replacement=0', 'convert-local-access-chains', 'eliminate-local-single-block',
+  'eliminate-local-single-store', 'eliminate-dead-code-aggressive', 'ssa-rewrite', 'eliminate-dead-code-aggressive', 'ccp',
+  'eliminate-dead-code-aggressive', 'loop-unroll', 'eliminate-dead-branches', 'redundancy-elimination',
+  'simplify-instructions', 'scalar-replacement=0', 'convert-local-access-chains', 'eliminate-local-single-block',
+  'eliminate-local-single-store', 'eliminate-dead-code-aggressive', 'ssa-rewrite', 'eliminate-dead-code-aggressive',
+  'vector-dce', 'eliminate-dead-inserts', 'eliminate-dead-branches', 'simplify-instructions', 'if-conversion',
+  'copy-propagate-arrays', 'reduce-load-size', 'eliminate-dead-code-aggressive', 'merge-blocks', 'redundancy-elimination',
+  'eliminate-dead-branches', 'merge-blocks', 'simplify-instructions']
+spirvOptFlags = ' '.join([f'--{p}' for p in spirvOptPasses]) \
+              + ' --strip-debug --strip-nonsemantic --preserve-bindings --preserve-spec-constants --target-env=vulkan1.2 --scalar-block-layout'
+spirvValFlags = '--target-env vulkan1.2 --scalar-block-layout'
 
 os.makedirs(args.output, exist_ok = True)
 
@@ -223,8 +245,11 @@ def createSlangTask(inputFile, variantSpec):
     headerFile = os.path.join(args.output, variantName + ".h")
     depFile = os.path.join(args.output, variantName + ".d")
 
+    # With -spirvopt, slangc writes an intermediate file and spirv-opt writes the final .spv from it.
+    slangOutputFile = os.path.join(args.output, variantName + ".slangc.bin") if args.spirvopt else destFile
+
     # Create task to resolve dep file for the compiler output (.spv)
-    task = createBasicTask(inputFile, destFile, destFile, depFile)
+    task = createBasicTask(inputFile, destFile, slangOutputFile, depFile)
 
     if variantName != inputName:
         task.customName = f'{os.path.basename(inputFile)} ({variantName})'
@@ -245,18 +270,26 @@ def createSlangTask(inputFile, variantSpec):
       reproFile = os.path.join(args.output, variantName + ".slangRepro")
       command1 += f'-dump-repro {reproFile}'
 
-    command1 += f'-o {destFile}'
+    command1 += f'-o {slangOutputFile}'
+
+    compileCommands = [command1]
+    if args.spirvopt:
+        compileCommands.append(f'{args.spirvopt} {spirvOptFlags} {slangOutputFile} -o {destFile}')
+        compileCommands.append(f'{args.spirvval} {spirvValFlags} {destFile}')
 
     # -binary switch just writes the SPV binary
     if args.binary:
-        task.commands = [command1]
+        task.commands = compileCommands
     else:
+        # NOTE: rebuild shader if its generated header is missing
+        task.outputs.append(headerFile)
+
         # Command to convert SPV into c array header
         script_dir = os.path.dirname(os.path.realpath(__file__))
         shader_xxd = os.path.join(script_dir, 'shader_xxd.py')
         command2 = f'"{sys.executable}" {shader_xxd} -i {destFile} -o {headerFile}'
 
-        task.commands = [command1, command2]
+        task.commands = compileCommands + [command2]
 
     return task
 

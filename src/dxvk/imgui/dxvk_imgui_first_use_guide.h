@@ -40,10 +40,6 @@ namespace dxvk {
 
     // Renders the first-use guide popup. Returns true if the user closed it.
     bool show(ImFont* boldFont);
-
-    // Renders the permission checkboxes (crash + performance reporting).
-    // Used by the popup and by the User Menu's Permissions tab.
-    static void showPermissionsUI();
   };
 
 }

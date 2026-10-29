@@ -25,6 +25,7 @@
 #include "rtx_resources.h"
 #include "rtx_common_object.h"
 #include "rtx/pass/sparse_rendering/sparse_rendering.h"
+#include "rtx/pass/sparse_rendering/compact_active_pixels_binding_indices.h"
 
 #include <memory>
 
@@ -47,25 +48,36 @@ namespace dxvk {
         "WhiteNoise (0): wangHash ~ white-noise.\n"
         "BlueNoise128x128x64x8 (1): 8 bit 128x128 blue-noise 64 frame length.");
 
-      RTX_OPTION_ARGS("rtx.sparseRendering", float, directLightingSamplingRate, 1.0f,
-        "Per-pixel sampling rate for primary direct lighting (RTXDI + integrate_direct).\n"
+      RTX_OPTION_ARGS("rtx.sparseRendering", float, samplingRate, 1.0f,
+        "Per-pixel sampling rate shared by primary direct and indirect lighting.\n"
         "Lower values boost performance at the cost of image detail and temporal stability.\n"
         "Range [0.0625, 1.0]. Rates below ~0.2 tend to look bad and yield diminishing perf returns.",
-        args.environment = "RTX_SPARSE_RENDERING_DIRECT_LIGHTING_SAMPLING_RATE",
+        args.environment = "RTX_SPARSE_RENDERING_SAMPLING_RATE",
         // 1/255 is the absolute minimum, but 1/16 is a more reasonable lower bound for image quality. Even 1/16 will show temporal instabilities but tends to not be catastrophic.
         // Second, there are diminishing returns on performance with lower rates so aggressive rates don't provide much more performance but can cause very bad image quality.
         args.minValue = 1.0f / 16.0f,
         args.maxValue = 1.0f);
 
-      RTX_OPTION_ARGS("rtx.sparseRendering", float, indirectLightingSamplingRate, 1.0f,
-        "Per-pixel sampling rate for primary indirect lighting (integrate_indirect, integrate_nee, NRC resolve).\n"
-        "Lower values boost performance at the cost of image detail and temporal stability.\n"
-        "Range [0.0625, 1.0]. Rates below ~0.2 tend to look bad and yield diminishing perf returns.",
-        args.environment = "RTX_SPARSE_RENDERING_INDIRECT_LIGHTING_SAMPLING_RATE",
-        // 1/255 is the absolute minimum, but 1/16 is a more reasonable lower bound for image quality. Even 1/16 will show temporal instabilities but has been tested to not be not catastrophic.
-        // Second, there are diminishing returns on performance with lower rates so aggressive rates don't provide much more performance but can cause very bad image quality.
+      // Deprecated per-signal rates - these are migrated to samplingRate via an onChange callback.
+      static void deprecatedSamplingRateOnChange(DxvkDevice* device);
+      RTX_OPTION_ARGS("rtx.sparseRendering", float, directLightingSamplingRate, 1.0f,
+        "Warning: This option is deprecated, please use rtx.sparseRendering.samplingRate instead.\n"
+        "Direct and indirect lighting use a single shared rate. A value set here migrates to that option unless it\n"
+        "already holds a value from the same config, which is left as it is.",
+        args.environment = "RTX_SPARSE_RENDERING_DIRECT_LIGHTING_SAMPLING_RATE",
         args.minValue = 1.0f / 16.0f,
-        args.maxValue = 1.0f);
+        args.maxValue = 1.0f,
+        args.onChangeCallback = &deprecatedSamplingRateOnChange);
+
+      RTX_OPTION_ARGS("rtx.sparseRendering", float, indirectLightingSamplingRate, 1.0f,
+        "Warning: This option is deprecated, please use rtx.sparseRendering.samplingRate instead.\n"
+        "Direct and indirect lighting use a single shared rate. A value set here migrates to that option unless it\n"
+        "already holds a value from the same config, which is left as it is - including one migrated from\n"
+        "rtx.sparseRendering.directLightingSamplingRate, which takes precedence when both are set.",
+        args.environment = "RTX_SPARSE_RENDERING_INDIRECT_LIGHTING_SAMPLING_RATE",
+        args.minValue = 1.0f / 16.0f,
+        args.maxValue = 1.0f,
+        args.onChangeCallback = &deprecatedSamplingRateOnChange);
 
       RTX_OPTION("rtx.sparseRendering", bool, enableSparsePrimaryRayMissComposition, false,
         "When enabled, primary miss pixels (sky) use sparse rendering.\n"
@@ -75,9 +87,6 @@ namespace dxvk {
         "When enabled, secondary surfaces (PSR glass reflections) use sparse rendering.\n"
         "This improves performance at the cost of potential sparse NRD denoising artifacts on glass.\n"
         "This option is in development and may not produce good denoised results.");
-
-      RTX_OPTION("rtx.sparseRendering", bool, forceNrcTrainingPixelsActive, true,
-        "When enabled, pixels that correspond to NRC training paths are forced active in sparse rendering.");
 
       RTX_OPTION("rtx.sparseRendering", bool, enableRtxdiReuseForInactivePixels, false,
         "Enables RTXDI reservoir reuse (temporal reprojection and spatial reuse) on inactive pixels.\n"
@@ -89,6 +98,12 @@ namespace dxvk {
 
       RTX_OPTION("rtx.sparseRendering", bool, enableSparseVolumetricsPrimaryMiss, false,
         "When enabled, volumetric NEE integration at primary-miss (sky) pixels uses sparse rendering.");
+
+      RTX_OPTION("rtx.sparseRendering", bool, compactActivePixels, true,
+        "When enabled, sparse rendering gathers the active pixels into a dense list every frame,\n"
+        "and the direct lighting passes launch one thread per active pixel instead of one per screen pixel.\n"
+        "This only takes effect while sparse rendering runs, and it does not change which pixels are lit.\n"
+        "Disable it to compare against the full-screen launches.");
 
       RTX_OPTION("rtx.sparseRendering", bool, enableSparsePrimarySpecularAlbedo, false,
         "When enabled, the primary specular albedo guide for DLSS Ray Reconstruction is written sparsely: active pixels get\n"
@@ -104,10 +119,21 @@ namespace dxvk {
     // use isActive() for per-frame dispatch decisions.
     static bool isEnabledByOptions();
 
+    bool resamplesNrcTrainingPaths(bool nrcIsActive) const;
+    static bool shouldDeferNrcTrainingSetup(const SparseRenderingArgs& args);
+
     void showImguiSettings();
     void dispatch(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
     void setSparseRenderingArgs(RtxContext& ctx, SparseRenderingArgs& args) const;
     void prewarmShaders(DxvkPipelineManager& pipelineManager) const;
+
+    // Returns the active-pixel list buffer, which starts with the indirect dispatch args of the compacted launches.
+    // Returns an empty slice while the list is not built this frame.
+    DxvkBufferSlice getActivePixelListSlice() const;
+
+    // Launches a compute pass over the active-pixel list when the pass's COMPACT_ACTIVE_PIXELS_LAUNCH_* bit is set in args,
+    // and over the given workgroups otherwise. The bound shader must use COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE groups.
+    void dispatchLaunch(RtxContext& ctx, const SparseRenderingArgs& args, uint32_t launchBit, const VkExtent3D& workgroups) const;
 
   protected:
     bool isEnabled() const override;
@@ -121,8 +147,22 @@ namespace dxvk {
     void dispatchActivePixelMask(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
     void dispatchCompactActivePixels(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
     bool checkCompactActivePixelsRequirements() const;
+    bool buildsActivePixelList() const;
+    void createActivePixelList(const VkExtent3D& downscaledExtent);
+    void dispatchActivePixelListArgs(RtxContext& ctx);
+    void readBackActivePixelCount(RtxContext& ctx);
 
     VkExtent3D m_activePixelMaskExtent = { 0u, 0u, 0u };
+
+    Rc<DxvkBuffer> m_activePixelList;
+    uint32_t m_activePixelListCapacity = 0u;
+    bool m_activePixelListLaunchesFit = false;
+
+    // A host-visible ring of active pixel counts, read several frames after the GPU wrote them.
+    static constexpr uint32_t kActivePixelCountReadbackSlots = 8u;
+    Rc<DxvkBuffer> m_activePixelCountReadback;
+    uint32_t m_activePixelCount = 0u;
+    uint32_t m_activePixelCountPixels = 0u;
   };
 
 } // namespace dxvk

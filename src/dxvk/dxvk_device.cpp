@@ -26,6 +26,7 @@
 #include "rtx_render/rtx_ray_reconstruction.h"
 #include "rtx_render/rtx_texture_manager.h"
 #include "rtx_render/rtx_neural_radiance_cache.h"
+#include "rtx_render/rtx_sharc.h"
 #include "rtx_render/rtx_rtxdi_rayquery.h"
 #include "rtx_render/rtx_restir_gi_rayquery.h"
 #include "rtx_render/rtx_composite.h"
@@ -34,10 +35,16 @@
 #include "rtx_render/rtx_fork_fsr.h"
 #include "rtx_render/rtx_fork_fsr_framegen.h"
 #include "rtx_render/rtx_fork_rcas.h"
+#include "rtx_render/rtx_external_effects.h"
+#include "rtx_render/rtx_gpu_breadcrumbs.h"
 
 #include "rtx_render/rtx_sparse_rendering.h"
 
 namespace dxvk {
+
+  // NV-DXVK start: Remix native device access
+  DxvkDevice* g_dxvkDeviceNative = nullptr;
+  // NV-DXVK end
   
   DxvkDevice::DxvkDevice(
     const Rc<vk::InstanceFn>&       vki,
@@ -75,7 +82,7 @@ namespace dxvk {
     if (adapterQueueInfos.imageAcquire.has_value()) {
       m_queues.imageAcquire = getQueue(adapterQueueInfos.imageAcquire->queueFamilyIndex, adapterQueueInfos.imageAcquire->queueIndex);
     }
-    
+
     if (adapterQueueInfos.fsrPresent.has_value()) {
       m_queues.fsrPresent = getQueue(adapterQueueInfos.fsrPresent->queueFamilyIndex, adapterQueueInfos.fsrPresent->queueIndex);
     }
@@ -139,6 +146,8 @@ namespace dxvk {
       TracyVkContextName(m_queues.present.tracyCtx, "Present Queue", strlen("Present Queue"));
     }
 #endif
+
+    m_gpuBreadcrumbs = GpuBreadcrumbs::create(this);
   }
 
   
@@ -150,6 +159,11 @@ namespace dxvk {
 
     // NV-DXVK start: RTX initializer
     m_objects.getRtxInitializer().release();
+    // RemixFX effects hang off a process lifetime singleton, so the images and
+    // shaders they own are the only device resources with no owner that dies
+    // alongside the device. Released here, after waitForIdle, for the same
+    // reason everything else in this destructor is.
+    RtxExternalEffects::instance().onDestroyDevice(this);
     // NV-DXVK end
 
 #ifdef TRACY_ENABLE
@@ -357,18 +371,23 @@ namespace dxvk {
 
   uint32_t DxvkDevice::getCurrentFrameId() const {
     // NV-DXVK start
-    // ToDo: avoid returning kInvalidFrameIndex
+    // Raster presentation may run concurrently with the Remix CS thread.
+    return m_remixFrameId.load(std::memory_order_relaxed);
     // NV-DXVK end
-    return m_statCounters.getCtr(DxvkStatCounter::QueuePresentCount);
   }
   
   
   void DxvkDevice::initResources() {
-    m_objects.dummyResources().clearResources(this);
+    initDummyResources();
 
     // NV-DXVK start: RTX initializer
     m_objects.getRtxInitializer().initialize();
     // NV-DXVK end
+  }
+
+
+  void DxvkDevice::initDummyResources() {
+    m_objects.dummyResources().clearResources(this);
   }
 
 
@@ -384,7 +403,9 @@ namespace dxvk {
     bool                            insertReflexPresentMarkers,
     std::uint32_t                   cachedAcquiredImageIndex,
     const Rc<vk::Presenter>&        presenter,
-          DxvkSubmitStatus*         status
+          DxvkSubmitStatus*         status,
+          bool                      isRemixPresent,
+          float                     reflexSleepMs
           ) {
     ScopedCpuProfileZone();
     
@@ -397,10 +418,20 @@ namespace dxvk {
     presentInfo.cachedReflexFrameId = cachedReflexFrameId;
     presentInfo.insertReflexPresentMarkers = insertReflexPresentMarkers;
     presentInfo.cachedAcquiredImageIndex = cachedAcquiredImageIndex;
+    // NV-DXVK start: Identify the presentation stream on the shared queue
+    presentInfo.isRemixPresent = isRemixPresent;
+    presentInfo.reflexSleepMs = reflexSleepMs;
+    // NV-DXVK end
 
     m_submissionQueue.present(presentInfo, status);
 
-    incrementPresentCount();
+    incrementPresentCount(isRemixPresent);
+
+    // NV-DXVK start: Only Remix owns its async presenter and output window
+    if (!isRemixPresent) {
+      return;
+    }
+    // NV-DXVK end
 
     // NV-DXVK end
 
@@ -420,10 +451,15 @@ namespace dxvk {
     // NV-DXVK end
   }
 
-  void DxvkDevice::incrementPresentCount() {
+  // NV-DXVK start: Separate aggregate presentation statistics from Remix frames
+  void DxvkDevice::incrementPresentCount(bool isRemixPresent) {
     std::lock_guard<sync::Spinlock> statLock(m_statLock);
-    m_statCounters.addCtr(DxvkStatCounter::QueuePresentCount, 1); // Increase getCurrentFrameId()
+    m_statCounters.addCtr(DxvkStatCounter::QueuePresentCount, 1);
+    if (isRemixPresent) {
+      m_remixFrameId.fetch_add(1, std::memory_order_relaxed);
+    }
   }
+  // NV-DXVK end
 
   // NV-DXVK start: DLFG integration
   void DxvkDevice::setupFrameInterpolation(DxvkFrameInterpolationInfo parameters) {
@@ -452,6 +488,24 @@ namespace dxvk {
   }
   
   
+  void DxvkDevice::submitCommandListWithStatus(
+    const Rc<DxvkCommandList>&      commandList,
+          DxvkSubmitStatus*         status) {
+    ScopedCpuProfileZone();
+    DxvkSubmitInfo submitInfo;
+    submitInfo.cmdList  = commandList;
+    submitInfo.waitSync = VK_NULL_HANDLE;
+    submitInfo.wakeSync = VK_NULL_HANDLE;
+    submitInfo.insertReflexRenderMarkers = false;
+    submitInfo.cachedReflexFrameId = 0;
+    m_submissionQueue.submit(submitInfo, status);
+
+    std::lock_guard<sync::Spinlock> statLock(m_statLock);
+    m_statCounters.merge(commandList->statCounters());
+    m_statCounters.addCtr(DxvkStatCounter::QueueSubmitCount, 1);
+  }
+
+
   VkResult DxvkDevice::waitForSubmission(DxvkSubmitStatus* status) {
     VkResult result = status->result.load();
 
@@ -541,11 +595,9 @@ namespace dxvk {
     m_textureManager { std::make_unique<RtxTextureManager>(device) },
     m_imgui(device),
     m_dummyResources(device),
-    // NV-DXVK start: Numos atmosphere and precipitation subsystems
-    m_atmosphere(device),
-    m_precipitation(device),
-    // NV-DXVK end
     m_globalVolumetrics(device),
+    m_numos(device),
+    m_numosWeather(device),
     m_sparseRendering(device),
     m_pathtracerGbuffer(device),
     m_rtxdiRayQuery(device),
@@ -555,6 +607,7 @@ namespace dxvk {
     m_demodulate(device),
     m_neeCache(device),
     m_neuralRadianceCache(device),
+    m_sharc(device),
     m_primaryDirectLightDenoiser(device, DenoiserType::DirectLight),
     m_primaryIndirectLightDenoiser(device, DenoiserType::IndirectLight),
     m_primaryCombinedLightDenoiser(device, DenoiserType::DirectAndIndirectLight),
@@ -566,6 +619,7 @@ namespace dxvk {
     m_referenceDenoiserSecondLobe2(device, DenoiserType::Reference),
     m_dlss(device),
     m_rayReconstruction(device),
+    m_neuralUplift(device),
     m_nis(device),
     m_taa(device),
     m_xess(device),
@@ -594,6 +648,9 @@ namespace dxvk {
 
     metaGeometryUtils().onDestroy();
     getSceneManager().onDestroy();
+    // The SCCR shell manager's scratch allocator holds a device reference.
+    metaSccrShell().onDestroy();
+    metaFrameExport().onDestroy();
 
     m_primaryDirectLightDenoiser.get().onDestroy();
     m_primaryIndirectLightDenoiser.get().onDestroy();
@@ -603,8 +660,13 @@ namespace dxvk {
     m_referenceDenoiserSecondLobe1.get().onDestroy();
     m_referenceDenoiserSecondLobe2.get().onDestroy();
     m_rayReconstruction.get().onDestroy();
+    m_neuralUplift.get().onDestroy();
     m_dlss.get().onDestroy();
     m_dlfg.get().onDestroy();
     m_fsrFrameGen.get().onDestroy();
+    // NV-DXVK start: Shut down NGX after releasing its features
+    m_device->waitForIdle();
+    m_ngxContext.get().shutdown();
+    // NV-DXVK end
   }
 }

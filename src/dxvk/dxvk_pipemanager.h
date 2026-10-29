@@ -139,8 +139,21 @@ namespace dxvk {
      */
     bool isCompilingShaders() const;
 
+    // Whether registered shaders compile on the state cache workers.
+    bool hasStateCache() const { return m_stateCache != nullptr; }
+
 // NV-DXVK start
     uint32_t remixShaderCompilationCount() const;
+
+    // Remix pipelines in creation for longer than a cache hit takes (DxvkStateCache::remixShaderSlowCompileCount):
+    // what the "Compiling shaders" HUD shows.
+    uint32_t remixShaderSlowCompileCount() const;
+
+    // Remix pipelines queued for compilation since the device was created, finished or not.
+    uint32_t remixShaderQueuedCount() const;
+
+    // The pipeline cache every pipeline is created through (persisted, dxvk_pipecache.h).
+    DxvkPipelineCache* pipelineCache() const { return m_cache.ptr(); }
 // NV-DXVK end
 
     /**
@@ -175,5 +188,16 @@ namespace dxvk {
       DxvkHash, DxvkEq> m_raytracingPipelines;
 
   };
-  
+
 }
+
+// NV-DXVK start
+// d3d9.dll export consumed by HdRemix.dll (see GetRenderStats() in
+// nv-private/hdremix/renderDelegate.cpp).  Loaded via GetProcAddress; not
+// part of remixapi_Interface and not gated by REMIXAPI_VERSION_*.
+//
+// Returns the number of Remix shaders currently being compiled by background
+// worker threads.  0 = all shaders ready (path tracer unblocked).
+// UINT32_MAX = no Remix device registered yet (too early in initialization).
+extern "C" __declspec(dllexport) uint32_t remixinternal_GetShaderCompilationCount();
+// NV-DXVK end

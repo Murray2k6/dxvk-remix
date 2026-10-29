@@ -42,9 +42,6 @@ jobs:
     - name: Setup Meson
       run: pip install meson==1.1.0
 
-    - name: Install Pillow for FAST-noise embedder
-      run: pip install pillow
-
     - name: Fetch pinned DLSS / NGX DLL bundle
       shell: pwsh
       run: .\scripts\update-dlss-dlls.ps1
@@ -56,8 +53,23 @@ jobs:
         . .\build_common.ps1
         PerformBuild -BuildFlavour ${{matrix.build-flavour}} -BuildSubDir ${{matrix.output-subdir}} -Backend ninja -EnableTracy false copy_output
 
-    - name: Copy readme
-      run: copy artifacts_readme.txt _output
+    - name: Upload build logs
+      if: ${{ always() }}
+      continue-on-error: true
+      uses: actions/upload-artifact@v7
+      with:
+        name: build-logs-${{github.run_number}}-${{env.GITHUB_SHA_SHORT}}-${{matrix.build-flavour}}
+        path: |
+          ${{matrix.output-subdir}}\meson-logs\meson-log.txt
+          ${{matrix.output-subdir}}\update-deps.log
+          update-deps.log
+        if-no-files-found: ignore
+        retention-days: 30
+
+    - name: Copy readme and license notices
+      shell: pwsh
+      run: |
+        Copy-Item -Path artifacts_readme.txt, LICENSE, LICENSE-MIT, CREDITS.md, ThirdPartyLicenses.txt -Destination _output\ -Force
 
     - name: Upload x64 binaries
       uses: actions/upload-artifact@v7
@@ -67,6 +79,9 @@ jobs:
           _output\*.dll
           _output\*.pdb
           _output\*.txt
+          _output\LICENSE
+          _output\LICENSE-MIT
+          _output\CREDITS.md
           _output\usd\*
 
     - name: Move DXVK
@@ -100,6 +115,9 @@ jobs:
           _output\*.exe
           _output\*.pdb
           _output\*.txt
+          _output\LICENSE
+          _output\LICENSE-MIT
+          _output\CREDITS.md
           _output\.trex\*.dll
           _output\.trex\*.exe
           _output\.trex\*.pdb

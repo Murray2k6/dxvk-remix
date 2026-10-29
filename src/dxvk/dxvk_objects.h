@@ -33,11 +33,9 @@
 #include "dxvk_pipemanager.h"
 #include "dxvk_renderpass.h"
 #include "dxvk_unbound.h"
-// NV-DXVK start: Numos atmosphere and precipitation subsystems
-#include "rtx_render/rtx_atmosphere.h"
-#include "rtx_render/rtx_precipitation.h"
-// NV-DXVK end
 #include "rtx_render/rtx_global_volumetrics.h"
+#include "rtx_render/rtx_numos.h"
+#include "rtx_render/rtx_numos_weather.h"
 #include "rtx_render/rtx_pathtracer_gbuffer.h"
 #include "rtx_render/rtx_pathtracer_integrate_direct.h"
 #include "rtx_render/rtx_pathtracer_integrate_indirect.h"
@@ -58,12 +56,18 @@
 #include "rtx_render/rtx_srgb_dither.h"
 #include "rtx_render/rtx_initializer.h"
 #include "rtx_render/rtx_scene_manager.h"
+#include "rtx_render/rtx_screenshot.h"
 #include "rtx_render/rtx_reflex.h"
 #include "rtx_render/rtx_game_capturer.h"
 #include "rtx_render/rtx_dust_particles.h"
 #include "rtx_render/rtx_particle_system.h"
 #include "rtx_render/rtx_point_instancer_system.h"
+#include "rtx_render/rtx_settings_sweep.h"
+#include "rtx_render/rtx_frame_export.h"
+#include "rtx_render/rtx_fork_pom_cone_map.h"
+#include "rtx_render/rtx_fork_sccr_shell.h"
 #include "rtx_render/rtx_gpu_crash.h"
+#include "rtx_render/rtx_neural_uplift.h"
 
 #include "rtx_render/rtx_denoise_type.h"
 #include "../util/util_lazy.h"
@@ -87,6 +91,7 @@ namespace dxvk {
   class ImGUI;
   class RtxTextureManager;
   class NeuralRadianceCache;
+  class RtxSharc;
   class DxvkXeSS;
   class SparseRendering;
   class DxvkFSR;
@@ -145,19 +150,19 @@ namespace dxvk {
       return m_metaPack.get(m_device);
     }
 
-    // NV-DXVK start: Numos atmosphere and precipitation subsystems
-    RtxAtmosphere& metaAtmosphere() {
-      return m_atmosphere.get();
-    }
-
-    PrecipitationSystem& metaPrecipitation() {
-      return m_precipitation.get();
-    }
-    // NV-DXVK end
-
     RtxGlobalVolumetrics& metaGlobalVolumetrics() {
       return m_globalVolumetrics.get();
     }
+
+    // NV-DXVK start: NUMOS sky provider
+    RtxNumos& metaNumos() {
+      return m_numos.get();
+    }
+
+    NumosWeather& metaNumosWeather() {
+      return m_numosWeather.get();
+    }
+    // NV-DXVK end
 
     SparseRendering& metaSparseRendering() {
       return m_sparseRendering.get();
@@ -189,6 +194,10 @@ namespace dxvk {
 
     NeeCachePass& metaNeeCache() {
       return m_neeCache.get();
+    }
+
+    RtxSharc& metaSharc() {
+      return m_sharc.get();
     }
 
     NeuralRadianceCache& metaNeuralRadianceCache() {
@@ -237,6 +246,10 @@ namespace dxvk {
 
     DxvkDLFG& metaDLFG() {
       return m_dlfg.get();
+    }
+
+    DxvkNeuralUplift& metaNeuralUplift() {
+      return m_neuralUplift.get();
     }
 
     DxvkNIS& metaNIS() {
@@ -307,6 +320,18 @@ namespace dxvk {
       return m_reflex.get(m_device);
     }
 
+    RtxSettingsSweep& metaSettingsSweep() {
+      return m_settingsSweep.get(m_device);
+    }
+
+    RtxScreenshot& metaScreenshot() {
+      return m_screenshot.get(m_device);
+    }
+
+    RtxFrameExport& metaFrameExport() {
+      return m_frameExport.get(m_device);
+    }
+
     SceneManager& getSceneManager() {
       return m_sceneManager;
     }
@@ -353,6 +378,14 @@ namespace dxvk {
       return m_pointInstancerSystem.get(m_device);
     }
 
+    PomConeMapManager& metaPomConeMaps() {
+      return m_pomConeMaps.get(m_device);
+    }
+
+    SccrShellManager& metaSccrShell() {
+      return m_sccrShell.get(m_device);
+    }
+
     void onDestroy();
 
     void setWindowHandle(const HWND hwnd) {
@@ -394,11 +427,9 @@ namespace dxvk {
     Rc<GameCapturer>   m_capturer;
 
     // RTX Shaders
-    // NV-DXVK start: Numos atmosphere and precipitation subsystems
-    Active<RtxAtmosphere>                   m_atmosphere;
-    Active<PrecipitationSystem>             m_precipitation;
-    // NV-DXVK end
     Active<RtxGlobalVolumetrics>            m_globalVolumetrics;
+    Active<RtxNumos>                        m_numos;  // NV-DXVK: NUMOS sky provider
+    Active<NumosWeather>                    m_numosWeather;  // NV-DXVK: its weather presets
     Active<SparseRendering>                 m_sparseRendering;
     Active<DxvkPathtracerGbuffer>           m_pathtracerGbuffer;
     Active<DxvkRtxdiRayQuery>               m_rtxdiRayQuery;
@@ -408,6 +439,7 @@ namespace dxvk {
     Active<DemodulatePass>                  m_demodulate;
     Active<NeeCachePass>                    m_neeCache;
     Active<NeuralRadianceCache>             m_neuralRadianceCache;
+    Active<RtxSharc>                        m_sharc;
     Active<DxvkDenoise>                     m_primaryDirectLightDenoiser;
     Active<DxvkDenoise>                     m_primaryIndirectLightDenoiser;
     Active<DxvkDenoise>                     m_primaryCombinedLightDenoiser;
@@ -420,6 +452,7 @@ namespace dxvk {
     Active<DxvkDenoise>                     m_referenceDenoiserSecondLobe2;
     Active<DxvkDLSS>                        m_dlss;
     Active<DxvkRayReconstruction>           m_rayReconstruction;
+    Active<DxvkNeuralUplift>                m_neuralUplift;
     Active<DxvkNIS>                         m_nis;
     Active<DxvkTemporalAA>                  m_taa;
     Active<DxvkXeSS>                        m_xess;
@@ -437,9 +470,14 @@ namespace dxvk {
     Active<DxvkPostFx>                      m_postFx;
     Active<DxvkSRGBDither>                  m_srgbDither;
     Lazy<RtxReflex>                         m_reflex;
+    Lazy<RtxSettingsSweep>                  m_settingsSweep;
+    Lazy<RtxScreenshot>                     m_screenshot;
+    Lazy<RtxFrameExport>                    m_frameExport;
     Lazy<RtxDustParticles>                  m_dustParticles;
     Lazy<RtxParticleSystemManager>          m_particleSystem;
     Lazy<RtxPointInstancerSystem>            m_pointInstancerSystem;
+    Lazy<PomConeMapManager>                  m_pomConeMaps;
+    Lazy<SccrShellManager>                   m_sccrShell;
 
     std::atomic<HWND>                       m_lastKnownWindowHandle;
   };

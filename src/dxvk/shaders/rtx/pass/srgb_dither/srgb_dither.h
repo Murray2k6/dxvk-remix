@@ -30,5 +30,10 @@ struct SRGBDitherArgs {
   uint performSRGBConversion;
   uint ditherMode;
   uint frameIndex;
+  uint hdrOutput;  // 1 = HDR10 output: gamma encode without the 0..1 clamp or 8-bit dither (the present blit encodes PQ).
+
+  float hdrSceneScale;  // HDR: paper white nits / UI nits, so back buffer 1.0 = UI white and the scene stays at paper white.
   uint pad0;
+  uint pad1;
+  uint pad2;
 };

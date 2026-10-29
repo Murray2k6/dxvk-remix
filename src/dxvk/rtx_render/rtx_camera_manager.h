@@ -54,12 +54,31 @@ namespace dxvk {
 
     void onFrameEnd();
 
-    // Calculates a camera type for the specified draw call.
-    CameraType::Enum processCameraData(const DrawCallState& input);
+    // A camera a frontend found in its draws (SceneInterface::applyDrawCamera): updates the camera of this type (the
+    // first call per camera and frame wins, as RtCamera::update does), with camera-sequence playback / browse / record,
+    // the Main camera's cut registration and the last-set camera type.
+    void applyFrameCamera(CameraType::Enum cameraType, const Matrix4& worldToView, const Matrix4& viewToProjection);
     void processExternalCamera(CameraType::Enum type, const Matrix4& worldToView, const Matrix4& viewToProjection);
+    // rtx.worldOrigin.enable: worldOrigin is the host's render origin for this camera (render units,
+    // render position + origin = world position), or null. When it moved since this camera's last update, the
+    // camera's history is re-expressed around the new origin first (see rtx_fork_camera_origin.h).
+    // preciseWorldToView (rtx.worldOrigin.preciseCamera): the host camera's world-to-view in double; replaces the
+    // float matrix, whose translation is otherwise rounded at world magnitude every frame.
+    void processExternalCamera(CameraType::Enum type, const Matrix4& worldToView, const Matrix4& viewToProjection,
+                               const Vector3* worldOrigin, const Matrix4d* preciseWorldToView = nullptr);
+    // The Main camera's current host world origin (zero when none has been published).
+    const Vector3& getWorldOrigin() const { return m_externalCameraOrigins[CameraType::Main]; }
+    bool hasWorldOrigin() const { return m_externalCameraOriginValid[CameraType::Main]; }
 
     uint32_t getLastCameraCutFrameId() const { return m_lastCameraCutFrameId; }
     bool isCameraCutThisFrame() const;
+
+    // Scene interface (remixapi_CameraInfoFrameEventsEXT): a cut the host stated. Restarts temporal history this
+    // frame; unlike a detected cut it never clears the scene.
+    void signalCameraCut();
+    // ...ORIGIN_SHIFT: re-expresses the camera's history after the host moved its render origin by offset (new
+    // render position = old + offset). Before the camera's update this frame; a second call in a frame is ignored.
+    void shiftCameraHistory(CameraType::Enum type, const Vector3& offset);
 
   private:
     template<
@@ -84,8 +103,12 @@ namespace dxvk {
     uint32_t m_lastCameraCutFrameId = -1;
     uint32_t m_lastCameraViewHistoryInvalidationFrameId = -1;
     fast_unordered_cache<DecomposeProjectionParams> m_decompositionCache;
+    std::array<Vector3, CameraType::Count> m_externalCameraOrigins {};
+    std::array<bool, CameraType::Count> m_externalCameraOriginValid {};
 
     DecomposeProjectionParams getOrDecomposeProjection(const Matrix4& viewToProjection);
+    void updateExternalCamera(CameraType::Enum type, const Matrix4& worldToView, const Matrix4& viewToProjection,
+                              const Matrix4d* preciseWorldToView);
 
     RTX_OPTION("rtx", bool, rayPortalEnabled, false, "Enables ray portal support. Note this requires portal texture hashes to be set for the ray portal geometries in rtx.rayPortalModelTextureHashes.");
   };

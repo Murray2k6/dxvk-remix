@@ -23,6 +23,9 @@
 #define RAB_HAS_CURRENT_GBUFFER 1
 #define RAB_HAS_RESTIR_GI_RESERVOIRS 1
 
+// The previous frame's spatial output (ReSTIRGI_GetTemporalInputPage) still holds last frame's reservoirs here,
+// so RAB_LoadGIReservoir brings their radiance to this frame's pre-exposure.
+#define RESTIR_GI_PREVIOUS_FRAME_PAGE 1
 #include "rtx/pass/common_bindings.slangh"
 #include "rtx/pass/rtxdi/restir_gi_reuse_bindings.slangh"
 

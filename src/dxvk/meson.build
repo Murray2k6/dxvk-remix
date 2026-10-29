@@ -177,6 +177,7 @@ dxvk_src = files([
   'rtx_render/rtx.h',
   'rtx_render/rtx_accel_manager.cpp',
   'rtx_render/rtx_accel_manager.h',
+  'rtx_render/rtx_accel_size_cache.h',
   'rtx_render/rtx_accumulation.cpp',
   'rtx_render/rtx_accumulation.h',
   'rtx_render/rtx_sparse_rendering.cpp',
@@ -189,10 +190,11 @@ dxvk_src = files([
   'rtx_render/rtx_asset_package.h',
   'rtx_render/rtx_asset_replacer.cpp',
   'rtx_render/rtx_asset_replacer.h',
-  'rtx_render/rtx_atmosphere.cpp',
-  'rtx_render/rtx_atmosphere.h',
-  'rtx_render/rtx_atmosphere_ui.cpp',
+  'rtx_render/rtx_asset_resolver.cpp',
+  'rtx_render/rtx_asset_resolver.h',
   'rtx_render/rtx_auto_exposure.cpp',
+  'rtx_render/rtx_pre_exposure.cpp',
+  'rtx_render/rtx_photometer.cpp',
   'rtx_render/rtx_auto_exposure.h',
   'rtx_render/rtx_bindless_resource_manager.cpp',
   'rtx_render/rtx_bindless_resource_manager.h',
@@ -207,6 +209,15 @@ dxvk_src = files([
   'rtx_render/rtx_composite.h',
   'rtx_render/rtx_context.cpp',
   'rtx_render/rtx_context.h',
+  'rtx_render/rtx_perf_log.cpp',
+  'rtx_render/rtx_session_log.cpp',
+  'rtx_render/rtx_perf_log.h',
+  'rtx_render/rtx_pipeline_stats.cpp',
+  'rtx_render/rtx_pipeline_stats.h',
+  'rtx_render/rtx_stress.cpp',
+  'rtx_render/rtx_stress.h',
+  'rtx_render/rtx_gpu_breadcrumbs.cpp',
+  'rtx_render/rtx_gpu_breadcrumbs.h',
   'rtx_render/rtx_gpu_crash.cpp',
   'rtx_render/rtx_gpu_crash.h',
   'rtx_render/rtx_debug_view.cpp',
@@ -228,27 +239,67 @@ dxvk_src = files([
   'rtx_render/rtx_dust_particles.h',
   'rtx_render/rtx_env.cpp',
   'rtx_render/rtx_env.h',
-'rtx_render/rtx_file_watch.cpp',
+  'rtx_render/rtx_external_effect_image.cpp',
+  'rtx_render/rtx_external_effect_image.h',
+  'rtx_render/rtx_external_effect_manifest.cpp',
+  'rtx_render/rtx_external_effect_manifest.h',
+  'rtx_render/rtx_external_effects.cpp',
+  'rtx_render/rtx_external_effects.h',
+  'rtx_render/rtx_file_watch.cpp',
   'rtx_render/rtx_file_watch.h',
   'rtx_render/rtx_fork_api_entry.cpp',
+  'rtx_render/rtx_fork_api_record_format.h',
+  'rtx_render/rtx_fork_api_recorder.cpp',
+  'rtx_render/rtx_fork_api_recorder.h',
   'rtx_render/rtx_fork_capture.cpp',
+  'rtx_render/rtx_fork_d3d9_alpha.cpp',
+  'rtx_render/rtx_fork_d3d9_alpha.h',
+  'rtx_render/rtx_frame_export.cpp',
+  'rtx_render/rtx_frame_export.h',
+  'rtx_render/rtx_frontend_interface.cpp',
+  'rtx_render/rtx_frontend_interface.h',
+  'rtx_render/rtx_frontend_ui.cpp',
+  'rtx_render/rtx_frontend_ui.h',
   'rtx_render/rtx_fork_fsr.cpp',
   'rtx_render/rtx_fork_fsr.h',
   'rtx_render/rtx_fork_fsr_framegen.cpp',
   'rtx_render/rtx_fork_fsr_framegen.h',
+  'rtx_render/rtx_fork_camera_origin.cpp',
+  'rtx_render/rtx_fork_camera_origin.h',
   'rtx_render/rtx_fork_game_state.h',
   'rtx_render/rtx_fork_hooks.h',
   'rtx_render/rtx_fork_light.cpp',
+  'rtx_render/rtx_fork_light_bvh.cpp',
+  'rtx_render/rtx_fork_light_bvh.h',
+  'rtx_render/rtx_fork_light_bvh_pass.h',
   'rtx_render/rtx_fork_overlay.cpp',
+  'rtx_render/rtx_fork_pom_cone_map.cpp',
+  'rtx_render/rtx_fork_pom_cone_map.h',
+  'rtx_render/rtx_fork_sccr_shell.cpp',
+  'rtx_render/rtx_fork_sccr_shell.h',
+  'rtx_render/rtx_fork_shadow_rays.cpp',
+  'rtx_render/rtx_fork_shadow_rays.h',
+  'rtx_render/rtx_fork_material_derivation.cpp',
+  'rtx_render/rtx_fork_material_derivation.h',
+  'rtx_render/rtx_fork_frame_features.cpp',
+  'rtx_render/rtx_fork_frame_features.h',
+  'rtx_render/rtx_fork_variant_tables.cpp',
+  'rtx_render/rtx_fork_variant_tables.h',
+  'rtx_render/rtx_fork_material_census.cpp',
+  'rtx_render/rtx_fork_material_census.h',
+  'rtx_render/rtx_fork_core_material.cpp',
+  'rtx_render/rtx_fork_core_material.h',
   'rtx_render/rtx_fork_rcas.cpp',
   'rtx_render/rtx_fork_rcas.h',
+  'rtx_render/rtx_fork_post_processing.cpp',
+  'rtx_render/rtx_fork_post_processing.h',
   'rtx_render/rtx_fork_submit.cpp',
   'rtx_render/rtx_fork_upscaler_ui.cpp',
-  'rtx_render/rtx_fork_tonemap.cpp',
-  'rtx_render/rtx_fork_tonemap.h',
   'rtx_render/rtx_game_capturer.cpp',
   'rtx_render/rtx_game_capturer.h',
   'rtx_render/rtx_game_capturer_utils.h',
+  'rtx_render/rtx_game_lights.cpp',
+  'rtx_render/rtx_game_lights.h',
   'rtx_render/rtx_geometry_utils.cpp',
   'rtx_render/rtx_geometry_utils.h',
   'rtx_render/rtx_global_volumetrics.cpp',
@@ -294,6 +345,8 @@ dxvk_src = files([
   'rtx_render/rtx_nee_cache.h',
   'rtx_render/rtx_neural_radiance_cache.cpp',
   'rtx_render/rtx_neural_radiance_cache.h',
+  'rtx_render/rtx_neural_uplift.cpp',
+  'rtx_render/rtx_neural_uplift.h',
   'rtx_render/rtx_ngx_wrapper.cpp',
   'rtx_render/rtx_ngx_wrapper.h',
   'rtx_render/rtx_nis.cpp',
@@ -304,6 +357,8 @@ dxvk_src = files([
   'rtx_render/rtx_nrd_context.h',
   'rtx_render/rtx_nrd_settings.cpp',
   'rtx_render/rtx_nrd_settings.h',
+  'rtx_render/rtx_nsight_capture.cpp',
+  'rtx_render/rtx_nsight_capture.h',
   'rtx_render/rtx_objectpicking.h',
   'rtx_render/rtx_objectpicking.cpp',
   'rtx_render/rtx_opacity_micromap_manager.cpp',
@@ -327,8 +382,6 @@ dxvk_src = files([
   'rtx_render/rtx_pathtracer_integrate_indirect.h',
   'rtx_render/rtx_postFx.cpp',
   'rtx_render/rtx_postFx.h',
-  'rtx_render/rtx_precipitation.cpp',
-  'rtx_render/rtx_precipitation.h',
   'rtx_render/rtx_preserved_object_picking.h',
   'rtx_render/rtx_srgb_dither.cpp',
   'rtx_render/rtx_srgb_dither.h',
@@ -339,18 +392,48 @@ dxvk_src = files([
   'rtx_render/rtx_reflex.cpp',
   'rtx_render/rtx_reflex.h',
   'rtx_render/rtx_remix_api.cpp',
+  'rtx_render/rtx_host_settings.cpp',
+  'rtx_render/rtx_host_settings.h',
+  'rtx_render/rtx_remix_api_device.h',
   'rtx_render/rtx_resources.cpp',
   'rtx_render/rtx_resources.h',
   'rtx_render/rtx_restir_gi_rayquery.cpp',
   'rtx_render/rtx_restir_gi_rayquery.h',
+  'rtx_render/rtx_retained_scene.cpp',
+  'rtx_render/rtx_retained_scene.h',
   'rtx_render/rtx_rtxdi_rayquery.cpp',
   'rtx_render/rtx_rtxdi_rayquery.h',
+  'rtx_render/rtx_scene_command_queue.h',
+  'rtx_render/rtx_scene_input.h',
+  'rtx_render/rtx_scene_interface.h',
   'rtx_render/rtx_scene_manager.cpp',
   'rtx_render/rtx_scene_manager.h',
+  'rtx_render/rtx_scene_transient.cpp',
+  'rtx_render/rtx_scene_transient.h',
+  'rtx_render/rtx_screenshot.cpp',
+  'rtx_render/rtx_screenshot.h',
+  'rtx_render/rtx_sky_ui.cpp',
+  'rtx_render/rtx_sky_ui.h',
+  'rtx_render/rtx_numos_gpu.cpp',
+  'rtx_render/rtx_numos_gpu.h',
+  'rtx_render/rtx_numos_settings.cpp',
+  'rtx_render/rtx_numos_settings.h',
+  'rtx_render/rtx_numos.cpp',
+  'rtx_render/rtx_numos.h',
+  'rtx_render/rtx_numos_weather.cpp',
+  'rtx_render/rtx_numos_weather.h',
+  'rtx_render/rtx_numos_ui.cpp',
+  'rtx_render/rtx_numos_ui.h',
+  'rtx_render/translator/rtx_translator_lifetime.cpp',
+  'rtx_render/translator/rtx_translator_lifetime.h',
   'rtx_render/rtx_semaphore.cpp',
   'rtx_render/rtx_semaphore.h',
+  'rtx_render/rtx_settings_sweep.cpp',
+  'rtx_render/rtx_settings_sweep.h',
   'rtx_render/rtx_shader_manager.cpp',
   'rtx_render/rtx_shader_manager.h',
+  'rtx_render/rtx_sharc.cpp',
+  'rtx_render/rtx_sharc.h',
   'rtx_render/rtx_sparse_unique_cache.h',
   'rtx_render/rtx_staging.h',
   'rtx_render/rtx_staging.cpp',
@@ -362,19 +445,22 @@ dxvk_src = files([
   'rtx_render/rtx_texture.h',
   'rtx_render/rtx_texture_manager.cpp',
   'rtx_render/rtx_texture_manager.h',
+  'rtx_render/rtx_vram_budget.cpp',
+  'rtx_render/rtx_vram_budget.h',
+  'rtx_render/rtx_color_grade.cpp',
   'rtx_render/rtx_tone_mapping.cpp',
   'rtx_render/rtx_tone_mapping.h',
   'rtx_render/rtx_types.cpp',
+  'rtx_render/rtx_scene_types.h',
   'rtx_render/rtx_types.h',
   'rtx_render/rtx_utils.h',
-  'rtx_render/rtx_weather.cpp',
-  'rtx_render/rtx_weather.h',
   'rtx_render/rtx_xess.cpp',
   'rtx_render/rtx_xess.h',
 
   'rtx_render/rtx_system_info.cpp',
   'rtx_render/rtx_system_info.h',
   
+  'rtx_render/rtx_fork_particle_spawn.cpp',
   'rtx_render/rtx_particle_system.cpp',
   'rtx_render/rtx_particle_system.h',
 
@@ -432,12 +518,16 @@ dxvk_src = files([
   'imgui/dxvk_imgui_about.h',
   'imgui/dxvk_imgui_capture.cpp',
   'imgui/dxvk_imgui_capture.h',
+  'imgui/dxvk_imgui_option_search.cpp',
+  'imgui/dxvk_imgui_option_search.h',
   'imgui/dxvk_imgui_first_use_guide.cpp',
   'imgui/dxvk_imgui_first_use_guide.h',
   'imgui/dxvk_imgui_splash.cpp',
   'imgui/dxvk_imgui_splash.h',
   'imgui/imgui_remix_exports.cpp',
   'imgui/imgui_remix_exports.h',
+  'imgui/rtx_fault_notice.cpp',
+  'imgui/rtx_fault_notice.h',
   'imgui/rtx_user_menu.cpp',
   'imgui/imconfig.h',
   'imgui/imgui.cpp',
@@ -466,26 +556,6 @@ thread_dep = dependency('threads')
 nrd_include_dir = include_directories(join_paths('../../', 'external/nrd/Include'))
 nrd_dep = declare_dependency(
   include_directories : nrd_include_dir
-)
-
-target_dlss_lib_path = 'lib/Windows_x86_64/x86_64'
-if dxvk_is_woa
-  target_dlss_lib_path = 'lib/Windows_arm64/arm64'
-endif
-
-# Note: Include directory paths must be relative paths due to a limitation in Meson (currently at least)
-dlss_include_dir = include_directories(join_paths('../../', dlss_root_path, 'include'))
-dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, target_dlss_lib_path)
-dlfg_include_dir = include_directories(join_paths('../../', dlfg_root_path, 'include'))
-cc = meson.get_compiler('c')
-dlss_lib_name = 'nvsdk_ngx_d'
-if get_option('buildtype') == 'debug'
-  dlss_lib_name = 'nvsdk_ngx_d_dbg'
-endif
-dlss_lib = cc.find_library(dlss_lib_name, dirs : dlss_lib_path)
-dlss_dep = declare_dependency(
-  dependencies : [ dlss_lib ],
-  include_directories : [ dlss_include_dir, dlfg_include_dir ]
 )
 
 if dxvk_is_woa
@@ -546,10 +616,43 @@ rtx_shaders = custom_target(
   command: [ python_interpreter ] + rtx_shaders_command_arguments
 )
 
+# NV-DXVK start: NUMOS sky provider (submodules/numos): the CPU library, and its passes built with
+# this tree's slangc and checked against the library's pass table (passes.inc changes whenever a
+# submodule bump changes a shader, which re-runs the build).
+numos_shaders = custom_target(
+  'numos_shaders',
+  build_by_default: true,
+  output: ['_numos_shaders.txt'],
+  depend_files: files('../../submodules/numos/src/generated/passes.inc'),
+  command: [ python_interpreter, numos_shader_script, 'build', numos_root, slang_compiler.full_path(), numos_spirv_dir, '@OUTPUT@' ]
+)
+
+numos_lib = static_library('numos', files([
+    '../../submodules/numos/src/celestial.cpp',
+    '../../submodules/numos/src/ground_field.cpp',
+    '../../submodules/numos/src/layout.cpp',
+    '../../submodules/numos/src/log.cpp',
+    '../../submodules/numos/src/renderer.cpp',
+    '../../submodules/numos/src/renderer_api.cpp',
+    '../../submodules/numos/src/seed.cpp',
+    '../../submodules/numos/src/settings.cpp',
+    '../../submodules/numos/src/shaders.cpp',
+    '../../submodules/numos/src/weather.cpp',
+  ]),
+  include_directories : include_directories('../../submodules/numos/include', '../../submodules/numos/shaders', '../../submodules/numos/src'),
+  override_options    : ['cpp_std='+dxvk_cpp_std],
+  cpp_args            : dxvk_is_msvc ? ['/D_CRT_SECURE_NO_WARNINGS'] : []
+)
+
+numos_dep = declare_dependency(
+  link_with           : [ numos_lib ],
+  include_directories : include_directories('../../submodules/numos/include', '../../submodules/numos/shaders')
+)
+# NV-DXVK end
 
 dxvk_embedded_data_files = files([
-  '../../external/fonts/NVIDIASans/NVIDIASansMd.ttf',
-  '../../external/fonts/NVIDIASans/NVIDIASansBd.ttf',
+  'imgui/fonts/Inter/InterMd.ttf',
+  'imgui/fonts/Inter/InterBd.ttf',
   '../../external/fonts/RobotoMono/RobotoMonoRg.ttf'
 ])
 
@@ -568,6 +671,8 @@ endif
 dxvk_deps += [ fsr3_dep ]
 # NV-DXVK end
 
+dxvk_deps += [ numos_dep ]
+
 if enable_rtxio
   dxvk_deps += rtxio_dep
 endif
@@ -582,7 +687,16 @@ delayimp_dep = declare_dependency(
 	dependencies : [ lib_delayimp])
 dxvk_deps += delayimp_dep
 
-dxvk_lib = static_library('dxvk', dxvk_src, dxvk_version, [generated_dxvk_shaders, rtx_shaders, dxvk_generated_embedded_files],
+# The build ID lives in its own generated header, so changing it rebuilds only dxvk_instance.cpp.
+build_tag = get_option('build_tag')
+if build_tag.contains('"') or build_tag.contains('\\')
+  error('build_tag must not contain quotes or backslashes.')
+endif
+build_tag_conf = configuration_data()
+build_tag_conf.set_quoted('REMIX_BUILD_TAG', build_tag)
+configure_file(output : 'build_tag.h', configuration : build_tag_conf)
+
+dxvk_lib = static_library('dxvk', dxvk_src, dxvk_version, [generated_dxvk_shaders, rtx_shaders, numos_shaders, dxvk_generated_embedded_files],
   link_with           : [ util_lib, spirv_lib, usd_plugins ], 
   dependencies        : [ dxvk_deps ],
   include_directories : [ dxvk_include_path, dxvk_shader_include_path, rtxdi_include_path, remix_api_include_path, rtxcr_include_path, submodules_include_path ],

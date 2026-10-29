@@ -19,6 +19,7 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include "rtx_pre_exposure.h"
 #include "rtx_context.h"
 #include "rtx_taa.h"
 #include "dxvk_device.h"
@@ -99,6 +100,7 @@ namespace dxvk {
     temporalAaArgs.invMaximumRadiance = 1.0f / maximumRadiance();
     temporalAaArgs.colorClampingFactor = colorClampingFactor();
     temporalAaArgs.newFrameWeight = newFrameWeight();
+    temporalAaArgs.historyRatio = PreExposure::historyRatio();
 
     ctx->pushConstants(0, sizeof(temporalAaArgs), &temporalAaArgs);
 

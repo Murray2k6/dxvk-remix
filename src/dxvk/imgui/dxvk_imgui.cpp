@@ -21,14 +21,16 @@
 */
 
 #include <cassert>
+#include <ctime>
 #include <tuple>
 #include <string>
 #include <sstream>
 #include <iomanip>
 #include <optional>
+#include <filesystem>
 #include <nvapi.h>
-#include <NVIDIASansMd.ttf.h>
-#include <NVIDIASansBd.ttf.h>
+#include <InterMd.ttf.h>
+#include <InterBd.ttf.h>
 #include <RobotoMonoRg.ttf.h>
 
 #include "imgui.h"
@@ -38,23 +40,28 @@
 #include "implot.h"
 #include "imgui_remix_exports.h"
 #include "dxvk_imgui.h"
+#include "rtx_fault_notice.h"
 #include "rtx_render/rtx_imgui.h"
 #include "dxvk_device.h"
 #include "rtx_render/graph/rtx_graph_gui.h"
 #include "rtx_render/rtx_utils.h"
+#include "../../util/util_env.h"
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx_render/rtx_camera.h"
 #include "rtx_render/rtx_context.h"
+#include "rtx_render/rtx_pathtracer_integrate_direct.h"
+#include "rtx_render/rtx_pathtracer_gbuffer.h"
 #include "rtx_render/rtx_hash_collision_detection.h"
 #include "rtx_render/rtx_options.h"
+#include "rtx_render/rtx_pipeline_stats.h"
+#include "rtx_render/rtx_stress.h"
+#include "rtx_render/rtx_fork_api_recorder.h"
+#include "rtx_render/rtx_scene_interface.h"
 #include "rtx_render/rtx_terrain_baker.h"
 #include "rtx_render/rtx_neural_radiance_cache.h"
+#include "rtx_render/rtx_nsight_capture.h"
 #include "rtx_render/rtx_ray_reconstruction.h"
 #include "rtx_render/rtx_xess.h"
-#include "rtx_render/rtx_fork_hooks.h"
-// NV-DXVK start: Numos native weather UI
-#include "rtx_render/rtx_weather.h"
-// NV-DXVK end
 #include "rtx_render/rtx_rtxdi_rayquery.h"
 #include "rtx_render/rtx_restir_gi_rayquery.h"
 #include "rtx_render/rtx_debug_view.h"
@@ -64,6 +71,7 @@
 #include "../util/rc/util_rc_ptr.h"
 #include "../util/util_math.h"
 #include "../util/util_global_time.h"
+#include "../util/util_stress.h"
 #include "rtx_render/rtx_opacity_micromap_manager.h"
 #include "rtx_render/rtx_bridge_message_channel.h"
 #include "dxvk_imgui_about.h"
@@ -71,14 +79,27 @@
 #include "dxvk_imgui_splash.h"
 #include "dxvk_imgui_capture.h"
 #include "rtx_render/rtx_option_layer_gui.h"
+#include "rtx_render/rtx_mod_usd.h"
 #include "rtx_render/rtx_option_manager.h"
 #include "dxvk_scoped_annotation.h"
-#include "../../d3d9/d3d9_rtx.h"
 #include "dxvk_memory_tracker.h"
 #include "rtx_render/rtx_particle_system.h"
 #include "rtx_render/rtx_point_instancer_system.h"
 #include "rtx_render/rtx_overlay_window.h"
 #include "rtx_render/rtx_fork_hooks.h"
+#include "rtx_render/rtx_fork_shadow_rays.h"
+#include "rtx_render/rtx_fork_frame_features.h"
+#include "rtx_render/rtx_fork_variant_tables.h"
+#include "rtx_render/rtx_fork_camera_origin.h"
+#include "rtx_render/rtx_fork_d3d9_alpha.h"
+#include "rtx_render/rtx_frontend_ui.h"
+#include "rtx_render/rtx_host_settings.h"
+#include "rtx_render/rtx_vram_budget.h"
+#include "rtx_render/rtx_session_log.h"
+#include "rtx_render/rtx_numos_ui.h"
+#include "rtx_render/rtx_sky_ui.h"
+#include "../rtx_render/rtx_sharc.h"
+#include "../dxvk_instance.h"
 
 
 namespace dxvk {
@@ -191,7 +212,6 @@ namespace dxvk {
     {"particletextures", "Particle Texture (optional)", &RtxOptions::particleTexturesObject()},
     {"haircardtextures", "Hair Cards Texture (optional)", &RtxOptions::hairCardTexturesObject()},
     {"beamtextures", "Beam Texture (optional)", &RtxOptions::beamTexturesObject()},
-    {"ignoretransparencytextures", "Ignore Transparency Layer Texture (optional)", &RtxOptions::ignoreTransparencyLayerTexturesObject()},
     {"lightconvertertextures", "Add Light to Textures (optional)", &RtxOptions::lightConverterObject()},
     {"decaltextures", "Decal Texture (optional)", &RtxOptions::decalTexturesObject()},
     {"terraintextures", "Terrain Texture", &RtxOptions::terrainTexturesObject()},
@@ -278,13 +298,8 @@ namespace dxvk {
       {FusedWorldViewMode::World, "In World Transform"},
   } });
 
-  static auto skyAutoDetectCombo = RemixGui::ComboWithKey<SkyAutoDetectMode>(
-    "Sky Auto-Detect",
-    RemixGui::ComboWithKey<SkyAutoDetectMode>::ComboEntries{ {
-      {SkyAutoDetectMode::None, "Off"},
-      {SkyAutoDetectMode::CameraPosition, "By Camera Position"},
-      {SkyAutoDetectMode::CameraPositionAndDepthFlags, "By Camera Position and Depth Flags"}
-  } });
+  // NV-DXVK start: Sky detection controls live with the sky setup page (rtx_sky_ui.cpp).
+  // NV-DXVK end
 
   static auto upscalerNoDLSSCombo = RemixGui::ComboWithKey<UpscalerType>(
     "Upscaler Type",
@@ -316,6 +331,19 @@ namespace dxvk {
         {DLSSProfile::MaxQuality, "Quality"},
         {DLSSProfile::FullResolution, "Full Resolution"},
         {DLSSProfile::Auto, "Auto"},
+    } }
+  };
+
+  // Note: named 'dlssRenderPresetCombo' to avoid colliding with the user-menu 'dlssPresetCombo'
+  // (the combined On/Off/Custom preset).
+  RemixGui::ComboWithKey<DxvkDLSS::DLSSPreset> dlssRenderPresetCombo{
+    "DLSS SR Preset",
+    RemixGui::ComboWithKey<DxvkDLSS::DLSSPreset>::ComboEntries{ {
+        {DxvkDLSS::DLSSPreset::Default, "Default", "Let DLSS pick the best preset per quality mode."},
+        {DxvkDLSS::DLSSPreset::J, "J", "Similar to preset K, but may show slightly less ghosting at the cost of extra flickering. Preset K is generally recommended over J."},
+        {DxvkDLSS::DLSSPreset::K, "K", "Transformer-based default for DLAA/Balanced/Quality modes. Best image quality at a higher performance cost."},
+        {DxvkDLSS::DLSSPreset::L, "L", "Default for Ultra Performance mode."},
+        {DxvkDLSS::DLSSPreset::M, "M", "Default for Performance mode."},
     } }
   };
 
@@ -353,16 +381,23 @@ namespace dxvk {
           "RTX Neural Radiance Cache (NRC). NRC is an AI based world space radiance cache. It is live trained by the path tracer\n"
           "and allows paths to terminate early by looking up the cached value and saving performance.\n"
           "NRC supports infinite bounces and often provides results closer to that of reference than ReSTIR GI\n"
-          "while increasing performance in scenarios where ray paths have 2 or more bounces on average."}
+          "while increasing performance in scenarios where ray paths have 2 or more bounces on average."},
+        {IntegrateIndirectMode::Sharc, "SHARC",
+          "Spatially Hashed Radiance Cache (SHARC). A world space cache of irradiance held in a hash grid,\n"
+          "filled by a sparse update pass that traces one path per screen tile and read by the full resolution\n"
+          "indirect pass, which terminates a path into a cell once that cell has converged."}
     } }
   };
 
-  static auto rayReconstructionModelCombo = RemixGui::ComboWithKey<DxvkRayReconstruction::RayReconstructionModel>(
-    "Ray Reconstruction Model",
+  RemixGui::ComboWithKey<DxvkRayReconstruction::RayReconstructionPreset> rayReconstructionPresetCombo {
+    "DLSS RR Preset",
     { {
-      {DxvkRayReconstruction::RayReconstructionModel::Transformer, "Transformer", "Ensures highest image quality. Can be more expensive than CNN in terms of memory and performance."},
-      {DxvkRayReconstruction::RayReconstructionModel::CNN, "CNN", "Ensures great image quality"},
-  } });
+      { DxvkRayReconstruction::RayReconstructionPreset::Default, "Default", "Let DLSS pick the best preset per quality mode." },
+      { DxvkRayReconstruction::RayReconstructionPreset::D,       "D",       "Transformer model." },
+      { DxvkRayReconstruction::RayReconstructionPreset::E,       "E",       "Latest transformer model." },
+      { DxvkRayReconstruction::RayReconstructionPreset::F,       "F",       "Default RR2 model." },
+    } }
+  };
 
   RemixGui::ComboWithKey<int> dlfgMfgModeCombo {
     "DLSS Frame Generation Mode",
@@ -416,6 +451,7 @@ namespace dxvk {
       { RtxFramePassStage::Composition, "Composition" },
       { RtxFramePassStage::DLSS, "DLSS" },
       { RtxFramePassStage::DLSSRR, "DLSSRR" },
+      { RtxFramePassStage::DLSSNR, "DLSSNR" },
       { RtxFramePassStage::NIS, "NIS" },
       { RtxFramePassStage::XeSS, "XeSS" },
       { RtxFramePassStage::FSR, "FSR" },
@@ -499,6 +535,7 @@ namespace dxvk {
       {ImGUI::Theme::Toolkit,  "Default Theme"},
       {ImGUI::Theme::Legacy,   "Legacy Theme"},
       {ImGUI::Theme::Nvidia,   "NVIDIA Theme"},
+      {ImGUI::Theme::RemixPlus, "Remix Plus Theme"},
   });
 
   // Styles 
@@ -526,7 +563,7 @@ namespace dxvk {
       changed = RemixGui::Checkbox("Ray Reconstruction", &RtxOptions::enableRayReconstructionObject());
 
       if (RtxOptions::enableRayReconstruction()) {
-        rayReconstructionModelCombo.getKey(&DxvkRayReconstruction::modelObject());
+        rayReconstructionPresetCombo.getKey(&DxvkRayReconstruction::presetObject());
       }
       ImGui::EndDisabled();
     }
@@ -596,6 +633,11 @@ namespace dxvk {
     if (!NeuralRadianceCache::checkIsSupported(device)) {
       // Remove unsupported option
       integrateIndirectModeCombo.removeComboEntry(IntegrateIndirectMode::NeuralRadianceCache);
+    }
+
+    if (!RtxSharc::checkIsSupported(device)) {
+      // Remove unsupported option
+      integrateIndirectModeCombo.removeComboEntry(IntegrateIndirectMode::Sharc);
     }
 
     m_device->vkd()->vkCreateDescriptorPool(m_device->handle(), &pool_info, nullptr, &m_imguiPool);
@@ -689,11 +731,7 @@ namespace dxvk {
     }
   }
 
-  void ImGUI::showMemoryStats() const {
-    if (RtxOptions::Automation::disableDisplayMemoryStatistics()) {
-      return;
-    }
-
+  ImGUI::VideoMemoryUsage ImGUI::getVideoMemoryUsage() const {
     // Gather runtime vidmem stats
     VkDeviceSize vidmemSize = 0;
     VkDeviceSize vidmemUsedSize = 0;
@@ -713,33 +751,42 @@ namespace dxvk {
 
     constexpr float bytesPerMebibyte = 1024.f * 1024.f;
     const VkDeviceSize vidmemFreeSize = vidmemSize - std::min(vidmemUsedSize, vidmemSize);
-    const float vidmemTotalSizeMB = (float)((double) vidmemSize / bytesPerMebibyte);
-    const float vidmemUsedSizeMB = (float)((double) vidmemUsedSize / bytesPerMebibyte);
-    const float vidmemFreeSizeMB = (float)((double) vidmemFreeSize / bytesPerMebibyte);
     const float freeVidMemRatio = (float)std::min((double) vidmemFreeSize / (double) vidmemSize, 1.0);
 
-    // Display video memory information
-
-#ifdef REMIX_DEVELOPMENT
-    ImGui::Text("Video Memory Usage: %.f MiB / %.f MiB (%.f MiB free)", vidmemUsedSizeMB, vidmemTotalSizeMB, vidmemFreeSizeMB);
-#else
-    // Note: Simplify for end users, free memory is usually not as important to list and can just be observed visually with the graph.
-    ImGui::Text("Video Memory Usage: %.f MiB / %.f MiB", vidmemUsedSizeMB, vidmemTotalSizeMB);
-#endif
+    VideoMemoryUsage usage;
+    usage.totalMiB = (float)((double) vidmemSize / bytesPerMebibyte);
+    usage.usedMiB = (float)((double) vidmemUsedSize / bytesPerMebibyte);
+    usage.freeMiB = (float)((double) vidmemFreeSize / bytesPerMebibyte);
 
     // Note: Map the range [0.1, 0.6] to [0, 1] and clamp outside it to bias and clamp the green->red color transition more.
     const float remappedFreeVidMemRatio = std::max(std::min(freeVidMemRatio + 0.4f, 1.0f) - 0.5f, 0.0f) * 2.0f;
-    ImVec4 barColor = ImVec4{ 1.0f, 1.0f, 1.0f, 1.0f };
+    usage.barColor = ImVec4{ 1.0f, 1.0f, 1.0f, 1.0f };
 
     ImGui::ColorConvertHSVtoRGB(
       remappedFreeVidMemRatio * 0.32f, 0.717f, 0.704f,
-      barColor.x, barColor.y, barColor.z);
+      usage.barColor.x, usage.barColor.y, usage.barColor.z);
+    return usage;
+  }
 
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, barColor);
-    ImGui::ProgressBar(vidmemUsedSizeMB / vidmemTotalSizeMB);
+  void ImGUI::showMemoryStats() const {
+    if (RtxOptions::Automation::disableDisplayMemoryStatistics()) {
+      return;
+    }
+
+    const VideoMemoryUsage usage = getVideoMemoryUsage();
+
+#ifdef REMIX_DEVELOPMENT
+    ImGui::Text("Video Memory Usage: %.f MiB / %.f MiB (%.f MiB free)", usage.usedMiB, usage.totalMiB, usage.freeMiB);
+#else
+    // Note: Simplify for end users, free memory is usually not as important to list and can just be observed visually with the graph.
+    ImGui::Text("Video Memory Usage: %.f MiB / %.f MiB", usage.usedMiB, usage.totalMiB);
+#endif
+
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, usage.barColor);
+    ImGui::ProgressBar(usage.usedMiB / usage.totalMiB);
     ImGui::PopStyleColor();
 
-    ImGui::TextWrapped("RTX Remix dynamically uses available VRAM to maximize texture quality.");
+    ImGui::TextWrapped("%s dynamically uses available VRAM to maximize texture quality.", productName().c_str());
     
     ImGui::Dummy(ImVec2 { 4, 0 });
   }
@@ -762,9 +809,10 @@ namespace dxvk {
       RtxOptions::showUI.setDeferred(type);
     }
 
+    // The shader prewarm wait screen keeps holding the game's input after the menu closes.
     if (RtxOptions::blockInputToGameInUI()) {
       BridgeMessageChannel::get().send("UWM_REMIX_UIACTIVE_MSG",
-                                       type != UIType::None ? 1 : 0, 0);
+                                       type != UIType::None || m_prewarmScreenActive ? 1 : 0, 0);
     }
   }
   
@@ -784,6 +832,11 @@ namespace dxvk {
         RemixGui::DragFloat("Roughness", &LegacyMaterialDefaults::roughnessConstantObject(), 0.01f, 0.02f, 1.f, "%.3f", sliderFlags);
         RemixGui::DragFloat("Metallic", &LegacyMaterialDefaults::metallicConstantObject(), 0.01f, 0.0f, 1.f, "%.3f", sliderFlags);
         RemixGui::DragFloat("Anisotropy", &LegacyMaterialDefaults::anisotropyObject(), 0.01f, -1.0f, 1.f, "%.3f", sliderFlags);
+
+        // NV-DXVK start: Fresnel defaults apply only to legacy materials.
+        RemixGui::SliderFloat("Specular Level", &LegacyMaterialDefaults::specularLevelObject(), 0.0f, 1.f, "%.3f", sliderFlags);
+        RemixGui::SliderFloat("Fresnel Grazing (f90)", &LegacyMaterialDefaults::fresnelGrazingObject(), 0.0f, 1.f, "%.3f", sliderFlags);
+        // NV-DXVK end
 
         ImGui::Unindent();
       }
@@ -831,6 +884,7 @@ namespace dxvk {
             RemixGui::SliderFloat2("Primary Texcoord Velocity", &TranslucentMaterialOptions::animatedWaterPrimaryNormalMotionObject(), -0.5f, 0.5f, "%.3f", sliderFlags);
             RemixGui::SliderFloat2("Secondary Normal Texcoord Velocity", &TranslucentMaterialOptions::animatedWaterSecondaryNormalMotionObject(), -0.5f, 0.5f, "%.3f", sliderFlags);
             RemixGui::SliderFloat("Secondary Normal LOD bias", &TranslucentMaterialOptions::animatedWaterSecondaryNormalLodBiasObject(), 0.0f, 16.0f, "%.3f", sliderFlags);
+            RemixGui::SliderFloat("Secondary Normal UV Scale", &TranslucentMaterialOptions::animatedWaterSecondaryNormalScaleObject(), 0.05f, 8.0f, "%.3f", sliderFlags);
           }
           ImGui::Unindent();
         }
@@ -877,6 +931,14 @@ namespace dxvk {
       } else {
         switchMenu(RtxOptions::showUI() != UIType::None ? UIType::None : UIType::Basic);
       }
+    }
+
+    if (checkHotkeyState(RtxOptions::dxvkHudToggleKeyBinds())) {
+      RtxOptions::showDxvkHud.setDeferred(!RtxOptions::showDxvkHud());
+    }
+
+    if (checkHotkeyState(RtxScreenshot::hotkey())) {
+      m_device->getCommon()->metaScreenshot().request();
     }
 
 
@@ -937,6 +999,11 @@ namespace dxvk {
       showReflexLatencyStats();
     }
 
+    // The Weather Presets window stays open while the user moves around the developer menu.
+    if (showUI == UIType::Advanced) {
+      showWeatherPresetWindow(ctx.ptr());
+    }
+
     if (showUI == UIType::None) {
       ImGui::CloseCurrentPopup();
       ImGui::GetIO().MouseDrawCursor = false;
@@ -951,7 +1018,13 @@ namespace dxvk {
       }
     }
 
+    showShaderPrewarmScreen(ctx);
+
     showHudMessages(ctx);
+
+    // The notice draws in the user menu's font, at the size the menu would pick for this output.
+    const float noticeScale = std::max(1.0f, ImGui::GetMainViewport()->Size.y / 1080.0f);
+    FaultNotice::showToast(getUserMenuFont((largeUiMode() ? 24.0f : 18.0f) * noticeScale), showUI != UIType::None);
 
 #ifdef REMIX_DEVELOPMENT
     // Show visual indicator when crash hotkeys are armed (one option arms both CPU and GPU crash hotkeys)
@@ -979,13 +1052,13 @@ namespace dxvk {
     };
 
     auto common = ctx->getCommonObjects();
-    static RtxQuickAction sQuickAction = common->getSceneManager().areAllReplacementsLoaded() ? RtxQuickAction::kRtxOnEnhanced : RtxQuickAction::kRtxOn;
+    static RtxQuickAction sQuickAction = common->getSceneManager().hasAnyMods() ? RtxQuickAction::kRtxOnEnhanced : RtxQuickAction::kRtxOn;
 
     if (ImGui::IsKeyPressed(ImGui::GetKeyIndex(ImGuiKey_KeypadAdd))) {
       sQuickAction = (RtxQuickAction) ((sQuickAction + 1) % RtxQuickAction::kCount);
 
-      // Skip over the enhancements quick option if no replacements are loaded
-      if(!common->getSceneManager().areAllReplacementsLoaded() && sQuickAction == RtxQuickAction::kRtxOnEnhanced)
+      // Skip "RTX On Enhanced" if no mods are present — the mode would be identical to plain RTX On
+      if(!common->getSceneManager().hasAnyMods() && sQuickAction == RtxQuickAction::kRtxOnEnhanced)
         sQuickAction = (RtxQuickAction) ((sQuickAction + 1) % RtxQuickAction::kCount);
 
       switch (sQuickAction) {
@@ -1016,6 +1089,79 @@ namespace dxvk {
   }
 
 
+  namespace {
+    // Opens the file's folder in Explorer with the file selected.
+    void showFileInExplorer(const std::wstring& file) {
+      WCHAR windowsDir[MAX_PATH] = {};
+      GetWindowsDirectoryW(windowsDir, MAX_PATH);
+      const std::wstring explorer = std::wstring(windowsDir) + L"\\explorer.exe";
+      std::wstring commandLine = L"\"" + explorer + L"\" /select,\"" + file + L"\"";
+
+      STARTUPINFOW startupInfo = { sizeof(startupInfo) };
+      PROCESS_INFORMATION processInfo = {};
+      if (CreateProcessW(explorer.c_str(), commandLine.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                         &startupInfo, &processInfo)) {
+        CloseHandle(processInfo.hThread);
+        CloseHandle(processInfo.hProcess);
+      } else {
+        Logger::warn(str::format("[Log] Could not open a folder in Explorer, error ", GetLastError(), "."));
+      }
+    }
+  }
+
+  void ImGUI::showLogFolder(bool withReportHelp) {
+    if (withReportHelp) {
+      if (logHelpText().empty()) {
+        ImGui::TextWrapped("Send the log files below with a bug report.");
+      } else {
+        ImGui::TextWrapped("%s", logHelpText().c_str());
+      }
+
+      const std::string& report = reportFile();
+      if (!report.empty()) {
+        if (ImGui::Button("Show Report File")) {
+          showFileInExplorer(str::tows(report.c_str()));
+        }
+        RemixGui::SetTooltipToLastWidgetOnHover("Opens the folder of the newest report file, with the file selected.");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy Path##report")) {
+          ImGui::SetClipboardText(report.c_str());
+        }
+        RemixGui::SetTooltipToLastWidgetOnHover("Copies the newest report file's full path to the clipboard.");
+        const std::string reportName = str::fromws(std::filesystem::path(str::tows(report.c_str())).filename().c_str());
+        ImGui::TextWrapped("Newest report: %s", reportName.c_str());
+      }
+    }
+
+    // The path comes from the log file's own handle, so it is the real folder even under a virtual file system.
+    // Explorer is not redirected by such a file system, so it must be given that real path.
+    const std::wstring& logFile = Logger::realFilePath();
+
+    ImGui::BeginDisabled(logFile.empty());
+    if (ImGui::Button("Open Log Folder")) {
+      showFileInExplorer(logFile);
+    }
+    ImGui::EndDisabled();
+    RemixGui::SetTooltipToLastWidgetOnHover("Opens the folder that holds the log files, with the current log selected.");
+
+    if (logFile.empty()) {
+      ImGui::TextWrapped("No log file is being written.");
+      return;
+    }
+
+    const std::string folder = str::fromws(std::filesystem::path(logFile).parent_path().c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Copy Path##logFolder")) {
+      ImGui::SetClipboardText(folder.c_str());
+    }
+    RemixGui::SetTooltipToLastWidgetOnHover("Copies the log folder's path to the clipboard.");
+    ImGui::TextWrapped("Log folder: %s", folder.c_str());
+    if (Logger::virtualFileSystemActive()) {
+      ImGui::TextWrapped("A mod manager's virtual file system is active. The logs are in the folder above, which can be "
+                         "outside the game folder.");
+    }
+  }
+
   void ImGUI::showDebugVisualizations(const Rc<DxvkContext>& ctx) {
     auto common = ctx->getCommonObjects();
     common->getSceneManager().getLightManager().showImguiDebugVisualization();
@@ -1033,7 +1179,9 @@ namespace dxvk {
     int switchUI = -1;
     bool advancedMenuOpen = RtxOptions::showUI() == UIType::Advanced;
 
-    if (ImGui::Begin("RTX Remix Developer Menu", &advancedMenuOpen, windowFlags)) {
+    // The window ID after "###" stays fixed, so the title can follow the product name.
+    const std::string developerMenuTitle = str::format(productName(), " Developer Menu###RTX Remix Developer Menu");
+    if (ImGui::Begin(developerMenuTitle.c_str(), &advancedMenuOpen, windowFlags)) {
       // Begin handles window resize so this is fine. Do not set m_windowWidth after tabs so that tabs can modify the width
       m_windowWidth = ImGui::GetWindowWidth();
 
@@ -1046,14 +1194,21 @@ namespace dxvk {
       
       RemixGui::Separator();
 
+      // The search results replace the tabs while the search field holds a search.
+      const bool isSearching = m_optionSearch.show();
+
       const static ImGuiTabBarFlags tab_bar_flags = ImGuiTabBarFlags_Reorderable | ImGuiTabBarFlags_NoCloseWithMiddleMouseButton;
       const static ImGuiTabItemFlags tab_item_flags = ImGuiTabItemFlags_NoCloseWithMiddleMouseButton;
 
       // Tab Bar
-      if (ImGui::BeginTabBar("Developer Tabs", tab_bar_flags)) {
+      if (!isSearching && ImGui::BeginTabBar("Developer Tabs", tab_bar_flags)) {
         for (int n = 0; n < kTab_Count; n++) {
           // Only surface the Plugin tab when an external wrapper has registered a draw callback.
           if (n == kTab_Wrapper && !remixapi_imgui_HasDrawCallback()) {
+            continue;
+          }
+          // Only surface Host Settings once a host has registered one.
+          if (n == kTab_HostSettings && host_settings::empty()) {
             continue;
           }
           auto tabItemFlags = tab_item_flags;
@@ -1066,6 +1221,9 @@ namespace dxvk {
             switch (tab) {
             case kTab_Rendering:
               showRenderingSettings(ctx);
+              break;
+            case kTab_HostSettings:
+              host_settings::showImguiTab();
               break;
             case kTab_Setup:
               showSetupWindow(ctx);
@@ -1299,6 +1457,85 @@ namespace dxvk {
     }
   }
 
+  void ImGUI::setPrewarmScreenActive(bool active) {
+    if (active == m_prewarmScreenActive) {
+      return;
+    }
+    m_prewarmScreenActive = active;
+
+    // The bridge client holds back the game's keyboard and mouse input while the UI is active. When the screen closes,
+    // the open menu decides again.
+    const bool menuBlocksInput = RtxOptions::blockInputToGameInUI() && RtxOptions::showUI() != UIType::None;
+    BridgeMessageChannel::get().send("UWM_REMIX_UIACTIVE_MSG", active || menuBlocksInput ? 1 : 0, 0);
+
+    Logger::info(active ? "[ShaderPrewarm] wait screen shown, game input held until the shaders are ready"
+                        : "[ShaderPrewarm] wait screen closed");
+  }
+
+  void ImGUI::showShaderPrewarmScreen(const Rc<DxvkContext>& ctx) {
+    // Frames without ray tracing (menus, loading screens) register the shaders for changed options here.
+    RtxInitializer& initializer = ctx->getCommonObjects()->getRtxInitializer();
+    initializer.refreshPrewarm();
+    const RtxInitializer::PrewarmProgress progress = initializer.updateStartupPrewarm();
+
+    // Warm caches finish the prewarm in about a second without a real compile, so the screen waits for a compile that
+    // lasts and for this delay before it covers anything.
+    constexpr double kShowAfterSeconds = 1.0;
+    const bool show = RtxOptions::Shader::blockUntilPrewarmed() && progress.running && progress.compiling &&
+                      progress.elapsedSeconds >= kShowAfterSeconds;
+    setPrewarmScreenActive(show);
+    if (!show) {
+      return;
+    }
+
+    // The background draw list is drawn over the game's frame and under every ImGui window, so the Remix menu still opens.
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+    const ImVec2 origin = viewport->Pos;
+    const ImVec2 size = viewport->Size;
+    drawList->AddRectFilled(origin, ImVec2(origin.x + size.x, origin.y + size.y), IM_COL32(10, 11, 13, 255));
+
+    ImFont* titleFont = m_largeFont != nullptr ? m_largeFont : ImGui::GetFont();
+    ImFont* bodyFont = m_regularFont != nullptr ? m_regularFont : ImGui::GetFont();
+    const float titleSize = titleFont->FontSize;
+    const float bodySize = bodyFont->FontSize;
+
+    const auto drawCentered = [&](ImFont* font, float fontSize, float y, ImU32 color, const std::string& text) {
+      const ImVec2 textSize = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, text.c_str());
+      drawList->AddText(font, fontSize, ImVec2(origin.x + (size.x - textSize.x) * 0.5f, y), color, text.c_str());
+    };
+
+    const float fraction = progress.total > 0 ? float(progress.done) / float(progress.total) : 0.0f;
+    const uint32_t elapsed = uint32_t(progress.elapsedSeconds);
+    const ImU32 textColor = IM_COL32(235, 235, 235, 255);
+    const ImU32 dimColor = IM_COL32(160, 160, 165, 255);
+
+    float y = origin.y + size.y * 0.38f;
+    drawCentered(titleFont, titleSize, y, textColor, "Compiling shaders...");
+    y += titleSize * 1.6f;
+    drawCentered(bodyFont, bodySize, y, dimColor, "This only happens on the first launch, or after an update or a graphics driver change.");
+    y += bodySize * 1.4f;
+    drawCentered(bodyFont, bodySize, y, dimColor, "The game continues once every shader is ready. Its input is paused until then.");
+    y += bodySize * 2.4f;
+
+    // The bar.
+    const float barWidth = std::min(size.x * 0.5f, 900.0f);
+    const float barHeight = std::max(bodySize * 0.9f, 10.0f);
+    const ImVec2 barMin(origin.x + (size.x - barWidth) * 0.5f, y);
+    const ImVec2 barMax(barMin.x + barWidth, barMin.y + barHeight);
+    drawList->AddRectFilled(barMin, barMax, ImGui::GetColorU32(ImGuiCol_FrameBg), barHeight * 0.5f);
+    if (fraction > 0.0f) {
+      drawList->AddRectFilled(barMin, ImVec2(barMin.x + barWidth * fraction, barMax.y), ImGui::GetColorU32(ImGuiCol_CheckMark), barHeight * 0.5f);
+    }
+    y += barHeight + bodySize * 0.9f;
+
+    drawCentered(bodyFont, bodySize, y, textColor,
+                 str::format(progress.done, " of ", progress.total, " shaders (", uint32_t(fraction * 100.0f), "%)   ",
+                             elapsed / 60, ":", elapsed % 60 < 10 ? "0" : "", elapsed % 60, " elapsed"));
+    y += bodySize * 1.4f;
+    drawCentered(bodyFont, bodySize, y, dimColor, "The largest shaders finish last, so the final few can take a while.");
+  }
+
   struct HudMessage {
     HudMessage(const std::string& text, const std::optional<std::string>& subText) : text{ text }, subText{ subText } {}
 
@@ -1315,13 +1552,16 @@ namespace dxvk {
 
     // Add Shader Compilation HUD messages
 
+    // Only real compiles (pipelines in creation for longer than a cache hit takes), not every pipeline
+    // the runtime creates at startup, most of which come from the pipeline cache in a few ms.
     uint32_t asyncShaderCompilationCount = 0;
     if (RtxOptions::Shader::enableAsyncCompilation()) {
-      asyncShaderCompilationCount = pipelineManager.remixShaderCompilationCount();
+      asyncShaderCompilationCount = pipelineManager.remixShaderSlowCompileCount();
     }
 
-    if (RtxOptions::Shader::enableAsyncCompilationUI() && asyncShaderCompilationCount > 0) {
-      const auto compilationText = str::format("Compiling shaders (", asyncShaderCompilationCount, " remaining)");
+    // The prewarm wait screen shows the same progress.
+    if (RtxOptions::Shader::enableAsyncCompilationUI() && asyncShaderCompilationCount > 0 && !m_prewarmScreenActive) {
+      const auto compilationText = str::format("Compiling shaders (", asyncShaderCompilationCount, " in progress)");
 
       hudMessages.emplace_back(std::move(compilationText), "This may take some time if shaders are not cached yet.\nRemix will not render properly until compilation is finished.");
     }
@@ -1376,6 +1616,18 @@ namespace dxvk {
 
     if (loadingReplacementStateCount != 0U) {
       hudMessages.emplace_back("Loading enhancements", replacementLoadingSubtext);
+    }
+
+    std::string sweepText;
+    std::string sweepSubText;
+    if (common->metaSettingsSweep().getHudMessage(sweepText, sweepSubText)) {
+      hudMessages.emplace_back(sweepText, sweepSubText);
+    }
+
+    std::string screenshotText;
+    std::string screenshotSubText;
+    if (common->metaScreenshot().getHudMessage(screenshotText, screenshotSubText)) {
+      hudMessages.emplace_back(screenshotText, screenshotSubText);
     }
 
     // Draw Hud Messages
@@ -1453,14 +1705,133 @@ namespace dxvk {
 
   void ImGUI::showDevelopmentSettings(const Rc<DxvkContext>& ctx) {
     ImGui::PushItemWidth((largeUiMode() ? m_largeWindowWidgetWidth : m_regularWindowWidgetWidth) + 50.0f);
+    showLogFolder();
+
+    if (ImGui::Button("Save Screenshot to Log Folder")) {
+      const std::time_t now = std::time(nullptr);
+      std::tm local {};
+      localtime_s(&local, &now);
+      char stem[32];
+      std::strftime(stem, sizeof(stem), "manual-%Y%m%d-%H%M%S", &local);
+      RtxSessionLog::screenshotRequestObject().setDeferred(stem);
+    }
+    RemixGui::SetTooltipToLastWidgetOnHover("Saves the next frame as a PNG in the screenshots folder of the log folder, for a bug report. The image is the game's frame with its own interface, without this menu.");
+
     if (ImGui::Button("Take Screenshot")) {
-      RtxContext::triggerScreenshot();
+      ctx->getCommonObjects()->metaScreenshot().request();
+    }
+    RemixGui::SetTooltipToLastWidgetOnHover("Saves the next frame as a PNG, with the game's interface and without this menu. "
+                                            "With HDR output active, an HDR PNG and an SDR PNG are saved.");
+    RemixGui::InputKeyBind("Screenshot Key", &RtxScreenshot::hotkeyObject());
+    RemixGui::InputText("Screenshot Folder", &RtxScreenshot::folderObject());
+
+    {
+      const FrameExportStatus exportStatus = ctx->getCommonObjects()->metaFrameExport().status();
+      switch (exportStatus.state) {
+      case FrameExportState::Off:
+        ImGui::TextUnformatted("External frame: off");
+        break;
+      case FrameExportState::Exporting:
+        ImGui::Text("External frame: %ux%u", exportStatus.width, exportStatus.height);
+        break;
+      case FrameExportState::Unavailable:
+        ImGui::Text("External frame: unavailable: %s", RtxFrameExport::describe(exportStatus.reason));
+        break;
+      }
+    }
+    RemixGui::SetTooltipToLastWidgetOnHover("Whether a host application receives the presented frame through remixapi_ConfigureExternalFrame, and at which size. The shared frame never contains this menu.");
+
+    RemixGui::Separator();
+
+    if (RemixGui::CollapsingHeader("Performance Logging", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      RemixGui::Checkbox("Detailed Performance Logging", &RtxPerfLog::detailedLoggingObject());
+      RemixGui::Checkbox("Write All Repeated Log Lines", &RtxSessionLog::writeAllRepeatsObject());
+      RemixGui::SetTooltipToLastWidgetOnHover("Off: a kind of repeated diagnostic line is written for its first 10 lines, then at most once every 5 minutes with a count of the lines held back. On while Detailed Performance Logging is on.");
+      RemixGui::DragInt("Log Interval (frames)", &RtxPerfLog::detailedLogIntervalFramesObject(), 1.f, 10, 100000);
+      RemixGui::DragInt("GPU Timestamp Sample Every N Frames", &RtxPerfLog::detailedGpuSamplePeriodObject(), 1.f, 1, 120);
+      RemixGui::Checkbox("Serialize GPU Stage Timestamps (exact attribution)", &RtxPerfLog::serializeGpuStageTimestampsObject());
+      RemixGui::Checkbox("Split GBuffer Stage (sub-pass timings)", &RtxPerfLog::splitGBufferStagesObject());
+      RemixGui::DragFloat("Spike Threshold (ms)", &RtxPerfLog::spikeThresholdMsObject(), 1.f, 1.f, 10000.f, "%.0f");
+      RemixGui::DragFloat("Spike x Rolling Median (0 = off)", &RtxPerfLog::spikeMedianMultiplierObject(), 0.1f, 0.f, 20.f, "%.1f");
+      RemixGui::DragInt("Max Spike Lines per Interval", &RtxPerfLog::spikeMaxPerIntervalObject(), 1.f, 0, 1000);
+      RemixGui::DragFloat("GPU Stall Warning (s, 0 = off)", &RtxPerfLog::gpuStallWarnSecondsObject(), 0.1f, 0.f, 60.f, "%.1f");
+      RemixGui::DragFloat("GPU Stall Watchdog Timeout (s, 0 = off)", &RtxPerfLog::gpuStallTimeoutSecondsObject(), 1.f, 0.f, 600.f, "%.0f");
+      RemixGui::Separator();
+      RemixGui::DragInt("Log AS Memory Breakdown Every N Frames (0 = off)##perf", &RtxOptions::accelMemoryLogIntervalFramesObject(), 1.f, 0, 100000);
+      ImGui::Unindent();
     }
 
-    RemixGui::SetTooltipToLastWidgetOnHover("Screenshot will be dumped to, '<exe-dir>/Screenshots'");
+    if (RemixGui::CollapsingHeader("Present Pacing", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      RemixGui::DragInt("Log Present Pacing Every N Presents (0 = off)##pacing", &RtxPerfLog::pacingLogIntervalPresentsObject(), 1.f, 0, 100000);
+      RemixGui::DragInt("Present GPU Queue Limit (0 = off, 1 = strictest)##pacing", &RtxPerfLog::gpuQueueLimitObject(), 0.05f, 0, 4);
+      RemixGui::DragFloat("Present GPU Queue Limit Max Wait (ms, 200 = full)##pacing", &RtxPerfLog::gpuQueueLimitMaxWaitMsObject(), 0.1f, 0.1f, 200.f, "%.1f");
+      RemixGui::DragInt("Present-Wait Pacing (0 = off, 1 = hold RT work until previous present completes)##pacing", &RtxPerfLog::presentWaitPacingObject(), 0.05f, 0, 1);
+      RemixGui::DragInt("Present-Wait Lag (0 = previous present, 1 = one extra in flight)##pacing", &RtxPerfLog::presentWaitLagObject(), 0.05f, 0, 8);
+      RemixGui::DragFloat("Present-Wait Timeout (ms)##pacing", &RtxPerfLog::presentWaitTimeoutMsObject(), 0.5f, 1.f, 1000.f, "%.0f");
+      RemixGui::DragInt("Mid-Frame Flushes (bitmask: 1 GBuf, 2 pre-direct, 4 pre-indirect, 8 pre-denoise, 16 pre-upscale; 31 = all)##pacing", &RtxPerfLog::midFrameFlushesObject(), 0.1f, 0, 31);
+      RemixGui::Separator();
+      ImGui::TextWrapped("Gap fill (needs Present-Wait Pacing = 1): submits the start of the frame before the pacing wait. 2 is recommended.");
+      RemixGui::DragInt("Gap Fill: Early Submit Point (0 off, 1 TLAS, 2 +atmosphere, 3 +volumetrics, 4 +G-buffer)##pacing", &RtxPerfLog::presentWaitPreGateFlushObject(), 0.05f, 0, 4);
+      RemixGui::DragInt("Pre-Gate Guard: Max BLAS Builds per Frame (0 = no limit)##pacing", &RtxPerfLog::presentWaitPreGateMaxBlasBuildsObject(), 0.2f, 0, 10000);
+      RemixGui::DragInt("Pre-Gate Guard: Max OMM Micro-Triangles per Frame (thousands, 0 = no limit)##pacing", &RtxPerfLog::presentWaitPreGateMaxOmmKTrisObject(), 1.f, 0, 1000000);
+      RemixGui::DragInt("Queue Global Priority (0 = unset, 1 LOW, 2 MEDIUM, 3 HIGH, 4 REALTIME) (restart required)##pacing", &RtxPerfLog::queueGlobalPriorityObject(), 0.05f, 0, 4);
+      RemixGui::Checkbox("Disable NVIDIA Present Layer (restart required)##pacing", &RtxPerfLog::disableNvPresentLayerObject());
+      RemixGui::Checkbox("Per-Present Trace CSV (remix-present-trace.csv; pair with PresentMon --qpc_time_ms)##pacing", &RtxPerfLog::traceCsvObject());
+      ImGui::Unindent();
+    }
 
-    ImGui::SameLine(200.f);
-    RemixGui::Checkbox("Include G-Buffer", &RtxOptions::captureDebugImageObject());
+    if (RemixGui::CollapsingHeader("Settings Sweep", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      RtxSettingsSweep& sweep = ctx->getCommonObjects()->metaSettingsSweep();
+      if (sweep.isActive()) {
+        if (ImGui::Button("Stop Settings Sweep")) {
+          sweep.requestStop();
+        }
+        RemixGui::SetTooltipToLastWidgetOnHover("Stops the sweep and restores the user's settings.");
+      } else {
+        if (ImGui::Button("Run Settings Sweep")) {
+          sweep.requestStart();
+        }
+        RemixGui::SetTooltipToLastWidgetOnHover("Switches through the main rendering settings one step at a time and measures each step, for validation, stability and performance runs. The user's settings come back at the end. Results go to remix-dxvk.log, sweep-perf.csv and, with a validation layer, validation-sweep.log.");
+      }
+      RemixGui::DragFloat("Seconds per Step##sweep", &RtxSettingsSweep::stepSecondsObject(), 0.5f, 1.f, 3600.f, "%.0f");
+      RemixGui::DragFloat("Start Delay (s)##sweep", &RtxSettingsSweep::startDelaySecondsObject(), 0.5f, 0.f, 3600.f, "%.0f");
+      RemixGui::InputText("Step Filter##sweep", &RtxSettingsSweep::stepsObject());
+      RemixGui::Checkbox("Loop##sweep", &RtxSettingsSweep::loopObject());
+      ImGui::TextWrapped("Status: %s", sweep.getStatus().c_str());
+      ImGui::Unindent();
+    }
+
+    if (RemixGui::CollapsingHeader("Nsight Graphics Capture", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+
+#if DXVK_ENABLE_NSIGHT_GRAPHICS_CAPTURE
+      RemixGui::Checkbox("Enable Nsight Graphics Capture On Launch", &NsightGraphicsCapture::graphicsCaptureEnabledObject());
+      RemixGui::InputText("Nsight Graphics Install Path", &NsightGraphicsCapture::graphicsCaptureInstallPathObject());
+      RemixGui::InputText("Capture Output Directory", &NsightGraphicsCapture::graphicsCaptureOutputDirObject());
+      RemixGui::InputText("Capture Output File", &NsightGraphicsCapture::graphicsCaptureOutputFileObject());
+
+      RemixGui::DragInt("Capture Frames", &NsightGraphicsCapture::graphicsCaptureFramesToCaptureObject(), 1.0f,
+                        NsightGraphicsCapture::kMinFramesToCapture, NsightGraphicsCapture::kMaxFramesToCapture, "%d",
+                        ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::Checkbox("Show Nsight HUD", &NsightGraphicsCapture::graphicsCaptureShowHudObject());
+
+      ImGui::TextWrapped("Status: %s", NsightGraphicsCapture::statusText().c_str());
+      ImGui::TextWrapped("Last Result: %s", NsightGraphicsCapture::lastResultText().c_str());
+
+      ImGui::BeginDisabled(!NsightGraphicsCapture::isAvailable());
+      if (ImGui::Button("Trigger Nsight Graphics Capture")) {
+        NsightGraphicsCapture::requestGraphicsCapture(NsightGraphicsCapture::graphicsCaptureFramesToCapture());
+      }
+      ImGui::EndDisabled();
+#else
+      ImGui::TextWrapped("Nsight Graphics capture is supported only by x64 builds. See the build instructions in README.md.");
+#endif
+
+      ImGui::Unindent();
+    }
 
     RemixGui::Separator();
         
@@ -1579,6 +1950,7 @@ namespace dxvk {
       ImGui::Indent();
 
       RtCamera::showImguiSettings();
+      WorldOrigin::showImguiSettings();  // rtx.worldOrigin.enable
 
       {
         ImGui::PushID("CameraInfos");
@@ -1671,11 +2043,17 @@ namespace dxvk {
     if (RemixGui::CollapsingHeader("Developer Options", collapsingHeaderFlags)) {
       ImGui::Indent();
       RemixGui::Checkbox("Enable Preserve Path", &RtxOptions::enablePreservePathObject());
+      // NV-DXVK start: Optional UV animation cache optimization
+      RemixGui::Checkbox("Optimize Animated Texture Coordinates", &SceneManager::optimizeAnimatedTexcoordsObject());
+      // NV-DXVK end
       RemixGui::Checkbox("Enable Instance Debugging", &RtxOptions::enableInstanceDebuggingToolsObject());
       RemixGui::Checkbox("Disable Draw Calls Post RTX Injection", &RtxOptions::skipDrawCallsPostRTXInjectionObject());
+      RemixGui::Checkbox("GPU Screen Overlay (D3D11 Hosts)", &RtxOptions::enableGpuScreenOverlayObject());
       RemixGui::Checkbox("Break into Debugger On Press of Key 'B'", &RtxOptions::enableBreakIntoDebuggerOnPressingBObject());
       RemixGui::Checkbox("Block Input to Game in UI", &RtxOptions::blockInputToGameInUIObject());
+      RemixGui::Checkbox("Wait for Shader Compilation at Startup", &RtxOptions::Shader::blockUntilPrewarmedObject());
       RemixGui::Checkbox("Force Camera Jitter", &RtxOptions::forceCameraJitterObject());
+      RemixGui::Checkbox("Force Static Scene Motion Vectors", &RtxOptions::forceStaticSceneMotionVectorsObject());
       RemixGui::DragInt("Camera Jitter Sequence Length", &RtxOptions::cameraJitterSequenceLengthObject());
       
       RemixGui::DragIntRange2("Draw Call Range Filter", &RtxOptions::drawCallRangeObject(), 1.f, 0, INT32_MAX, nullptr, nullptr, ImGuiSliderFlags_AlwaysClamp);
@@ -1692,7 +2070,19 @@ namespace dxvk {
         ImGui::Unindent();
       }
       RemixGui::Checkbox("Hash Collision Detection", &HashCollisionDetectionOptions::enableObject());
-      RemixGui::Checkbox("Validate CPU index data", &RtxOptions::validateCPUIndexDataObject());
+      RemixGui::Checkbox("Keep Compiled Pipelines Between Runs (restart required)", &DxvkPipelineCache::persistObject());
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "rtx.pipelineCache.persist. Restart required: the cache file is opened at device creation, so a change takes effect\n"
+        "at the next launch (save rtx.conf first). When on, the compiled compute and ray tracing pipelines are saved to\n"
+        "<exe>.remix-pipeline-cache next to the DXVK state cache and loaded at the next start.");
+      RemixGui::DragInt("Pipeline Cache Max Size (MB)", &DxvkPipelineCache::maxSizeMBObject(), 16.f, 64, 65536);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "rtx.pipelineCache.maxSizeMB. A cache larger than this is not saved, and the old file is removed so the next run\n"
+        "starts a fresh one. Applies at the next save (when shader compiles settle, and at shutdown).");
+
+      ImGui::Indent();
+      showDeveloperSection(ctx);
+      ImGui::Unindent();
 
 #ifdef REMIX_DEVELOPMENT
       if (RemixGui::CollapsingHeader("Resource Aliasing Query", collapsingHeaderClosedFlags)) {
@@ -1946,6 +2336,9 @@ namespace dxvk {
 
       RemixGui::Checkbox("Always Developer Menu", &RtxOptions::defaultToAdvancedUIObject());
 
+      RemixGui::InputText("Product Name", &productNameObject());
+      RemixGui::InputText("Donate Link", &donateUrlObject());
+
       if (RemixGui::SliderFloat("Background Alpha", &backgroundAlphaObject(), 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
         adjustStyleBackgroundAlpha(backgroundAlpha());
       }
@@ -1954,6 +2347,12 @@ namespace dxvk {
       if (RemixGui::Checkbox("Use Large UI", &largeUiModeObject())) {
         m_pendingUIOptionsScroll = true;
       }
+
+      RemixGui::Checkbox("Problem Notice", &FaultNotice::enableObject());
+      ImGui::BeginDisabled(!FaultNotice::enable());
+      RemixGui::InputText("Problem Notice Help Text", &FaultNotice::supportTextObject());
+      RemixGui::InputText("Problem Notice Help Link", &FaultNotice::supportUrlObject());
+      ImGui::EndDisabled();
 
       {
         constexpr float indent = 60.0f;
@@ -2559,6 +2958,59 @@ namespace dxvk {
     ImGui::PopID();
   }
 
+  namespace {
+    // The mod order and the clashes between mods, read only. See documentation/RemixModOrder.md.
+    void showModConflicts(const ModConflictReport& report) {
+      static const char* const kKindNames[] = { "materials", "meshes", "lights" };
+      static const char* const kKindPrefixes[] = { "mat_", "mesh_", "light_" };
+      static const char* const kRuleNames[] = { "ownership file", "dependency", "name", "load order" };
+
+      ImGui::TextWrapped("Mods from lowest to highest precedence. When several replace the same asset, the last one wins, "
+                         "unless the asset's ownership file in rtx-remix/mods/owners names another of them.");
+      for (size_t i = 0; i < report.mods.size(); ++i) {
+        const ModConflictReport::ModEntry& mod = report.mods[i];
+        ImGui::Text("%zu. %s  (%zu %s, %zu %s, %zu %s)", i + 1, mod.name.c_str(),
+                    mod.replacedCounts[0], kKindNames[0], mod.replacedCounts[1], kKindNames[1],
+                    mod.replacedCounts[2], kKindNames[2]);
+        if (!mod.dependencies.empty()) {
+          std::string dependencies;
+          for (const std::string& dependency : mod.dependencies) {
+            dependencies += (dependencies.empty() ? "" : ", ") + dependency;
+          }
+          ImGui::TextDisabled("    depends on %s", dependencies.c_str());
+        }
+      }
+
+      RemixGui::Separator();
+      if (report.clashes.empty()) {
+        ImGui::Text("No asset is replaced by more than one mod.");
+        return;
+      }
+      ImGui::Text("%zu assets are replaced by more than one mod:", report.clashes.size());
+      const float rowHeight = ImGui::GetTextLineHeightWithSpacing();
+      const float height = std::min(rowHeight * static_cast<float>(report.clashes.size()) + rowHeight, 300.0f);
+      ImGui::BeginChild("##modClashes", ImVec2(0.0f, height), true);
+      ImGuiListClipper clipper;
+      clipper.Begin(static_cast<int>(report.clashes.size()));
+      while (clipper.Step()) {
+        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+          const ModConflictReport::Clash& clash = report.clashes[static_cast<size_t>(row)];
+          std::string losers;
+          for (const std::string& mod : clash.mods) {
+            if (mod != clash.winner) {
+              losers += (losers.empty() ? "" : ", ") + mod;
+            }
+          }
+          ImGui::Text("%s%016llX: %s wins over %s (%s)%s%s", kKindPrefixes[static_cast<size_t>(clash.kind)],
+                      static_cast<unsigned long long>(clash.hash), clash.winner.c_str(), losers.c_str(),
+                      kRuleNames[static_cast<size_t>(clash.rule)],
+                      clash.staleOwner.empty() ? "" : ", stale ownership file names ", clash.staleOwner.c_str());
+        }
+      }
+      ImGui::EndChild();
+    }
+  }
+
   void ImGUI::showEnhancementsWindow(const Rc<DxvkContext>& ctx) {
     ImGui::PushItemWidth(largeUiMode() ? m_largeWindowWidgetWidth : m_regularWindowWidgetWidth);
 
@@ -2580,11 +3032,27 @@ namespace dxvk {
   }
   
   void ImGUI::showEnhancementsTab(const Rc<DxvkContext>& ctx) {
-    if (!ctx->getCommonObjects()->getSceneManager().areAllReplacementsLoaded()) {
-      ImGui::Text("No USD enhancements detected, the following options have been disabled.  See documentation for how to use enhancements with Remix.");
+    auto& replacer = ctx->getCommonObjects()->getSceneManager().getAssetReplacer();
+    const auto states = replacer->getReplacementStates();
+    if (states.empty()) {
+      ImGui::Text("No USD enhancement mods detected. See documentation for how to use enhancements with Remix.");
+    } else {
+      const bool anyLoading = std::any_of(states.begin(), states.end(),
+          [](const Mod::State& s) { return s.progressState != Mod::ProgressState::Unloaded
+                                        && s.progressState != Mod::ProgressState::Loaded; });
+      if (anyLoading) {
+        ImGui::Text("Enhancement assets are loading...");
+      } else {
+        ImGui::Text("Mods Discovered: %zu", states.size());
+      }
     }
 
-    ImGui::BeginDisabled(!ctx->getCommonObjects()->getSceneManager().areAllReplacementsLoaded());
+    ImGui::BeginDisabled(replacer->isReloadPending());
+    if (ImGui::Button("Reload Enhancements")) {
+      replacer->requestReload();
+    }
+    ImGui::EndDisabled();
+
     RemixGui::Checkbox("Enable Enhanced Assets", &RtxOptions::enableReplacementAssetsObject());
     {
       ImGui::Indent();
@@ -2597,7 +3065,18 @@ namespace dxvk {
       ImGui::EndDisabled();
       ImGui::Unindent();
     }
+
+    RemixGui::Checkbox("Reload Enhancements on mod.usda change", &UsdMod::reloadOnChangedObject());
+    ImGui::BeginDisabled(!UsdMod::reloadOnChanged());
+    RemixGui::Checkbox("  Reload on any usd file change", &UsdMod::watchDependenciesObject());
     ImGui::EndDisabled();
+
+    if (!states.empty() && RemixGui::CollapsingHeader("Mod Conflicts", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      showModConflicts(replacer->getModConflictReport());
+      ImGui::Unindent();
+    }
+
     RemixGui::Separator();
     RemixGui::Checkbox("Highlight Legacy Materials (flash red)", &RtxOptions::useHighlightLegacyModeObject());
 
@@ -2836,9 +3315,7 @@ namespace dxvk {
 
       if (RemixGui::CollapsingHeader("Heuristics", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
-        RemixGui::Checkbox("Orthographic Is UI", &D3D9Rtx::orthographicIsUIObject());
-        RemixGui::Checkbox("Pre-Transformed Vertices Is UI", &D3D9Rtx::preTransformedVerticesIsUIObject());
-        RemixGui::Checkbox("Allow Cubemaps", &D3D9Rtx::allowCubemapsObject());
+        frontend_ui::drawPanels(frontend_ui::Group::Heuristics);
         RemixGui::Checkbox("Always Calculate AABB (For Instance Matching)", &RtxOptions::enableAlwaysCalculateAABBObject());
         RemixGui::Checkbox("Skip Sky Fog Values", &RtxOptions::fogIgnoreSkyObject());
         RemixGui::Checkbox("Recompute Texture Hash On Write", &RtxOptions::recomputeTextureHashOnWriteObject());
@@ -2854,15 +3331,7 @@ namespace dxvk {
         ImGui::Unindent();
       }
 
-      if (RemixGui::CollapsingHeader("Shader Support (Experimental)", collapsingHeaderClosedFlags)) {
-        ImGui::Indent();
-        RemixGui::Checkbox("Capture Vertices from Shader", &D3D9Rtx::useVertexCaptureObject());
-        RemixGui::Checkbox("Capture Normals from Shader", &D3D9Rtx::useVertexCapturedNormalsObject());
-        RemixGui::Checkbox("Capture Texcoords from Shader", &D3D9Rtx::useVertexCapturedTexcoordsObject());
-        RemixGui::Separator();
-        RemixGui::Checkbox("Use World Transforms", &D3D9Rtx::useWorldMatricesForShadersObject());
-        ImGui::Unindent();
-      }
+      frontend_ui::drawPanels(frontend_ui::Group::TuningSections);
 
       if (RemixGui::CollapsingHeader("View Model", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
@@ -2871,48 +3340,17 @@ namespace dxvk {
         RemixGui::Checkbox("Virtual Instances", &RtxOptions::ViewModel::enableVirtualInstancesObject());
         RemixGui::Checkbox("Perspective Correction", &RtxOptions::ViewModel::perspectiveCorrectionObject());
         RemixGui::DragFloat("Scale", &RtxOptions::ViewModel::scaleObject(), 0.01f, 0.01f, 2.0f);
+        RemixGui::Checkbox("Gate Stale Previous Positions", &RtxOptions::ViewModel::gatePreviousPositionsObject());
         ImGui::Unindent();
       }
 
-      if (RemixGui::CollapsingHeader("Sky Tuning", collapsingHeaderClosedFlags)) {
+      // NV-DXVK start: Sky appearance and game setup UI
+      if (RemixGui::CollapsingHeader("Sky###Sky Tuning", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
-        // NV-DXVK start: Numos native atmosphere UI
-        ctx->getCommonObjects()->metaAtmosphere().showImguiSettings(
-          ctx->getCommonObjects()->getSceneManager().getWeatherBlender());
-        // NV-DXVK end
-        RemixGui::InputInt("First N Untextured Draw Calls", &RtxOptions::skyDrawcallIdThresholdObject(), 1, 1, 0);
-        RemixGui::SliderFloat("Sky Min Z Threshold", &RtxOptions::skyMinZThresholdObject(), 0.0f, 1.0f);
-        skyAutoDetectCombo.getKey(&RtxOptions::skyAutoDetectObject());
-
-        if (RemixGui::CollapsingHeader("Advanced", collapsingHeaderClosedFlags)) {
-          ImGui::Indent();
-
-          RemixGui::Checkbox("Reproject Sky to Main Camera", &RtxOptions::skyReprojectToMainCameraSpaceObject());
-          {
-            ImGui::BeginDisabled(!RtxOptions::skyReprojectToMainCameraSpace());
-            RemixGui::DragFloat("Reprojected Sky Scale", &RtxOptions::skyReprojectScaleObject(), 1.0f, 0.1f, 1000.0f);
-            RemixGui::Checkbox("Force Auto-Detected Sky to Reproject", &RtxOptions::skyForceAutoDetectedToReprojectObject());
-            ImGui::EndDisabled();
-          }
-          RemixGui::DragFloat("Sky Auto-Detect Unique Camera Search Distance", &RtxOptions::skyAutoDetectUniqueCameraDistanceObject(), 1.0f, 0.1f, 1000.0f);
-
-          RemixGui::Checkbox("Force HDR sky", &RtxOptions::skyForceHDRObject());
-
-          static const char* exts[] = { "256 (1.5MB vidmem)", "512 (6MB vidmem)", "1024 (24MB vidmem)",
-            "2048 (96MB vidmem)", "4096 (384MB vidmem)", "8192 (1.5GB vidmem)" };
-
-          static int extIdx;
-          extIdx = std::clamp(bit::tzcnt(RtxOptions::skyProbeSide()), 8u, 13u) - 8;
-
-          if (RemixGui::Combo("Sky Probe Extent", &extIdx, exts, IM_ARRAYSIZE(exts))) {
-            RemixGui::CheckRtxOptionPopups(&RtxOptions::skyProbeSideObject());
-          }
-          RtxOptions::skyProbeSide.setDeferred(1 << (extIdx + 8));
-
-          ImGui::Unindent();
-        }
+        showSkyImguiSettings(ctx.ptr());
         ImGui::Unindent();
       }
+      // NV-DXVK end
 
       if (RtxOptions::Eye::showOptions() && RemixGui::CollapsingHeader("Eyes", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
@@ -2958,10 +3396,10 @@ namespace dxvk {
         }
 
         constexpr static const char* fogModes[] = {
-          "D3DFOG_NONE",
-          "D3DFOG_EXP",
-          "D3DFOG_EXP2",
-          "D3DFOG_LINEAR",
+          "None",
+          "Exp",
+          "Exp2",
+          "Linear",
         };
 
         {
@@ -3018,10 +3456,6 @@ namespace dxvk {
   void ImGUI::updateWindowWidths() {
     // Developer menu
     m_windowWidth = largeUiMode() ? m_largeWindowWidth : m_regularWindowWidth + (compactGui() ? 0.0f : 42.0f);
-
-    // User menu popup
-    m_userWindowWidth = largeUiMode() ? m_largeUserWindowWidth : m_regularUserWindowWidth;
-    m_userWindowHeight = largeUiMode() ? m_largeUserWindowHeight : m_regularUserWindowHeight;
   }
 
   void ImGUI::setToolkitStyle(ImGuiStyle* dst) {
@@ -3230,6 +3664,138 @@ namespace dxvk {
     style->Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.00f, 0.00f, 0.00f, 0.56f);
   }
 
+  void ImGUI::setRemixPlusStyle(ImGuiStyle* dst) {
+    ImGuiStyle* style = dst ? dst : &ImGui::GetStyle();
+
+    // Spacing and rounding from the default theme; plum, rose and cream colors.
+    // Text is cream on dark plum fills. Bright rose is used only where no text sits on top of it.
+    setToolkitStyle(style);
+
+    const ImVec4 cream     = ImVec4(0.980f, 0.953f, 0.925f, 1.00f);
+    const ImVec4 soft      = ImVec4(0.910f, 0.871f, 0.886f, 1.00f);
+    const ImVec4 muted     = ImVec4(0.580f, 0.510f, 0.560f, 1.00f);
+    const ImVec4 rose      = ImVec4(0.957f, 0.729f, 0.816f, 1.00f);
+    const ImVec4 roseLight = ImVec4(1.000f, 0.835f, 0.894f, 1.00f);
+    const ImVec4 roseDim   = ImVec4(0.725f, 0.518f, 0.604f, 1.00f);
+    const ImVec4 roseDeep  = ImVec4(0.478f, 0.267f, 0.400f, 1.00f);
+    const ImVec4 roseDark  = ImVec4(0.361f, 0.200f, 0.310f, 1.00f);
+    const ImVec4 plumBlack = ImVec4(0.071f, 0.047f, 0.078f, 1.00f);
+    const ImVec4 plum      = ImVec4(0.110f, 0.075f, 0.125f, 1.00f);
+    const ImVec4 plumFrame = ImVec4(0.251f, 0.165f, 0.275f, 1.00f);
+    const ImVec4 plumField = ImVec4(0.345f, 0.235f, 0.373f, 1.00f);
+    const ImVec4 plumHover = ImVec4(0.431f, 0.290f, 0.459f, 1.00f);
+    const ImVec4 plumLine  = ImVec4(0.290f, 0.200f, 0.282f, 1.00f);
+    const ImVec4 frameLine = ImVec4(0.765f, 0.635f, 0.761f, 1.00f);
+
+    auto withAlpha = [](ImVec4 c, float a) { c.w = a; return c; };
+
+    style->Colors[ImGuiCol_Text] = cream;
+    style->Colors[ImGuiCol_TextDisabled] = muted;
+    style->Colors[ImGuiCol_WindowBg] = withAlpha(plumBlack, backgroundAlpha());
+    style->Colors[ImGuiCol_ChildBg] = withAlpha(plum, 0.86f);
+    style->Colors[ImGuiCol_PopupBg] = plum;
+    // Fields and checkboxes stand out from the window by a lighter fill and a light border.
+    style->Colors[ImGuiCol_Border] = frameLine;
+    style->Colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    style->Colors[ImGuiCol_FrameBg] = plumField;
+    style->Colors[ImGuiCol_FrameBgHovered] = plumHover;
+    style->Colors[ImGuiCol_FrameBgActive] = roseDeep;
+    style->Colors[ImGuiCol_TitleBg] = plumBlack;
+    style->Colors[ImGuiCol_TitleBgActive] = plumBlack;
+    style->Colors[ImGuiCol_TitleBgCollapsed] = withAlpha(plum, 0.98f);
+    style->Colors[ImGuiCol_MenuBarBg] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    style->Colors[ImGuiCol_ScrollbarBg] = ImVec4(0.00f, 0.00f, 0.00f, 0.24f);
+    style->Colors[ImGuiCol_ScrollbarGrab] = plumLine;
+    style->Colors[ImGuiCol_ScrollbarGrabHovered] = roseDeep;
+    style->Colors[ImGuiCol_ScrollbarGrabActive] = roseDim;
+    style->Colors[ImGuiCol_CheckMark] = roseLight;
+    style->Colors[ImGuiCol_SliderGrab] = roseDim;
+    style->Colors[ImGuiCol_SliderGrabActive] = rose;
+    style->Colors[ImGuiCol_Button] = plumFrame;
+    style->Colors[ImGuiCol_ButtonHovered] = roseDeep;
+    style->Colors[ImGuiCol_ButtonActive] = roseDark;
+    style->Colors[ImGuiCol_Header] = plumFrame;
+    style->Colors[ImGuiCol_HeaderHovered] = roseDeep;
+    style->Colors[ImGuiCol_HeaderActive] = roseDark;
+    style->Colors[ImGuiCol_Separator] = plumLine;
+    style->Colors[ImGuiCol_SeparatorHovered] = roseDim;
+    style->Colors[ImGuiCol_SeparatorActive] = rose;
+    style->Colors[ImGuiCol_ResizeGrip] = withAlpha(plumLine, 0.60f);
+    style->Colors[ImGuiCol_ResizeGripHovered] = roseDim;
+    style->Colors[ImGuiCol_ResizeGripActive] = rose;
+    style->Colors[ImGuiCol_Tab] = withAlpha(plumBlack, 0.60f);
+    style->Colors[ImGuiCol_TabHovered] = roseDeep;
+    style->Colors[ImGuiCol_TabActive] = roseDeep;
+    style->Colors[ImGuiCol_TabUnfocused] = withAlpha(plumBlack, 0.40f);
+    style->Colors[ImGuiCol_TabUnfocusedActive] = roseDark;
+    style->Colors[ImGuiCol_PlotLines] = roseDim;
+    style->Colors[ImGuiCol_PlotLinesHovered] = rose;
+    style->Colors[ImGuiCol_PlotHistogram] = roseDim;
+    style->Colors[ImGuiCol_PlotHistogramHovered] = rose;
+    style->Colors[ImGuiCol_TableHeaderBg] = plumFrame;
+    style->Colors[ImGuiCol_TableBorderStrong] = plumLine;
+    style->Colors[ImGuiCol_TableBorderLight] = withAlpha(plumLine, 0.54f);
+    style->Colors[ImGuiCol_TableRowBg] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    style->Colors[ImGuiCol_TableRowBgAlt] = withAlpha(plumFrame, 0.50f);
+    style->Colors[ImGuiCol_TextSelectedBg] = withAlpha(roseDeep, 0.80f);
+    style->Colors[ImGuiCol_DragDropTarget] = rose;
+    style->Colors[ImGuiCol_NavHighlight] = rose;
+    style->Colors[ImGuiCol_NavWindowingHighlight] = withAlpha(soft, 0.70f);
+    style->Colors[ImGuiCol_NavWindowingDimBg] = withAlpha(plumBlack, 0.40f);
+    style->Colors[ImGuiCol_ModalWindowDimBg] = withAlpha(plumBlack, 0.60f);
+  }
+
+  std::string ImGUI::productVersion() {
+    const std::string tag = remixBuildTag();
+    const size_t space = tag.find_last_of(' ');
+    std::string version = space == std::string::npos ? tag : tag.substr(space + 1);
+    if (version.empty() || version[0] < '0' || version[0] > '9') {
+      return {};
+    }
+    return version;
+  }
+
+  std::string ImGUI::productNameWithVersion() {
+    const std::string version = productVersion();
+    return version.empty() ? productName() : str::format(productName(), " ", version);
+  }
+
+  bool ImGUI::hasDonateLink() {
+    return donateUrl().rfind("https://", 0) == 0;
+  }
+
+  // Draws nothing when rtx.gui.donateUrl holds no https link.
+  void ImGUI::showDonateButton(const ImVec2& buttonSize) {
+    if (!hasDonateLink()) {
+      return;
+    }
+    const std::string& url = donateUrl();
+    const bool stacked = buttonSize.x > 0.0f;
+    if (stacked) {
+      constexpr const char* kText = "Help keep this project going";
+      const float textOffset = (buttonSize.x - ImGui::CalcTextSize(kText).x) * 0.5f;
+      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(textOffset, 0.0f));
+      ImGui::TextUnformatted(kText);
+    } else {
+      ImGui::AlignTextToFramePadding();
+      ImGui::TextUnformatted("Help keep this project going:");
+      ImGui::SameLine();
+    }
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, std::max(ImGui::GetStyle().FrameRounding, ImGui::GetFontSize() * 0.3f));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.37f, 0.36f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.47f, 0.46f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.85f, 0.30f, 0.29f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+    if (ImGui::Button("Donate", buttonSize)) {
+      env::openUrlInBrowser(url.c_str());
+    }
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar();
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("%s", url.c_str());
+    }
+  }
+
   void ImGUI::onThemeChange(DxvkDevice* device) {
     if (GImGui != nullptr) {
       ImGUI& gui = device->getCommon()->getImgui();
@@ -3264,6 +3830,10 @@ namespace dxvk {
     case Theme::Nvidia:
       setNvidiaStyle(style);
       break;
+
+    case Theme::RemixPlus:
+      setRemixPlusStyle(style);
+      break;
     }
   }
 
@@ -3272,7 +3842,7 @@ namespace dxvk {
     assert(RtxOptions::enableVsyncState != EnableVsync::WaitingForImplicitSwapchain);
 
     const bool anyFGActive = enableDLFGGuard && fork_hooks::anyFrameGenerationEnabled();
-    
+
     if (anyFGActive) {
       ImGui::BeginDisabled();
     }
@@ -3360,6 +3930,7 @@ namespace dxvk {
       if (ImGui::Button("Toggle Reflex Stats Window", ImVec2(ImGui::GetContentRegionAvail().x - GImGui->Style.FramePadding.x * 2, 0))) {
         m_reflexLatencyStatsOpen = !m_reflexLatencyStatsOpen;
       }
+      RemixGui::Checkbox("Reflex on D3D11 Host Path (sleep + markers)", &RtxOptions::reflexD3D11MarkersObject());
     }
 
   }
@@ -3503,6 +4074,309 @@ namespace dxvk {
     ImGui::End();
   }
 
+  void ImGUI::showDeveloperSection(const Rc<DxvkContext>& ctx) {
+    if (RemixGui::CollapsingHeader("Frontend and Scene Paths", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      ImGui::TextWrapped("Set these paths in rtx.conf before the game starts. Switching a path while a scene is loaded is not supported.");
+      if (ImGui::TreeNode("D3D9 Frontend")) {
+        frontend_ui::drawPanels(frontend_ui::Group::Geometry);
+        ImGui::TreePop();
+      }
+      if (ImGui::TreeNode("Scene Interface")) {
+        RemixGui::Checkbox("Scene: Origin Shift as One Event", &scene::Options::originShiftEventObject());
+        RemixGui::Checkbox("Scene: Origin Shift Translates Merged BLAS (no rebuild)", &RtxOptions::originTranslationObject());
+        RemixGui::Checkbox("API: External Preserve Path", &RtxOptions::enableExternalPreservePathObject());
+        ImGui::TreePop();
+      }
+      ImGui::Unindent();
+    }
+
+    if (RemixGui::CollapsingHeader("Shader Variants", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      RemixGui::Checkbox("Slim Indirect Variants Keep POM", &DxvkPathtracerIntegrateIndirect::slimKeepPomObject());
+      showVariantTablesImguiSettings();
+      showFrameFeaturesImguiSettings();
+      RemixGui::Checkbox("Log Pipeline Shader Stats (restart required)", &RtxPipelineStats::logPipelineStatsObject());
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "rtx.debug.logPipelineStats. Restart required: the Vulkan extension is enabled at device creation, and pipelines are\n"
+        "created early and cached, so toggling this in a running game does nothing until the next launch (save rtx.conf first).\n"
+        "When on, every compute / ray tracing / graphics pipeline logs one [PipelineStats] line per executable to remix-dxvk.log:\n"
+        "register count, spills / local memory, instruction count, binary size, subgroup size (whatever the driver reports).");
+      ImGui::Unindent();
+    }
+
+    if (RemixGui::CollapsingHeader("Self-Checks and Logs", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      RemixGui::Checkbox("Material Census Log", &RtxOptions::CoreMaterial::censusObject());
+      RemixGui::Checkbox("Core Material Self-Check (CPU)", &RtxOptions::CoreMaterial::selfCheckObject());
+      RemixGui::Checkbox("Core Material GPU Check", &RtxOptions::CoreMaterial::gpuCheckObject());
+      RemixGui::Separator();
+      RemixGui::DragInt("Self-Check Incremental Bookkeeping Every N Frames (0 = off)", &RtxOptions::accelIncrementalSelfCheckFramesObject(), 1.f, 0, 100000);
+      RemixGui::DragInt("Log Top N Meshes Dirtying Merged BLAS (0 = off)", &RtxOptions::accelDirtyLogTopNObject(), 1.f, 0, 256);
+      RemixGui::DragInt("API Retained: Self-Check Steady Path Every N Frames (0 = off)", &RtxOptions::retainedSteadySelfCheckFramesObject(), 1.f, 0, 100000);
+      RemixGui::DragInt("Scene: Self-Check Every N Frames (0 = off)", &scene::Options::selfCheckFramesObject(), 1.f, 0, 100000);
+      RemixGui::Checkbox("Log Sampled GPU Stage Timings (verbose)", &RtxContext::gpuStagesObject());
+      frontend_ui::drawPanels(frontend_ui::Group::SelfChecks);
+      ImGui::Unindent();
+    }
+
+    if (RemixGui::CollapsingHeader("Stress Mode", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      ImGui::TextWrapped("Random delays on the worker, command stream and scene command threads, and early slot reuse, to "
+                         "expose timing and lifetime bugs. Slows everything down. The seed is logged as [Stress].");
+      RemixGui::DragInt("Longest Delay (us, 0 = off)", &RtxStress::delayUsObject(), 10.f, 0, 100000);
+      RemixGui::DragFloat("Delay Chance", &RtxStress::delayChanceObject(), 0.01f, 0.f, 1.f);
+      RemixGui::Checkbox("Force Early Slot Reuse", &RtxStress::forceSlotReuseObject());
+      RemixGui::DragInt("Seed (0 = from the clock)", &RtxStress::seedObject(), 1.f, 0, INT32_MAX);
+      ImGui::Text("Delays injected: %llu", static_cast<unsigned long long>(stress::delaysInjected()));
+      ImGui::Unindent();
+    }
+
+    if (RemixGui::CollapsingHeader("Opacity Micromap Diagnostics", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      RemixGui::Checkbox("OMM: Log Triangle Opacity Census ([AlphaBake])", &RtxOptions::censusObject());
+      RemixGui::Checkbox("OMM: Census Counts Micro-Triangle States", &RtxOptions::censusMicroStatesObject());
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "rtx.alphaBake.censusMicroStates. Needs the census above. Adds the share of transparent / opaque / unknown\n"
+        "micro-triangles inside mixed and uniform triangles to the [AlphaBake] census lines (micromaps baked after it is set).");
+      RemixGui::Combo("OMM: Software Micromaps", &RtxOptions::softwareOmmObject(), "Off\0Only Without the Extension\0Always (No Hardware OMM)\0");
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "rtx.alphaBake.softwareOmm. Bakes opacity micromaps as usual but keeps them as shader-readable stores instead of\n"
+        "building hardware micromaps ([SoftOmm] log lines). Changing it restarts the micromap cache.");
+      RemixGui::Checkbox("OMM: Simulate a GPU Without the Extension (restart)", &RtxOptions::softwareOmmSimulateNoExtensionObject());
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "rtx.alphaBake.softwareOmmSimulateNoExtension. Read once at startup: VK_EXT_opacity_micromap is then treated as\n"
+        "unsupported (no hardware micromaps, no micromap pipeline flags).");
+      RemixGui::Checkbox("OMM: Software Micromaps in Visibility Rays", &RtxOptions::softwareOmmVisibilityObject());
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "rtx.alphaBake.softwareOmmVisibility. Shadow / NEE candidates on surfaces with software micromap data skip transparent\n"
+        "micro-triangles and commit opaque ones without the alpha test, as hardware micromaps do.");
+      RemixGui::Checkbox("OMM: Software Micromaps in Resolve Loops (skip transparent)", &RtxOptions::softwareOmmResolveSkipObject());
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "rtx.alphaBake.softwareOmmResolveSkip. Primary and PSR resolves re-trace past transparent micro-triangles\n"
+        "without the hit function, and emulate the final CULL_NON_OPAQUE iteration, as hardware micromaps do.");
+      RemixGui::Checkbox("OMM: Software Micromaps in Resolve Loops: Indirect Too", &RtxOptions::softwareOmmResolveSkipIndirectObject());
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "rtx.alphaBake.softwareOmmResolveSkipIndirect. Also skips in the indirect resolves (integration and SHaRC update /\n"
+        "query). Acts only with the option above on. Off by default because it adds GPU time in the indirect passes.");
+      RemixGui::DragInt("OMM: Software Micromaps in Traversal (pass mask)", &RtxOptions::softwareOmmTraversalObject(), 0.05f, 0, 7);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "rtx.alphaBake.softwareOmmTraversal. Bitmask: 1 = G-buffer (primary + PSR), 2 = SHaRC update, 4 = indirect integration\n"
+        "(add the bits, 7 = all). Ray query resolves only (indirect needs rtx.renderPassIntegrateIndirectRaytraceMode = Ray Query).\n"
+        "The resolve trace drops FORCE_OPAQUE and skips transparent micro-triangles inside traversal (no re-trace); everything\n"
+        "else is committed as before. Replaces the resolve-loop skip above in those passes. 0 = off.");
+      RemixGui::Checkbox("OMM: Log Software Micromap Candidate Counters ([SoftOmm])", &RtxOptions::softwareOmmCountersObject());
+      RemixGui::Checkbox("OMM: Run bary2index Self-Test", &RtxOptions::softwareOmmSelfTestObject());
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "rtx.alphaBake.softwareOmmSelfTest. Each switch to on runs the check once and logs [SoftOmm] bary2index self-test lines.");
+      RemixGui::Checkbox("OMM: Split API Point Instancers Between Scene Lanes", &scene::Options::directInstancerSplitObject());
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "rtx.scene.directInstancerSplit. The scene owns the point-instanced API submeshes of every second mesh, and the\n"
+        "rest stay on the retained path. With Detailed Performance Logging, [D3d9Alpha] pointInstancers compares both lanes.");
+      ImGui::Unindent();
+    }
+
+    if (RemixGui::CollapsingHeader("Live TLAS / Trace Readout", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      RemixGui::Checkbox("Enable Readout##livetrace", &RtxPerfLog::liveTraceReadoutObject());
+      static bool lastOn = false, lastMinimize = false, lastFastTrace = false;
+      static float lastCellSize = -1.f;
+      if (!RtxPerfLog::liveTraceReadout()) {
+        lastOn = false;
+      } else {
+        SceneManager& scene = ctx->getCommonObjects()->getSceneManager();
+        const uint32_t frameId = ctx->getDevice()->getCurrentFrameId();
+        // Restart the averages whenever the BLAS layout settings change; skip the rebuild frames.
+        static constexpr uint32_t kSettleFrames = 120;
+        const bool minimize = RtxOptions::minimizeBlasMerging();
+        const bool fastTrace = RtxOptions::preferFastTraceForStaticMergedBlas();
+        const float cellSize = RtxOptions::effectiveMergedBucketCellSize();
+        if (!lastOn || minimize != lastMinimize || fastTrace != lastFastTrace || cellSize != lastCellSize) {
+          RtxPerfLog::resetLiveTrace(frameId, kSettleFrames);
+          lastMinimize = minimize;
+          lastFastTrace = fastTrace;
+          lastCellSize = cellSize;
+        }
+        lastOn = true;
+
+        RemixGui::Checkbox("Minimize BLAS Merging##livetrace", &RtxOptions::minimizeBlasMergingObject());
+        RemixGui::DragFloat("Merged BLAS World Cell Size (0 = off)##livetrace", &RtxOptions::mergedBucketCellSizeObject(), 64.f, 0.f, 1000000.f, "%.0f");
+        RemixGui::Checkbox("Fast-Trace Flags for Static Merged BLAS##livetrace", &RtxOptions::preferFastTraceForStaticMergedBlasObject());
+        if (ImGui::Button("Reset Averages##livetrace")) {
+          RtxPerfLog::resetLiveTrace(frameId, 0);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Log Snapshot ([TlasAB])##livetrace")) {
+          RtxPerfLog::logLiveTrace(scene);
+        }
+
+        const RtxPerfLog::TlasCounts c = RtxPerfLog::gatherTlasCounts(scene);
+        ImGui::Text("TLAS instances: %u  (opaque %u, unordered %u, SSS %u, point-instancer slots %u)",
+                    c.opaque + c.unordered + c.sss + c.piSlots, c.opaque, c.unordered, c.sss, c.piSlots);
+        ImGui::Text("Merged BLAS: %u holding %u instances, %llu prims   Per-geometry BLAS: %u   TLAS: %.1f MiB",
+                    c.mergedBlas, c.mergedInstances, (unsigned long long) c.mergedPrims, c.perGeomBlas,
+                    double(c.tlasBytes) / (1024.0 * 1024.0));
+
+        const RtxPerfLog::LiveTraceSnapshot snap = RtxPerfLog::liveTraceSnapshot();
+        if (snap.samples == 0) {
+          ImGui::TextUnformatted(snap.settling ? "GPU times: waiting for BLASes to settle..." : "GPU times: no samples yet");
+        } else {
+          ImGui::Text("GPU times, average of %u samples: trace stages %.2f ms, whole sequence %.2f ms",
+                      snap.samples, snap.traceMs, snap.measuredMs);
+          for (const RtxPerfLog::LiveTraceStage& st : snap.stages) {
+            if (st.avgMs < 0.01) {
+              continue;
+            }
+            const bool highlight = st.trace || std::strcmp(st.label, "TlasBuild") == 0 || std::strcmp(st.label, "BlasBuild") == 0;
+            if (highlight) {
+              ImGui::Text("  %-32s %6.2f ms%s", st.label, st.avgMs, st.trace ? "  (trace)" : "");
+            } else {
+              ImGui::TextDisabled("  %-32s %6.2f ms", st.label, st.avgMs);
+            }
+          }
+        }
+      }
+      ImGui::Unindent();
+    }
+
+    if (RemixGui::CollapsingHeader("Experimental", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      ImGui::TextWrapped("Options that measured no gain or still wait for an A/B. They are off by default.");
+      RemixGui::DragInt("Indirect: Skip Cutouts From Bounce (-1 off)", &RtxOptions::cullNonOpaqueFromBounceObject(), 0.1f, -1, 15, "%d", sliderFlags);
+      RemixGui::Checkbox("Indirect: Skip Cutouts On Diffuse Rays", &RtxOptions::cullNonOpaqueOnDiffuseRaysObject());
+      RemixGui::Combo("Indirect: Cutout Fast-Ray Mode", &RtxOptions::fastRayModeObject(),
+        "Cull Non-Opaque (fastest, leaks)\0OMM 2-State (keeps coverage)\0");
+      RemixGui::Checkbox("Fast-Trace Flags for Static Per-Geometry BLAS", &RtxOptions::preferFastTraceForStaticBlasObject());
+      RemixGui::Checkbox("Fast-Trace Flags for Static Merged BLAS", &RtxOptions::preferFastTraceForStaticMergedBlasObject());
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "rtx.preferFastTraceForStaticMergedBlas. Applies when a merged BLAS is next built: buckets that are already built\n"
+        "keep their flags, so compare after a restart or a cell change (enter / leave a building, fast travel).");
+      ShadowRays::showImguiSettings();
+      ImGui::Unindent();
+    }
+
+    if (RemixGui::CollapsingHeader("Remix API Recording", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      ApiRecorder::showImguiSettings();
+      ImGui::Unindent();
+    }
+  }
+
+  void ImGUI::showSccrSettings(DxvkObjects* common) {
+    const bool sccrShellOn = SccrShellManager::enable();
+    ImGui::Separator();
+    ImGui::TextWrapped("SCCR: cone-stepped relief from the height maps. Shell tracing keeps deep relief on the mesh instead of sliding.");
+
+    // The quality levels write the march budgets under Advanced. Editing one there shows Custom.
+    static const char* const kSccrQualityNames[] = { "High", "Medium", "Low" };
+    const SccrShellManager::Quality currentQuality = SccrShellManager::qualityLevel();
+    const int currentLevel = static_cast<int>(currentQuality);
+    if (ImGui::BeginCombo("SCCR Quality", currentQuality == SccrShellManager::Quality::Custom ? "Custom" : kSccrQualityNames[currentLevel])) {
+      for (int level = 0; level < int(std::size(kSccrQualityNames)); ++level) {
+        if (ImGui::Selectable(kSccrQualityNames[level], level == currentLevel)) {
+          SccrShellManager::setQualityLevel(static_cast<SccrShellManager::Quality>(level));
+        }
+      }
+      ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("High is the default. Medium and Low take fewer march steps and hand off to plain SCCR sooner,\n"
+                        "for slower GPUs. The graphics presets set this too. Changing a march setting under Advanced shows Custom.");
+    }
+
+    RemixGui::Checkbox("SCCR Shell Tracing", &SccrShellManager::enableObject());
+
+    const PomConeMapManager::Progress coneProgress = common->metaPomConeMaps().progress();
+    ImGui::Text("Cone maps ready: %u of %u", coneProgress.fullMaps, coneProgress.liveMaps);
+    if (sccrShellOn) {
+      const SccrShellManager::Stats shellStats = common->metaSccrShell().stats();
+      ImGui::Text("Shell tracing on %u of %u displaced surfaces", shellStats.boundSurfaces, shellStats.eligibleSurfaces);
+      if (RtxOptions::Displacement::referenceWorldUnitsPerUv() <= 0.0f) {
+        ImGui::TextWrapped("Shell tracing needs Reference World Units per UV above 0 (Advanced, Depth).");
+      }
+    }
+
+    if (!RemixGui::CollapsingHeader("SCCR Advanced", collapsingHeaderClosedFlags)) {
+      return;
+    }
+    ImGui::Indent();
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Relief march");
+    RemixGui::DragInt("Cone Steps", &RtxOptions::Displacement::coneStepsObject(), 1.f, 1, 64, "%d", sliderFlags);
+    RemixGui::DragInt("Binary Steps", &RtxOptions::Displacement::binaryStepsObject(), 1.f, 0, 16, "%d", sliderFlags);
+    RemixGui::DragInt("Shadow Cone Steps", &RtxOptions::Displacement::coneShadowStepsObject(), 1.f, 1, 64, "%d", sliderFlags);
+    RemixGui::DragInt("Indirect Shadow Steps (0 = full)", &RtxOptions::Displacement::indirectShadowStepsObject(), 1.f, 0, 16, "%d", sliderFlags);
+    RemixGui::DragFloat("Indirect Shadow Footprint Scale", &RtxOptions::Displacement::indirectShadowFootprintScaleObject(), 0.05f, 0.0f, 8.0f, "%.2f", sliderFlags);
+    RemixGui::Checkbox("Step LOD", &RtxOptions::Displacement::enableStepLodObject());
+    RemixGui::DragFloat("Step LOD Scale", &RtxOptions::Displacement::stepLodScaleObject(), 0.05f, 0.25f, 8.0f, "%.2f", sliderFlags);
+    RemixGui::Checkbox("Curvature Correction", &RtxOptions::Displacement::enableCurvatureCorrectionObject());
+    RemixGui::DragFloat("Curvature Scale", &RtxOptions::Displacement::curvatureScaleObject(), 0.01f, 0.0f, 2.0f, "%.2f", sliderFlags);
+    RemixGui::Checkbox("Stable Triangle Frame", &RtxOptions::Displacement::enableStableFrameObject());
+    RemixGui::Checkbox("Depth Offset (depth and motion at the relief)", &RtxOptions::Displacement::enableDepthOffsetObject());
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Depth");
+    // Shell tracing forces world-unit depth on and the zero plane off (rtx_context.cpp).
+    ImGui::BeginDisabled(sccrShellOn);
+    RemixGui::Checkbox("World-Unit Depth", &RtxOptions::Displacement::enableWorldUnitDepthObject());
+    ImGui::EndDisabled();
+    RemixGui::DragFloat("Reference World Units per UV", &RtxOptions::Displacement::referenceWorldUnitsPerUvObject(), 1.0f, 1.0f, 100000.0f, "%.1f", sliderFlags);
+    RemixGui::DragFloat("Max World Depth Scale", &RtxOptions::Displacement::maxWorldUnitDepthScaleObject(), 0.05f, 1.0f, 16.0f, "%.2f", sliderFlags);
+    ImGui::BeginDisabled(sccrShellOn);
+    RemixGui::DragFloat("Zero Plane (-1 = as authored)", &RtxOptions::Displacement::zeroPlaneObject(), 0.01f, -1.0f, 1.0f, "%.2f", sliderFlags);
+    ImGui::EndDisabled();
+    if (sccrShellOn) {
+      ImGui::TextWrapped("Shell tracing is on: world-unit depth is always on and the zero plane is ignored (the mesh is the top of the relief, which only goes inwards).");
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Cone maps");
+    ImGui::TextWrapped("Until a map's cones are ready, SCCR marches in linear steps of 1/N like Raymarched POM (N set by Max Iterations).");
+    RemixGui::Combo("Cone Quality", &PomConeMapManager::qualityObject(), "Full (generated cones)\0Coarse only (comparison)\0");
+    const bool coarseOnlyCones = PomConeMapManager::quality() == PomConeMapManager::ConeQuality::CoarseOnly;
+    ImGui::Text("Cone maps: %u full, %u coarse, %u linear (of %u)", coneProgress.fullMaps, coneProgress.coarseMaps,
+                coneProgress.liveMaps - coneProgress.fullMaps - coneProgress.coarseMaps, coneProgress.liveMaps);
+    ImGui::Text("Queue: %u maps, %llu tiles to generate, %zu MB", coneProgress.pendingMaps,
+                static_cast<unsigned long long>(coneProgress.tilesRemaining),
+                (coneProgress.derivedBytes + (size_t(1) << 19)) >> 20);
+    // A request to the manager, not an option write (see PomConeMapManager::bakeNow). Nothing generates in coarse-only
+    // quality.
+    ImGui::BeginDisabled(coarseOnlyCones);
+    if (ImGui::Button("Bake now")) {
+      common->metaPomConeMaps().requestBake();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextUnformatted(coarseOnlyCones ? "Generation paused: coarse-only cone quality." :
+                           common->metaPomConeMaps().baking() ? "Baking: generation budget lifted until the queue is empty." :
+                           "Generates every queued cone map at a higher budget.");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Shell tracing");
+    ImGui::BeginDisabled(!sccrShellOn);
+    RemixGui::DragFloat("Shell Hand-off Distance", &SccrShellManager::maxDistanceObject(), 10.0f, 0.0f, 100000.0f, "%.0f", sliderFlags);
+    RemixGui::DragInt("Shell Max Prisms Crossed", &SccrShellManager::maxPrismsObject(), 1.f, 0, 64, "%d", sliderFlags);
+    RemixGui::DragInt("Shell Max Steps", &SccrShellManager::maxStepsObject(), 1.f, 1, 1024, "%d", sliderFlags);
+    RemixGui::Checkbox("Shell Fold Guard", &SccrShellManager::foldGuardObject());
+    RemixGui::Checkbox("Shell Self-Shadows (march through the prisms)", &SccrShellManager::shadowsObject());
+    ImGui::BeginDisabled(!SccrShellManager::shadows());
+    RemixGui::DragInt("Shell Max Shadow Prisms", &SccrShellManager::maxShadowPrismsObject(), 1.f, 0, 255, "%d", sliderFlags);
+    ImGui::EndDisabled();
+    RemixGui::DragFloat("Shell Weld Tolerance (of mesh size)", &SccrShellManager::weldEpsilonObject(), 0.000001f, 0.0f, 0.01f, "%.6f", sliderFlags);
+    RemixGui::DragInt("Shell Memory Cap (MB)", &SccrShellManager::maxMBObject(), 1.f, 1, 4096, "%d", sliderFlags);
+    RemixGui::DragInt("Shell Triangles Built per Frame", &SccrShellManager::buildTrianglesPerFrameObject(), 1000.f, 1000, 10000000, "%d", sliderFlags);
+    ImGui::EndDisabled();
+    if (sccrShellOn) {
+      const SccrShellManager::Stats shellStats = common->metaSccrShell().stats();
+      ImGui::Text("%u meshes, %u buffers, %.1f of %u MB; %u waiting (%u over the cap), %u dynamic surfaces",
+                  shellStats.boundMeshes, shellStats.cachedBuffers, double(shellStats.bytes) / double(1 << 20),
+                  SccrShellManager::maxMB(), shellStats.pendingBuilds, shellStats.overBudgetBuilds, shellStats.dynamicSurfaces);
+    }
+
+    ImGui::Unindent();
+  }
+
   void ImGUI::showRenderingSettings(const Rc<DxvkContext>& ctx) {
     ImGui::PushItemWidth(largeUiMode() ? m_largeWindowWidgetWidth : m_regularWindowWidgetWidth);
     auto common = ctx->getCommonObjects();
@@ -3530,7 +4404,7 @@ namespace dxvk {
         RemixGui::Separator();
       }
 
-      // NV-DXVK start: fork frame-generation panel (DLSS-G / FSR-FG selector)
+      // NV-DXVK start: frame-generation panel (DLSS-G / FSR-FG selector)
       fork_hooks::showFrameGenerationOptions(ctx,
         ctx->getCommonObjects()->metaNGXContext().supportsDLFG() &&
         !ctx->getCommonObjects()->metaDLFG().hasDLFGFailed());
@@ -3567,6 +4441,7 @@ namespace dxvk {
         dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());
         rayReconstruction.showRayReconstructionImguiSettings(false);
       } else if (RtxOptions::upscalerType() == UpscalerType::DLSS) {
+        dlssRenderPresetCombo.getKey(&DxvkDLSS::presetObject());
         dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());
         dlss.showImguiSettings();
       } else if (RtxOptions::upscalerType() == UpscalerType::NIS) {
@@ -3599,6 +4474,24 @@ namespace dxvk {
       RemixGui::Separator();
 
       RemixGui::Checkbox("Allow Full Screen Exclusive?", &RtxOptions::allowFSEObject());
+      RemixGui::Checkbox("Show DXVK HUD (Alt+H)", &RtxOptions::showDxvkHudObject());
+
+      // Deliberately not gated on a support query. The driver-core capability parameters are
+      // exactly what is missing on the machines the snippet backend exists to serve, so hiding
+      // the section behind them would hide the fix along with the problem; the panel reports
+      // availability in its own status line instead.
+      {
+        auto& neuralUplift = common->metaNeuralUplift();
+        RemixGui::Separator();
+
+        if (RemixGui::CollapsingHeader("DLSS 3D-Guided Neural Generation [Experimental]", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
+          ImGui::PushID("DLSS 3D-Guided Neural Generation");
+          neuralUplift.showImguiSettings(true);
+          ImGui::PopID();
+          ImGui::Unindent();
+        }
+      }
 
       ImGui::Unindent();
     }
@@ -3615,6 +4508,7 @@ namespace dxvk {
         RemixGui::DragInt("Max Primary Interactions", &RtxOptions::primaryRayMaxInteractionsObject(), 1.0f, 1, 255, "%d", sliderFlags);
         RemixGui::DragInt("Max PSR Interactions", &RtxOptions::psrRayMaxInteractionsObject(), 1.0f, 1, 255, "%d", sliderFlags);
         RemixGui::DragInt("Max Secondary Interactions", &RtxOptions::secondaryRayMaxInteractionsObject(), 1.0f, 1, 255, "%d", sliderFlags);
+        RemixGui::Checkbox("Last Interaction Skips Cutouts", &RtxOptions::resolveFinalInteractionSkipsNonOpaqueObject());
         RemixGui::Checkbox("Separate Unordered Approximations", &RtxOptions::enableSeparateUnorderedApproximationsObject());
         RemixGui::Checkbox("Direct Translucent Shadows", &RtxOptions::enableDirectTranslucentShadowsObject());
         RemixGui::Checkbox("Direct Alpha Blended Shadows", &RtxOptions::enableDirectAlphaBlendShadowsObject());
@@ -3644,6 +4538,8 @@ namespace dxvk {
         // Note: value of 255 effectively means unlimited bounces, and we don't want to allow that
         RemixGui::DragInt("Max Reflection PSR Bounces", &RtxOptions::psrrMaxBouncesObject(), 1.0f, 1, 254, "%d", sliderFlags);
         RemixGui::DragInt("Max Transmission PSR Bounces", &RtxOptions::pstrMaxBouncesObject(), 1.0f, 1, 254, "%d", sliderFlags);
+        // Skip PSR on far primary hits (distant water planes).
+        RemixGui::DragFloat("PSR Max Distance (m, 0 off)", &RtxOptions::psrMaxDistanceMetersObject(), 1.0f, 0.0f, 100000.0f, "%.0f");
         RemixGui::Checkbox("Outgoing Transmission Approx Enabled", &RtxOptions::enablePSTROutgoingSplitApproximationObject());
         RemixGui::Checkbox("Incident Transmission Approx Enabled", &RtxOptions::enablePSTRSecondaryIncidentSplitApproximationObject());
         RemixGui::DragFloat("Reflection PSR Normal Detail Threshold", &RtxOptions::psrrNormalDetailThresholdObject(), 0.001f, 0.f, 1.f);
@@ -3729,6 +4625,8 @@ namespace dxvk {
 
           if (RtxOptions::renderPassIntegrateIndirectRaytraceMode() == DxvkPathtracerIntegrateIndirect::RaytraceMode::TraceRay)
             RemixGui::Checkbox("Enable In Integrate Indirect Pass", &RtxOptions::enableShaderExecutionReorderingInPathtracerIntegrateIndirectObject());
+            // Surface/material coherence hint for the indirect reorder (0 = off).
+            RemixGui::DragInt("Indirect Surface Hint Bits (0 off)", &RtxOptions::serSurfaceCoherenceHintBitsObject(), 0.1f, 0, 14, "%d", ImGuiSliderFlags_AlwaysClamp);
 
           ImGui::Unindent();
         }
@@ -3774,6 +4672,8 @@ namespace dxvk {
         ImGui::Unindent();
       }
 
+      common->getSceneManager().getLightManager().getLightBvh().showImguiSettings();
+
       // Indirect Illumination Integration Mode
       if (RemixGui::CollapsingHeader("Indirect Illumination", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
@@ -3795,6 +4695,14 @@ namespace dxvk {
             ImGui::PushID("Neural Radiance Cache");
             NeuralRadianceCache& nrc = common->metaNeuralRadianceCache();
             nrc.showImguiSettings(*ctx);
+            ImGui::PopID();
+            ImGui::Unindent();
+          }
+        } else if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::Sharc) {
+          if (RemixGui::CollapsingHeader("SHARC", collapsingHeaderClosedFlags)) {
+            ImGui::Indent();
+            ImGui::PushID("SHARC");
+            common->metaSharc().showImguiSettings();
             ImGui::PopID();
             ImGui::Unindent();
           }
@@ -3828,11 +4736,7 @@ namespace dxvk {
     if (RemixGui::CollapsingHeader("RTX Volumetrics (Global)", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
 
-      // NV-DXVK start: Numos weather-aware volumetrics UI
-      const WeatherBlender* weatherBlender = common->getSceneManager().getWeatherBlender();
-      common->metaGlobalVolumetrics().showImguiSettings(
-        weatherBlender ? weatherBlender->getBlendedSnapshot() : nullptr);
-      // NV-DXVK end
+      common->metaGlobalVolumetrics().showImguiSettings();
 
       common->metaDustParticles().showImguiSettings();
 
@@ -3849,6 +4753,7 @@ namespace dxvk {
 
       if (RtxOptions::SubsurfaceScattering::enableDiffusionProfile()) {
         RemixGui::SliderFloat("SSS Scale", &RtxOptions::SubsurfaceScattering::diffusionProfileScaleObject(), 0.0f, 100.0f);
+        RemixGui::Checkbox("Transmittance Texture Follows Albedo (sRGB + Tint)", &RtxOptions::SubsurfaceScattering::transmittanceFollowsAlbedoObject());
 
         RemixGui::Checkbox("Enable SSS Transmission", &RtxOptions::SubsurfaceScattering::enableTransmissionObject());
         if (RtxOptions::SubsurfaceScattering::enableTransmission()) {
@@ -3875,6 +4780,7 @@ namespace dxvk {
 
       RemixGui::Checkbox("Emissive Blend Override", &RtxOptions::enableEmissiveBlendEmissiveOverrideObject());
       RemixGui::DragFloat("Emissive Blend Override Intensity", &RtxOptions::emissiveBlendOverrideEmissiveIntensityObject(), 0.001f, 0.0f, FLT_MAX, "%.3f", sliderFlags);
+      RemixGui::Checkbox("Emissive Blend Override: Scale by Material", &RtxOptions::emissiveBlendOverrideScaleByMaterialObject());
 
       RemixGui::Separator();
       RemixGui::SliderFloat("Particle Softness", &RtxOptions::particleSoftnessFactorObject(), 0.f, 0.5f);
@@ -3892,7 +4798,7 @@ namespace dxvk {
 
     if (RemixGui::CollapsingHeader("Denoising", collapsingHeaderClosedFlags)) {
       bool isRayReconstructionEnabled = RtxOptions::isRayReconstructionEnabled();
-      bool useNRD = !isRayReconstructionEnabled || common->metaRayReconstruction().enableNRDForTraining();
+      const bool useNRD = !isRayReconstructionEnabled;
       ImGui::Indent();
       ImGui::BeginDisabled(!useNRD);
       RemixGui::Checkbox("Denoising Enabled", &RtxOptions::useDenoiserObject());
@@ -3964,17 +4870,6 @@ namespace dxvk {
         }
       }
 
-      // Show secondary denoiser settings when RR is enabled and secondary signal uses external denoiser
-      if (!useNRD && isRayReconstructionEnabled && common->metaRayReconstruction().denoiseSecondarySignalWithExternalDenoiser()) {
-        if (RemixGui::CollapsingHeader("Secondary Direct/Indirect Light Denoiser", collapsingHeaderClosedFlags)) {
-          ImGui::Indent();
-          ImGui::PushID("Secondary Direct/Indirect Light Denoiser");
-          common->metaSecondaryCombinedLightDenoiser().showImguiSettings();
-          ImGui::PopID();
-          ImGui::Unindent();
-        }
-      }
-
       ImGui::Unindent();
     }
 
@@ -3989,24 +4884,7 @@ namespace dxvk {
           common->metaTAA().showImguiSettings();
       }
 
-      if (RemixGui::CollapsingHeader("Bloom", collapsingHeaderClosedFlags))
-        common->metaBloom().showImguiSettings();
-
-      if (RemixGui::CollapsingHeader("Auto Exposure", collapsingHeaderClosedFlags))
-        common->metaAutoExposure().showImguiSettings();
-
-      if (RemixGui::CollapsingHeader("Tonemapping", collapsingHeaderClosedFlags))
-      {
-        RemixGui::Separator();
-        common->metaToneMapping().showImguiSettings();
-        RemixGui::Separator();
-      }
-
-      if (RemixGui::CollapsingHeader("Post FX", collapsingHeaderClosedFlags))
-        common->metaPostFx().showImguiSettings();
-
-      if (RemixGui::CollapsingHeader("sRGB + Dither", collapsingHeaderClosedFlags))
-        common->metaSRGBDither().showImguiSettings();
+      fork_hooks::showPostProcessingStackSettings(ctx);
 
       ImGui::Unindent();
     }
@@ -4027,6 +4905,31 @@ namespace dxvk {
       RemixGui::DragInt("Max Prims in Merged BLAS", &RtxOptions::maxPrimsInMergedBLASObject(), 1.f, 100, 0);
       RemixGui::Checkbox("Force Merge All Meshes", &RtxOptions::forceMergeAllMeshesObject());
       RemixGui::Checkbox("Minimize BLAS Merging", &RtxOptions::minimizeBlasMergingObject());
+      if (RemixGui::CollapsingHeader("Acceleration Structure Tuning", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+        RemixGui::DragInt("Share Small BLAS at N Instances (0 = off)", &RtxOptions::minInstancesToShareSmallBlasObject(), 1.f, 0, 4096);
+        RemixGui::DragInt("BLAS Build Scratch Budget (MB, 0 = unlimited)", &RtxOptions::maxBlasBuildScratchMBObject(), 1.f, 0, 16384);
+        RemixGui::DragInt("Min Frames Between OMM Rebinds (0 = next frame)", &RtxOptions::ommRebindIntervalFramesObject(), 1.f, 0, 600);
+        RemixGui::DragInt("Own BLAS for Moved Geometry, Frames (0 = off)", &RtxOptions::ownBlasForMovedInstancesFramesObject(), 1.f, 0, 100000);
+        RemixGui::DragInt("Own BLAS for Hidden/Shown Geometry, Frames (0 = off)", &RtxOptions::ownBlasForToggledInstancesFramesObject(), 1.f, 0, 100000);
+        RemixGui::DragInt("Own BLAS for Chronically Dirty Geometry After N Frames (0 = off)", &RtxOptions::ownBlasForChronicallyDirtyFramesObject(), 1.f, 0, 1000);
+        RemixGui::DragInt("Chronically Dirty Geometry: Keep Own BLAS for N Frames", &RtxOptions::ownBlasChronicallyDirtyHoldFramesObject(), 1.f, 1, 100000);
+        RemixGui::DragInt("Max Prims per Merged BLAS Bucket (0 = unlimited)", &RtxOptions::maxPrimsPerMergedBucketObject(), 1024.f, 0, 16777216);
+        RemixGui::DragFloat("Merged BLAS World Cell Size (0 = off)", &RtxOptions::mergedBucketCellSizeObject(), 64.f, 0.f, 1000000.f, "%.0f");
+        RemixGui::Checkbox("Auto Cell Size from Scene Scale (when size is 0)", &RtxOptions::autoCellSizeObject());
+        ImGui::TextDisabled("Effective cell size: %.1f", RtxOptions::effectiveMergedBucketCellSize());
+        RemixGui::DragInt("Static Clusters: Young Instance Frames", &RtxOptions::clusterYoungFramesObject(), 1.f, 0, 1000);
+        RemixGui::DragInt("Static Clusters: Young Folds per Frame", &RtxOptions::clusterFoldsPerFrameObject(), 0.1f, 1, 64);
+        RemixGui::Checkbox("Compact Stable BLAS", &RtxOptions::compactStableBlasObject());
+        RemixGui::DragInt("Compact BLAS Unchanged for N Frames", &RtxOptions::compactStableBlasFramesObject(), 1.f, 1, 100000);
+        RemixGui::DragInt("Rebuild BLAS After N Refits (0 = never)", &RtxOptions::maxBlasRefitsBeforeRebuildObject(), 1.f, 0, 100000);
+        RemixGui::DragInt("Frames to Keep Instances", &RtxOptions::numFramesToKeepInstancesObject(), 1.f, 1, 10000);
+        RemixGui::DragInt("Frames to Keep BLAS / Geometry", &RtxOptions::numFramesToKeepBLASObject(), 1.f, 1, 10000);
+        RemixGui::DragInt("Frames to Keep Pooled BLAS (0 = as above)", &RtxOptions::numFramesToKeepMergedBlasObject(), 1.f, 0, 10000);
+        RemixGui::Combo("API Retained: Hidden Instances", &RtxOptions::retainedHiddenPolicyObject(),
+          "Release (age out)\0Keep ray traced\0Keep resident, not ray traced\0");
+        ImGui::Unindent();
+      }
       RemixGui::Separator();
       RemixGui::Checkbox("Portals: Virtual Instance Matching", &RtxOptions::useRayPortalVirtualInstanceMatchingObject());
       RemixGui::Checkbox("Portals: Fade In Effect", &RtxOptions::enablePortalFadeInEffectObject());
@@ -4047,6 +4950,65 @@ namespace dxvk {
       RemixGui::Separator();
       RemixGui::Checkbox("Terminator Transition Softening", &RtxOptions::ShadowTerminator::softenObject());
 
+      ImGui::Unindent();
+    }
+
+    if (RemixGui::CollapsingHeader("Host Integration (API)", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      RemixGui::DragInt("Max Imported Texture Dimension (0 = host cap only)", &RtxOptions::HostImport::maxCopiedTextureDimensionObject(), 16.f, 0, 16384);
+      ImGui::TextWrapped("This applies to textures imported after the change.");
+      RemixGui::Checkbox("Device-Local Static Meshes, No Second Copy (new meshes)", &RtxOptions::HostImport::deviceLocalStaticMeshesObject());
+      ImGui::Unindent();
+    }
+
+    if (RemixGui::CollapsingHeader("VRAM Budget", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      {
+        static const char* kLevelNames[] = { "none", "elevated", "high", "critical" };
+        const vram_budget::HostInfo info = vram_budget::hostInfo();
+        const vram_budget::FreedTotals freed = vram_budget::freedTotals();
+        const double pct = info.budgetBytes ? 100.0 * double(info.usageBytes) / double(info.budgetBytes) : 0.0;
+        const uint32_t level = vram_budget::level();
+        ImGui::Text("Level: %u (%s)%s", level, kLevelNames[std::min(level, 3u)],
+                    info.requestHostRelease ? ", host asked to release" : "");
+        ImGui::Text("Demand (driver usage minus free space inside chunks): %llu / %llu MiB (%.1f%%), to release %llu MiB",
+                    (unsigned long long) (info.usageBytes >> 20), (unsigned long long) (info.budgetBytes >> 20), pct,
+                    (unsigned long long) (info.bytesToRelease >> 20));
+        ImGui::Text("Freed so far: pooled BLAS %llu MiB, scratch %llu MiB, empty chunks %llu MiB, import mips ~%llu MiB (%u level changes)",
+                    (unsigned long long) (freed.pooledBlas >> 20), (unsigned long long) (freed.scratch >> 20),
+                    (unsigned long long) (freed.emptyChunks >> 20), (unsigned long long) (freed.importCapSkipped >> 20), freed.levelChanges);
+      }
+      RemixGui::Checkbox("Enable VRAM Budget", &VramBudget::enableObject());
+      if (ImGui::TreeNode("Advanced##vrambudget")) {
+        ImGui::BeginDisabled(!VramBudget::enable());
+        RemixGui::DragFloat("Elevated at % of Budget", &VramBudget::elevatedPercentObject(), 0.1f, 50.f, 120.f, "%.1f");
+        RemixGui::DragFloat("High at % of Budget", &VramBudget::highPercentObject(), 0.1f, 50.f, 120.f, "%.1f");
+        RemixGui::DragFloat("Critical at % of Budget", &VramBudget::criticalPercentObject(), 0.1f, 50.f, 120.f, "%.1f");
+        RemixGui::DragFloat("Hysteresis (%)", &VramBudget::hysteresisPercentObject(), 0.1f, 0.f, 20.f, "%.1f");
+        RemixGui::DragInt("Frames Below Before Relaxing", &VramBudget::relaxFramesObject(), 1.f, 1, 100000);
+        RemixGui::DragInt("Frames Between Escalations", &VramBudget::escalateFramesObject(), 1.f, 0, 10000);
+        RemixGui::DragInt("Max Level", &VramBudget::maxLevelObject(), 0.05f, 0, 3);
+        RemixGui::DragInt("Budget Override MiB (0 = driver)", &VramBudget::budgetOverrideMBObject(), 16.f, 0, 262144);
+        RemixGui::DragFloat("Drain Memory Kinds With Free Space Above (%)", &VramBudget::slackPercentObject(), 0.5f, 1.f, 100.f, "%.0f");
+        RemixGui::Checkbox("Drain Sparse Memory Chunks", &VramBudget::drainSparseChunksObject());
+        RemixGui::DragInt("Released Import Copy Size (px, 0 = keep game image)", &VramBudget::releasedImportMaxSizeObject(), 16.f, 0, 16384);
+        RemixGui::DragFloat("Drain Chunks Used Below (%)", &VramBudget::drainOccupancyPercentObject(), 0.5f, 1.f, 100.f, "%.0f");
+        RemixGui::DragInt("Log Interval Frames (0 = changes only)", &VramBudget::logIntervalFramesObject(), 1.f, 0, 100000);
+        RemixGui::Separator();
+        RemixGui::Checkbox("L1: Free Idle Pooled BLAS and Scratch", &VramBudget::freeIdleAccelMemoryObject());
+        RemixGui::Checkbox("L1: Release Empty Allocator Chunks", &VramBudget::releaseEmptyChunksObject());
+        RemixGui::Checkbox("L1: Shrink OMM Cache (x0.5, L2 x0.25)", &VramBudget::shrinkOmmCacheObject());
+        RemixGui::Checkbox("L1: Shrink Replacement Texture Budget (x0.75, L2 x0.5)", &VramBudget::shrinkReplacementTextureBudgetObject());
+        RemixGui::Checkbox("L1: Force BLAS Compaction", &VramBudget::forceBlasCompactionObject());
+        RemixGui::Checkbox("L2: Cap New Host-Import Copies", &VramBudget::capHostImportCopiesObject());
+        RemixGui::DragInt("L2 Import Cap (px)", &VramBudget::highImportCapObject(), 16.f, 0, 16384);
+        RemixGui::DragInt("L3 Import Cap (px)", &VramBudget::criticalImportCapObject(), 16.f, 0, 16384);
+        RemixGui::Checkbox("Ask Host to Release Far Content", &VramBudget::signalHostObject());
+        RemixGui::DragInt("Host Release From Level", &VramBudget::hostSignalLevelObject(), 0.05f, 1, 3);
+        ImGui::EndDisabled();
+        RemixGui::Checkbox("Release Empty Chunks Even Without Pressure (measure slack)", &VramBudget::releaseEmptyChunksAlwaysObject());
+        ImGui::TreePop();
+      }
       ImGui::Unindent();
     }
 
@@ -4196,7 +5158,7 @@ namespace dxvk {
     if (RemixGui::CollapsingHeader("Displacement [Experimental]", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
       ImGui::TextWrapped("Warning: This is currently implemented using POM with a simple height map, displacing inwards.  The implementation may change in the future, which could include changes to the texture format or displacing outwards.\nRaymarched POM will use a simple raymarch algorithm, and will show artifacts on thin features and at oblique angles.\nQuadtree POM depends on custom mipmaps with maximums instead of averages, which can be generated using `generate_max_mip.py`.");
-      RemixGui::Combo("Mode", &RtxOptions::Displacement::modeObject(), "Off\0Raymarched POM\0Quadtree POM\0");
+      RemixGui::Combo("Mode", &RtxOptions::Displacement::modeObject(), "Off\0Raymarched POM\0Quadtree POM\0SCCR (Silhouette Curvature-Corrected Cone Relief)\0");
       RemixGui::Checkbox("Enable Direct Lighting", &RtxOptions::Displacement::enableDirectLightingObject());
       RemixGui::Checkbox("Enable Indirect Lighting", &RtxOptions::Displacement::enableIndirectLightingObject());
       RemixGui::Checkbox("Enable Indirect Hit", &RtxOptions::Displacement::enableIndirectHitObject());
@@ -4207,6 +5169,24 @@ namespace dxvk {
       RemixGui::DragFloat("Displacement In Factor", &RtxOptions::Displacement::displacementInFactorObject(), 0.01f, 0.0f, 20.0f);
       RemixGui::DragFloat("Displacement Out Factor", &RtxOptions::Displacement::displacementOutFactorObject(), 0.01f, 0.0f, 20.0f);
       RemixGui::DragInt("Max Iterations", &RtxOptions::Displacement::maxIterationsObject(), 1.f, 1, 256, "%d", sliderFlags);
+      if (RtxOptions::Displacement::mode() == DisplacementMode::SCCR) {
+        showSccrSettings(common);
+      }
+      ImGui::Unindent();
+    }
+
+    // After Mochabeanproto/dxvk-remix legacyrt ef6f42f, used with permission.
+    if (RemixGui::CollapsingHeader("Underwater", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      ImGui::TextWrapped("Underwater look on surfaces seen through a medium (under the water surface, or with the camera underwater): sun absorption, procedural caustics and depth murk. A stand-in for real refractive caustics. The host sets the surface height.");
+      RemixGui::Checkbox("Enable", &RtxOptions::Underwater::enableObject());
+      RemixGui::DragFloat("Surface Height (world units)", &RtxOptions::Underwater::surfaceHeightObject(), 1.0f, -1.0e6f, 1.0e6f);
+      RemixGui::DragFloat("Units Per Metre (0 = atmosphere's)", &RtxOptions::Underwater::unitsPerMeterObject(), 0.5f, 0.0f, 1000.0f);
+      RemixGui::DragFloat("Sun Scale (underwater dimming)", &RtxOptions::Underwater::sunScaleObject(), 0.01f, 0.0f, 2.0f);
+      RemixGui::DragFloat("Caustic Scale (per metre, higher = finer)", &RtxOptions::Underwater::causticScaleObject(), 0.01f, 0.0f, 10.0f);
+      RemixGui::DragFloat("Caustic Strength", &RtxOptions::Underwater::causticStrengthObject(), 0.01f, 0.0f, 10.0f);
+      RemixGui::DragFloat("Caustic Speed", &RtxOptions::Underwater::causticSpeedObject(), 0.01f, 0.0f, 10.0f);
+      RemixGui::DragFloat3("Murk Absorption R,G,B per metre", &RtxOptions::Underwater::murkAbsorptionObject(), 0.02f, 0.0f, 10.0f, "%.3f", sliderFlags);
       ImGui::Unindent();
     }
 
@@ -4257,12 +5237,13 @@ namespace dxvk {
       ImGui::Unindent();
     }
 
-    if (!RtCamera::enableFreeCamera() &&
-        RemixGui::CollapsingHeader("Anti-Culling", collapsingHeaderClosedFlags)) {
+    if (RemixGui::CollapsingHeader("Anti-Culling", collapsingHeaderClosedFlags)) {
 
       ImGui::Indent();
 
-      if (ctx->getCommonObjects()->getSceneManager().isAntiCullingSupported()) {
+      if (RtCamera::enableFreeCamera()) {
+        ImGui::TextUnformatted("Off while the free camera is on.");
+      } else if (ctx->getCommonObjects()->getSceneManager().isAntiCullingSupported()) {
         RemixGui::Checkbox("Anti-Culling Objects", &RtxOptions::AntiCulling::Object::enableObject());
         if (RtxOptions::AntiCulling::Object::enable()) {
           RemixGui::Checkbox("High precision Anti-Culling", &RtxOptions::AntiCulling::Object::enableHighPrecisionAntiCullingObject());
@@ -4345,7 +5326,7 @@ namespace dxvk {
     ImGuiIO& io = ImGui::GetIO();
     ImGui_ImplDxvk::Data* bd = (ImGui_ImplDxvk::Data*)io.BackendRendererUserData;
     
-    // Range of characters we want to use the primary font
+    // Letters and symbols use Inter; digits use Roboto Mono so numbers keep a fixed width.
     ImVector<ImWchar> characterRange;
     {
       ImFontGlyphRangesBuilder builder;
@@ -4353,7 +5334,6 @@ namespace dxvk {
       builder.BuildRanges(&characterRange);
     }
 
-    // Range of characters we want to use the second (monospaced) font for
     ImVector<ImWchar> numericalRange;
     {
       ImFontGlyphRangesBuilder builder;
@@ -4361,7 +5341,6 @@ namespace dxvk {
       builder.BuildRanges(&numericalRange);
     }
 
-    // Build a second font, where all characters are consistent.  This will be used for non-field/title text
     ImVector<ImWchar> allRange;
     {
       ImFontGlyphRangesBuilder builder;
@@ -4369,29 +5348,22 @@ namespace dxvk {
       builder.BuildRanges(&allRange);
     }
 
+    const size_t interMdLength = sizeof(___InterMd) / sizeof(___InterMd[0]);
+    const size_t interBdLength = sizeof(___InterBd) / sizeof(___InterBd[0]);
+    const size_t robotoMonoLength = sizeof(___RobotoMonoRg) / sizeof(___RobotoMonoRg[0]);
+
     // Normal Size Font (Default)
 
     ImFontConfig normalFontCfg = ImFontConfig();
     normalFontCfg.SizePixels = 16.f;
     normalFontCfg.FontDataOwnedByAtlas = false;
 
-    const size_t nvidiaSansLength = sizeof(___NVIDIASansMd) / sizeof(___NVIDIASansMd[0]);
-    const size_t nvidiaSansBdLength = sizeof(___NVIDIASansBd) / sizeof(___NVIDIASansBd[0]);
-    const size_t robotoMonoLength = sizeof(___RobotoMonoRg) / sizeof(___RobotoMonoRg[0]);
+    m_regularFont = io.Fonts->AddFontFromMemoryTTF(&___InterMd[0], interMdLength, 0, &normalFontCfg, characterRange.Data);
+    normalFontCfg.MergeMode = true;
+    io.Fonts->AddFontFromMemoryTTF(&___RobotoMonoRg[0], robotoMonoLength, 0, &normalFontCfg, numericalRange.Data);
+    normalFontCfg.MergeMode = false;
 
-    {
-      // Add letters/symbols (NVIDIA-Sans)
-      m_regularFont = io.Fonts->AddFontFromMemoryTTF(&___NVIDIASansMd[0], nvidiaSansLength, 0, &normalFontCfg, characterRange.Data);
-
-      // Enable merging
-      normalFontCfg.MergeMode = true;
-
-      // Add numbers (Roboto-Mono)
-      io.Fonts->AddFontFromMemoryTTF(&___RobotoMonoRg[0], robotoMonoLength, 0, &normalFontCfg, numericalRange.Data);
-
-      normalFontCfg.MergeMode = false;
-      m_boldFont = io.Fonts->AddFontFromMemoryTTF(&___NVIDIASansBd[0], nvidiaSansBdLength, 0, &normalFontCfg, allRange.Data);
-    }
+    m_boldFont = io.Fonts->AddFontFromMemoryTTF(&___InterBd[0], interBdLength, 0, &normalFontCfg, allRange.Data);
 
     // Large Size Font
 
@@ -4399,15 +5371,19 @@ namespace dxvk {
     largeFontCfg.SizePixels = 24.f;
     largeFontCfg.FontDataOwnedByAtlas = false;
 
-    {
-      // Add letters/symbols (NVIDIA-Sans)
-      m_largeFont = io.Fonts->AddFontFromMemoryTTF(&___NVIDIASansBd[0], nvidiaSansLength, 0, &largeFontCfg, characterRange.Data);
+    m_largeFont = io.Fonts->AddFontFromMemoryTTF(&___InterMd[0], interMdLength, 0, &largeFontCfg, characterRange.Data);
+    largeFontCfg.MergeMode = true;
+    io.Fonts->AddFontFromMemoryTTF(&___RobotoMonoRg[0], robotoMonoLength, 0, &largeFontCfg, numericalRange.Data);
 
-      // Enable merging
-      largeFontCfg.MergeMode = true;
+    // User Menu Fonts
 
-      // Add numbers (Roboto-Mono)
-      io.Fonts->AddFontFromMemoryTTF(&___RobotoMonoRg[0], robotoMonoLength, 0, &largeFontCfg, numericalRange.Data);
+    for (size_t i = 0; i < std::size(kUserMenuFontSizes); ++i) {
+      ImFontConfig userMenuFontCfg = ImFontConfig();
+      userMenuFontCfg.SizePixels = kUserMenuFontSizes[i];
+      userMenuFontCfg.FontDataOwnedByAtlas = false;
+      m_userMenuFonts[i] = io.Fonts->AddFontFromMemoryTTF(&___InterMd[0], interMdLength, 0, &userMenuFontCfg, characterRange.Data);
+      userMenuFontCfg.MergeMode = true;
+      io.Fonts->AddFontFromMemoryTTF(&___RobotoMonoRg[0], robotoMonoLength, 0, &userMenuFontCfg, numericalRange.Data);
     }
 
     // Build the fonts

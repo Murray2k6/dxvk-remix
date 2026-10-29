@@ -24,8 +24,26 @@
 
 #include "rtx_graph_instance.h"
 #include "rtx_graph_manager.h"
+#include "../rtx_retained_scene.h"
 
 namespace dxvk {
+
+PrimInstance ScenePrimOwner::resolve(uint32_t primIndex) const {
+  if (scene == nullptr || primIndex >= slots.size()) {
+    return PrimInstance();
+  }
+  const Slot& slot = slots[primIndex];
+  switch (slot.type) {
+  case PrimInstance::Type::Instance: {
+    RtInstance* instance = scene->submeshInstance(handle, slot.submesh);
+    return instance != nullptr ? PrimInstance(instance) : PrimInstance();
+  }
+  case PrimInstance::Type::Light:
+    return slot.light != nullptr ? PrimInstance(slot.light) : PrimInstance();
+  default:
+    return PrimInstance();
+  }
+}
 
 void GraphInstance::removeInstance() {
   m_graphManager->removeInstance(m_id);

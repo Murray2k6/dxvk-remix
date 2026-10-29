@@ -27,6 +27,7 @@
 #include <utility>
 #include <filesystem>
 #include <algorithm>
+#include <limits>
 
 #include "config.h"
 
@@ -599,11 +600,6 @@ namespace dxvk {
         "ace20008ae3a0a5b,"  // barrel detail texture
         "504697625CCD3B45,"  // building detail texture
       },
-      { "rtx.ignoreTransparencyLayerTextures",
-        // Light beams
-        "0x67801EDD7AA4E77A,"
-        "0xF116B8E9DA308EE8,"
-      },
       { "rtx.ignoreLights",
         // Chell atlases - associated with a light (player light?)
         "460306E97FB2D4B5,"  // 5044883607524660405ULL
@@ -616,8 +612,10 @@ namespace dxvk {
       },
       { "rtx.playerModelTextures",
         // Character - Chell
-        "8DD6F568BD126398,"  // Left eye
-        "EEF8EFD4B8A1B2A5,"  // Right eye
+        "8DD6F568BD126398,"  // Left eye (old)
+        "EEF8EFD4B8A1B2A5,"  // Right eye (old)
+        "D262A1108173A7C5,"  // Left eye
+        "3A1794C42393FFDF,"  // Right eye
         "4A066E5A5292D273,"  // Hair and eyelashes
         "AC869B6F32D8BBDB,"  // Something in the eyes
         "2D5AC1ADC56A42FD,"  // Body
@@ -1187,6 +1185,22 @@ namespace dxvk {
       ? iter->second : std::string();
   }
 
+  // NV-DXVK start: 0x hex integers in config files
+  // Reads "0x..." (after leading spaces) as a 32-bit pattern. Returns false for anything else; throws on a malformed or
+  // out-of-range hex number.
+  static bool parseHex32(const std::string& value, uint32_t& result) {
+    const size_t start = value.find_first_not_of(" \t");
+    if (start == std::string::npos || value.size() <= start + 2 || value[start] != '0' ||
+        (value[start + 1] != 'x' && value[start + 1] != 'X'))
+      return false;
+    const unsigned long long parsed = std::stoull(value, nullptr, 16);
+    if (parsed > std::numeric_limits<uint32_t>::max())
+      throw std::out_of_range("hex value exceeds 32 bits");
+    result = uint32_t(parsed);
+    return true;
+  }
+  // NV-DXVK end
+
   bool Config::parseOptionValue(
     const std::string&  value,
           std::string&  result) {
@@ -1229,8 +1243,14 @@ namespace dxvk {
     if (value.size() == 0)
       return false;
 
-    // NV-DXVK start: skip whitespaces at start of number strings
+    // NV-DXVK start: skip whitespaces at start of number strings; 0x hex is a 32-bit pattern (unsigned options
+    // are stored as int)
     try {
+      uint32_t bits = 0;
+      if (parseHex32(value, bits)) {
+        result = int32_t(bits);
+        return true;
+      }
       result = std::stoi(value);
       return true;
     }
@@ -1246,9 +1266,15 @@ namespace dxvk {
     if (value.size() == 0)
       return false;
 
-    // NV-DXVK start: skip whitespaces at start of number strings
+    // NV-DXVK start: skip whitespaces at start of number strings; the full unsigned range, decimal or 0x hex
     try {
-      result = std::stol(value);
+      if (parseHex32(value, result))
+        return true;
+      // Decimal is read signed, so a negative value wraps.
+      const long long parsed = std::stoll(value);
+      if (parsed < std::numeric_limits<int32_t>::min() || parsed > (long long) std::numeric_limits<uint32_t>::max())
+        return false;
+      result = uint32_t(parsed);
       return true;
     }
     catch (...) {
@@ -1491,8 +1517,17 @@ namespace dxvk {
     if (!m_options.empty()) {
       Logger::info(str::format(configName, " configuration:"));
 
-      for (auto& pair : m_options)
-        Logger::info(str::format("  ", pair.first, " = ", pair.second));
+      // Long values (texture hash lists) are cut to their start and their entry count; rtx.conf has them in full.
+      constexpr size_t kMaxValueChars = 160;
+      for (auto& pair : m_options) {
+        if (pair.second.size() <= kMaxValueChars) {
+          Logger::info(str::format("  ", pair.first, " = ", pair.second));
+        } else {
+          const size_t entries = size_t(std::count(pair.second.begin(), pair.second.end(), ',')) + 1;
+          Logger::info(str::format("  ", pair.first, " = ", pair.second.substr(0, kMaxValueChars), "... (",
+                                   entries, " entries, ", pair.second.size(), " characters)"));
+        }
+      }
     }
   }
   // NV-DXVK end

@@ -346,6 +346,14 @@ namespace dxvk {
         if (isDebugBufferRequired()) {
           clearBuffer(ctx, nrc::BufferIdx::DebugTrainingPathInfo, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         }
+
+        // BeginFrame records NRC's own writes to these buffers, which DXVK's barrier tracking does not see,
+        // so the clears are ordered before them here.
+        ctx.emitMemoryBarrier(0,
+          VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_TRANSFER_WRITE_BIT,
+          VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+          VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
       }
 
       // Configure network

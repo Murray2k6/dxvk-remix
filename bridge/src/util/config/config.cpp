@@ -134,7 +134,10 @@ namespace bridge_util {
 
   std::vector<Config::AppDefaultConfig> Config::appDefaultConfigs = {
     { "Source Engine", R"(\\hl2\.exe$)", {
-      { "presentSemaphoreMaxFrames ", "1" }
+      { "presentSemaphoreMaxFrames", "1" },
+      // Async creates: the client does not wait for create results. The server counts and
+      // reports failures ([Bridge] async creates); the server adopts the client's policy at the handshake.
+      { "sendCreateFunctionServerResponses", "False" }
     }}
   };
 
@@ -252,7 +255,8 @@ namespace bridge_util {
       return config;
     }
     const std::string moduleDir = moduleFilePath.string().substr(0, finalDirPos + 1);
-    const std::string trexDirPath = (app == App::Client) ? moduleDir + ".trex\\" : moduleDir;
+    const std::string trexDirName = dxvk::util::RtxFileSys::runtimeDirNameIn(moduleDir, getNativeArchString());
+    const std::string trexDirPath = (app == App::Client) ? moduleDir + trexDirName + "\\" : moduleDir;
     const std::filesystem::path userConfPath = trexDirPath + "bridge.conf";
 
     Logger::info(std::string("Trying to open config file: ") + userConfPath.string());

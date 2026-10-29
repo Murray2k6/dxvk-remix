@@ -22,6 +22,7 @@
 #include "rtx_options.h"
 
 #include <filesystem>
+#include <mutex>
 #include <nvapi.h>
 #include "../imgui/imgui.h"
 #include "rtx_bridge_message_channel.h"
@@ -31,6 +32,7 @@
 #include "rtx_restir_gi_rayquery.h"
 #include "rtx_composite.h"
 #include "rtx_demodulate.h"
+#include "rtx_dlfg.h"
 #include "rtx_neural_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
 #include "../util/util_global_time.h"
@@ -38,6 +40,9 @@
 #include "dxvk_device.h"
 #include "rtx_global_volumetrics.h"
 #include "rtx_scene_manager.h"
+#include "rtx_sharc.h"
+#include "rtx_fork_sccr_shell.h"
+#include "rtx_sparse_rendering.h"
 
 namespace dxvk {
   RtxOptions* RtxOptions::s_instance = nullptr;
@@ -394,7 +399,7 @@ namespace dxvk {
       }
     }
   }
-    
+
   void RtxOptions::updateGraphicsPresets(DxvkDevice* device) {
     // Code-driven changes for graphics preset (automatically routes to User layer when preset is Custom)
     RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::Derived);
@@ -433,8 +438,8 @@ namespace dxvk {
           preferredDefault = GraphicsPreset::High;
         } else {
           // Blackwell and beyond
-          Logger::info("NVIDIA Blackwell architecture detected, setting default graphics settings to Ultra");
-          preferredDefault = GraphicsPreset::Ultra;
+          Logger::info("NVIDIA Blackwell architecture detected, setting default graphics settings to High");
+          preferredDefault = GraphicsPreset::High;
         }
       } else {
         // Default to low if we don't know the hardware
@@ -502,21 +507,41 @@ namespace dxvk {
       postFx.enable.setDeferred(false);
     };
 
-    auto enableNrcPreset = [&](NeuralRadianceCache::QualityPreset nrcPreset) {
-      NeuralRadianceCache& nrc = device->getCommon()->metaNeuralRadianceCache();
-      // TODO[REMIX-4105] trying to use NRC for a frame when it isn't supported will cause a crash, so this needs to be setImmediately.
-      // Should refactor this to use a separate global for the final state, and indicate user preference with the option. 
+    const uint32_t deviceVendorID = device->adapter()->devicePropertiesExt().core.properties.vendorID;
+    const bool isNvidiaGpu = deviceVendorID == static_cast<uint32_t>(DxvkGpuVendor::Nvidia);
+    const bool isSharcVendor = isNvidiaGpu;
+
+    // Every preset selects SHARC on NVIDIA GPUs that support it, and ReSTIR GI everywhere else.
+    // The SHARC update is a ray tracing pipeline, and other GPUs run only Ray Query passes (see updateRaytraceModePresets).
+    // NRC runs only on NVIDIA GPUs, so it is chosen by hand with the Custom preset. Its tier still follows the preset.
+    auto setIndirectPreset = [&](RtxSharc::QualityPreset sharcPreset, NeuralRadianceCache::QualityPreset nrcPreset) {
+      NeuralRadianceCache& nrc = common->metaNeuralRadianceCache();
       if (nrc.checkIsSupported(device)) {
-        RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::NeuralRadianceCache);
         nrc.setQualityPreset(nrcPreset);
+      }
+      // TODO[REMIX-4105] a frame that uses NRC where it isn't supported crashes, and a lower layer may select NRC,
+      // so this needs to be setImmediately.
+      if (isSharcVendor && RtxSharc::checkIsSupported(device)) {
+        RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::Sharc);
+        common->metaSharc().setQualityPreset(sharcPreset);
+        Logger::info("[RTX] Graphics preset indirect lighting: SHARC (NVIDIA GPU).");
       } else {
         RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::ReSTIRGI);
+        Logger::info(str::format("[RTX] Graphics preset indirect lighting: ReSTIR GI (",
+                                 isSharcVendor ? "SHARC is not supported" : "SHARC is off on this GPU vendor",
+                                 ", vendor ID 0x", std::hex, deviceVendorID, ")."));
       }
     };
 
     assert(graphicsPreset() != GraphicsPreset::Auto);
 
     RtxGlobalVolumetrics& volumetrics = device->getCommon()->metaGlobalVolumetrics();
+
+    // The previous preset's frame generation preset is cleared, so only Medium and Low select the lightweight model.
+    {
+      std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
+      DxvkDLFG::litePreset.disableLayerValue(RtxOptionLayer::getQualityLayer());
+    }
 
     if (graphicsPreset() == GraphicsPreset::Ultra) {
       pathMinBounces.setDeferred(1);
@@ -537,17 +562,20 @@ namespace dxvk {
       postFx.enable.setDeferred(true);
 
       volumetrics.setQualityLevel(RtxGlobalVolumetrics::Ultra);
-      enableNrcPreset(NeuralRadianceCache::QualityPreset::Ultra);
+      volumetrics.setConsumerCacheQualityLevel(RtxGlobalVolumetrics::Ultra);
+      setIndirectPreset(RtxSharc::QualityPreset::Ultra, NeuralRadianceCache::QualityPreset::Ultra);
+      SccrShellManager::setQualityLevel(SccrShellManager::Quality::High);
+      SparseRendering::Options::enableSparseRendering.setDeferred(false);
 
-      DxvkRayReconstruction::model.setDeferred(DxvkRayReconstruction::RayReconstructionModel::Transformer);
     } else if (graphicsPreset() == GraphicsPreset::High) {
-      pathMinBounces.setDeferred(0);
-      pathMaxBounces.setDeferred(2);
-      enableTransmissionApproximationInIndirectRays.setDeferred(true);
-      enableUnorderedEmissiveParticlesInIndirectRays.setDeferred(false);
-      denoiseDirectAndIndirectLightingSeparately.setDeferred(false);
+      // High uses upstream RTX Remix's Ultra path settings with a lighter SHaRC update than Ultra.
+      pathMinBounces.setDeferred(1);
+      pathMaxBounces.setDeferred(4);
+      enableTransmissionApproximationInIndirectRays.setDeferred(false);
+      enableUnorderedEmissiveParticlesInIndirectRays.setDeferred(true);
+      denoiseDirectAndIndirectLightingSeparately.setDeferred(true);
       enableUnorderedResolveInIndirectRays.setDeferred(true);
-      NeeCachePass::enable.setDeferred(isRayReconstruction);
+      NeeCachePass::enable.setDeferred(true);
 
       rtxdiRayQuery.enableRayTracedBiasCorrection.setDeferred(true);
       restirGiRayQuery.biasCorrectionMode.setDeferred(ReSTIRGIBiasCorrection::PairwiseRaytrace);
@@ -558,30 +586,43 @@ namespace dxvk {
       russianRouletteMaxContinueProbability.setDeferred(0.9f);
       russianRoulette1stBounceMinContinueProbability.setDeferred(0.6f);
 
-      volumetrics.setQualityLevel(RtxGlobalVolumetrics::High);
-      enableNrcPreset(NeuralRadianceCache::QualityPreset::High);
+      volumetrics.setQualityLevel(RtxGlobalVolumetrics::Ultra);
+      volumetrics.setConsumerCacheQualityLevel(RtxGlobalVolumetrics::Ultra);
+      setIndirectPreset(RtxSharc::QualityPreset::High, NeuralRadianceCache::QualityPreset::Ultra);
+      SccrShellManager::setQualityLevel(SccrShellManager::Quality::High);
+      // Sparse rendering needs Ray Reconstruction to fill in the pixels it skips.
+      SparseRendering::Options::enableSparseRendering.setDeferred(isRayReconstruction);
+      SparseRendering::Options::samplingRate.setDeferred(0.6f);
 
-      DxvkRayReconstruction::model.setDeferred(DxvkRayReconstruction::RayReconstructionModel::Transformer);
     } else if (graphicsPreset() == GraphicsPreset::Medium) {
+      DxvkDLFG::litePreset.setDeferred(true);
+
       lowGraphicsPresetCommonSettings();
 
       russianRouletteMaxContinueProbability.setDeferred(0.7f);
       russianRoulette1stBounceMinContinueProbability.setDeferred(0.4f);
 
       volumetrics.setQualityLevel(RtxGlobalVolumetrics::Medium);
-      enableNrcPreset(NeuralRadianceCache::QualityPreset::Medium);
-
-      DxvkRayReconstruction::model.setDeferred(DxvkRayReconstruction::RayReconstructionModel::CNN);
+      volumetrics.setConsumerCacheQualityLevel(RtxGlobalVolumetrics::Medium);
+      setIndirectPreset(RtxSharc::QualityPreset::Medium, NeuralRadianceCache::QualityPreset::Medium);
+      SccrShellManager::setQualityLevel(SccrShellManager::Quality::Medium);
+      // Sparse rendering needs Ray Reconstruction to fill in the pixels it skips.
+      SparseRendering::Options::enableSparseRendering.setDeferred(isRayReconstruction);
+      SparseRendering::Options::samplingRate.setDeferred(0.5f);
     } else if (graphicsPreset() == GraphicsPreset::Low) {
+      DxvkDLFG::litePreset.setDeferred(true);
+
       lowGraphicsPresetCommonSettings();
 
       russianRouletteMaxContinueProbability.setDeferred(0.7f);
       russianRoulette1stBounceMinContinueProbability.setDeferred(0.4f);
 
       volumetrics.setQualityLevel(RtxGlobalVolumetrics::Low);
-      enableNrcPreset(NeuralRadianceCache::QualityPreset::Medium);
-
-      DxvkRayReconstruction::model.setDeferred(DxvkRayReconstruction::RayReconstructionModel::CNN);
+      volumetrics.setConsumerCacheQualityLevel(RtxGlobalVolumetrics::Low);
+      setIndirectPreset(RtxSharc::QualityPreset::Medium, NeuralRadianceCache::QualityPreset::Medium);
+      SccrShellManager::setQualityLevel(SccrShellManager::Quality::Low);
+      SparseRendering::Options::enableSparseRendering.setDeferred(isRayReconstruction);
+      SparseRendering::Options::samplingRate.setDeferred(0.357f);
     }
 
     // Ensure we are using auto DLSS profile since we will be relying on quality downgrades for Medium/Low settings
@@ -608,22 +649,13 @@ namespace dxvk {
       preferredGBufferRaytraceMode = DxvkPathtracerGbuffer::RaytraceMode::RayQuery;
       preferredIntegrateDirectRaytraceMode = DxvkPathtracerIntegrateDirect::RaytraceMode::RayQuery;
 
-      if (vendorID == static_cast<uint32_t>(DxvkGpuVendor::Nvidia)
-        || driverID == VK_DRIVER_ID_MESA_RADV
-        || driverID == VK_DRIVER_ID_AMD_PROPRIETARY) {
-        // Default to a mixture of Trace Ray and Ray Query on NVIDIA, RADV, and AMD proprietary
-        if (driverID == VK_DRIVER_ID_MESA_RADV) {
-          Logger::info("RADV driver detected, setting default raytrace modes to Trace Ray (Indirect Integrate) and Ray Query (GBuffer, Direct Integrate)");
-        } else if (driverID == VK_DRIVER_ID_AMD_PROPRIETARY) {
-          Logger::info("AMD driver detected, setting default raytrace modes to Trace Ray (Indirect Integrate) and Ray Query (GBuffer, Direct Integrate)");
-        } else {
-          Logger::info("NVIDIA architecture detected, setting default raytrace modes to Trace Ray (Indirect Integrate) and Ray Query (GBuffer, Direct Integrate)");
-        }
+      // Indirect lighting uses Trace Ray only on NVIDIA; every other GPU uses Ray Query for all passes.
+      if (vendorID == static_cast<uint32_t>(DxvkGpuVendor::Nvidia)) {
+        Logger::info("NVIDIA architecture detected, setting default raytrace modes to Trace Ray (Indirect Integrate) and Ray Query (GBuffer, Direct Integrate)");
 
         preferredIntegrateIndirectRaytraceMode = DxvkPathtracerIntegrateIndirect::RaytraceMode::TraceRay;
       } else {
-        // Default to Ray Query on Unknown
-        Logger::info("Non-NVIDIA architecture detected, setting default raytrace modes to Ray Query");
+        Logger::info(str::format("Non-NVIDIA GPU detected (driver ID ", uint32_t(driverID), "), setting default raytrace modes to Ray Query"));
 
         preferredIntegrateIndirectRaytraceMode = DxvkPathtracerIntegrateIndirect::RaytraceMode::RayQuery;
       }

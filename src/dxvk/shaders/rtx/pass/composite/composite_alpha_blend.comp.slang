@@ -35,7 +35,7 @@
 #include "rtx/concept/surface/alpha_blend_surface.slangh"
 #include "rtx/external/NRD.slangh"
 #include "rtx/utility/geometry_flags.slangh"
-#include "rtx/algorithm/volume_lighting.slangh"
+#include "rtx/algorithm/volume_lighting_consumer.slangh"
 #include "rtx/pass/sparse_rendering/sparse_rendering.slangh"
 
 groupshared uint samplePixel[16 * 8];
@@ -189,7 +189,7 @@ void main(uint2 thread_id : SV_DispatchThreadID, uint2 localIndex : SV_GroupThre
 
       MinimalSurfaceInteraction surfaceInteraction = (MinimalSurfaceInteraction)0;
       surfaceInteraction.position = surfacePosition;
-      vec3 radiance = evalVolumetricNEE(VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg, cb.volumeArgs, surfaceInteraction, froxelVolumeHint);
+      vec3 radiance = evalVolumetricConsumerNEE(VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg, cb.volumeArgs, surfaceInteraction, froxelVolumeHint);
       surfaceLight = radiance * surface.color.xyz * cb.stochasticAlphaBlendRadianceVolumeMultiplier;
     }
   }

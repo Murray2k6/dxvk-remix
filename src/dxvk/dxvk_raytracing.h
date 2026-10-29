@@ -114,6 +114,8 @@ namespace dxvk {
      */
     void compilePipeline();
 
+    bool isCompiled() const { return m_isCompiled.load(); }
+
     const DxvkRaytracingPipelineShaders& shaders() const { return m_shaders; }
 
     DxvkPipelineLayout* layout() { return m_layout.ptr(); }
@@ -128,6 +130,7 @@ namespace dxvk {
   private:
     void createLayout();
     void createPipeline();
+    void logPipelineStats(VkPipelineCreateFlags flags) const;
     void createShaderBindingTable();
     void releaseTmpResources();
 

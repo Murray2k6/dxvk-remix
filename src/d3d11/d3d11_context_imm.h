@@ -115,7 +115,24 @@ namespace dxvk {
     void SynchronizeCsThread(
             uint64_t                          SequenceNumber);
     
+    // NV-DXVK start: Explicit API host frame ownership
+    void RenderRemix(const Rc<DxvkImage>& image, bool render);
+    bool FinishRemixFrame(const Rc<DxvkImage>& image, uint64_t& frameId);
+    void DisableRemixHost() { m_remixTarget = nullptr; }
+    // The Remix frame the game thread is building now. It is also the
+    // Reflex frame id: injectRTX, endFrame and the present of this frame all carry it.
+    uint64_t GetRemixFrameId() const { return m_remixFrameId; }
+    // NV-DXVK end
+
   private:
+    // NV-DXVK start: Only the submitted output swapchain advances Remix
+    Rc<DxvkImage> m_remixTarget;
+    uint64_t m_remixFrameId = 0;
+    // Used by rtx.reflexD3D11Markers: SIMULATION_END once per Remix frame, at the
+    // first of RenderRemix / FinishRemixFrame (game thread, under the context lock).
+    uint64_t m_reflexSimEndedFrame = ~0ull;
+    void EndReflexSimulation();
+    // NV-DXVK end
     
     DxvkCsThread            m_csThread;
     uint64_t                m_csSeqNum = 0ull;

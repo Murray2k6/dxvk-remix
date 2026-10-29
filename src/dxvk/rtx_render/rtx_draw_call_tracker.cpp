@@ -19,11 +19,15 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <ppl.h>
+#include <intrin.h>
 #include "rtx_draw_call_tracker.h"
+#include "translator/rtx_translator_lifetime.h"
 #include "rtx_options.h"
 #include "rtx_ray_portal_manager.h"
 #include "rtx_intersection_test.h"
 #include "dxvk_device.h"
+#include "dxvk_perf_counters.h"
 #include "../util/util_struct_hash.h"
 
 
@@ -59,27 +63,16 @@ namespace dxvk {
     }
   }
 
-  // Frustum check for an AABB in the space defined by objectToWorld.
-  // Uses SAT (high precision) or fast check based on the RtxOption.
-  static bool aabbIntersectsFrustum(
-      RtCamera& camera,
-      const AxisAlignedBoundingBox& aabb,
-      const Matrix4& objectToWorld) {
-    const Matrix4 objectToView = camera.getWorldToView(false) * objectToWorld;
-    if (RtxOptions::AntiCulling::Object::enableHighPrecisionAntiCulling()) {
-      return boundingBoxIntersectsFrustumSAT(
-          camera, aabb.minPos, aabb.maxPos, objectToView,
-          RtxOptions::AntiCulling::Object::enableInfinityFarFrustum());
-    }
-    return boundingBoxIntersectsFrustum(camera.getFrustum(), aabb.minPos, aabb.maxPos, objectToView);
-  }
-
   DrawCallTracker::DrawCallTracker(DxvkDevice* device)
     : m_device(device) {
   }
 
+  uint32_t DrawCallTracker::frameId() const {
+    return m_device->getCurrentFrameId();
+  }
+
   XXH64_hash_t DrawCallTracker::computeIdentityHash(
-      const DrawCallState& drawCallState,
+      const SceneDraw& drawCallState,
       const MaterialData* overrideMaterialData) {
     struct IdentityHashData{
       XXH64_hash_t geoHash;
@@ -88,10 +81,9 @@ namespace dxvk {
       XXH64_hash_t overrideMaterialHash;
       Matrix4 xform;
       Matrix4 textureTransform;
-      uint32_t cameraType;
       uint32_t categories;
-      uint32_t texgenMode;
-      uint32_t _pad0;
+      // Packed: cameraType (bits 0-7), texgenMode (bits 8-15), isUsingRaytracedRenderTarget (bit 16).
+      uint32_t miscFlags;
     };
 
     // {} value-initializes the entire object.
@@ -105,9 +97,14 @@ namespace dxvk {
     data.xform = drawCallState.getTransformData().objectToWorld;
     data.categories = drawCallState.getCategoryFlags().raw();
     data.boneHash = drawCallState.getSkinningState().boneHash;
-    data.cameraType = static_cast<uint32_t>(drawCallState.cameraType);
     data.textureTransform = drawCallState.getTransformData().textureTransform;
-    data.texgenMode = static_cast<uint32_t>(drawCallState.getTransformData().texgenMode);
+
+    // Note: these could be packed tighter, if we have more small values that need to be included.
+    static_assert(CameraType::Count <= (1u << 8), "CameraType no longer fits in the 8 bits allocated to it in IdentityHashData::miscFlags");
+    static_assert(static_cast<uint32_t>(TexGenMode::Count) <= (1u << 8), "TexGenMode no longer fits in the 8 bits allocated to it in IdentityHashData::miscFlags");
+    data.miscFlags = static_cast<uint32_t>(drawCallState.cameraType)
+        | (static_cast<uint32_t>(drawCallState.getTransformData().texgenMode) << 8)
+        | (drawCallState.isUsingRaytracedRenderTarget ? (1u << 16) : 0u);
 
     return hashStructByMemory<IdentityHashData,
         &IdentityHashData::geoHash,
@@ -116,10 +113,8 @@ namespace dxvk {
         &IdentityHashData::overrideMaterialHash,
         &IdentityHashData::xform,
         &IdentityHashData::textureTransform,
-        &IdentityHashData::cameraType,
         &IdentityHashData::categories,
-        &IdentityHashData::texgenMode,
-        &IdentityHashData::_pad0>(data);
+        &IdentityHashData::miscFlags>(data);
   }
 
   void DrawCallTracker::eraseFromSpatialMap(
@@ -140,6 +135,7 @@ namespace dxvk {
       ReplacementInstance* match,
       const ReplacementInstance::LookupKey& key,
       ReplacementSpatialMap* moveInAssetMap) {
+    noteRekeyOrDestroy(match);
     m_identityHashMap.erase(match->identityHash);
     match->identityHash = key.identityHash;
     match->vertexPositionHash = key.vertexPositionHash;
@@ -171,7 +167,7 @@ namespace dxvk {
   ReplacementInstance* DrawCallTracker::findOrCreateReplacementInstance(
       const ReplacementInstance::LookupKey& key) {
     ScopedCpuProfileZone();
-    const uint32_t currentFrameId = m_device->getCurrentFrameId();
+    const uint32_t currentFrameId = frameId();
 
     // Level 1: exact identity match.
     // Draw calls with the same identity hash (same geometry, material, transform) return
@@ -192,6 +188,7 @@ namespace dxvk {
       if (match->frameLastSeen != currentFrameId) {
         match->dirtyFlags.clr(ReplacementInstance::kLookupDriftMask);
       }
+      perf::countD3D9(perf::D3D9Ctr::TrackerExact);
       return match;
     }
 
@@ -220,9 +217,11 @@ namespace dxvk {
         // by construction here; only material can diverge (l2Filter requires
         // material match, so usually nothing differs at this point).
         computeDirtyFlags(exactTransformMatch, key);
+        noteRekeyOrDestroy(exactTransformMatch);
         m_identityHashMap.erase(exactTransformMatch->identityHash);
         exactTransformMatch->identityHash = key.identityHash;
         m_identityHashMap[key.identityHash] = exactTransformMatch;
+        perf::countD3D9(perf::D3D9Ctr::TrackerTransform);
         return exactTransformMatch;
       }
 
@@ -237,8 +236,10 @@ namespace dxvk {
         // branch above); other fields may also have changed.
         ReplacementInstance* match = const_cast<ReplacementInstance*>(nearestMatch);
         computeDirtyFlags(match, key);
+        perf::countD3D9(perf::D3D9Ctr::TrackerSpatial);
         return reassociateMatch(match, key, &spatialMapIter->second);
       }
+
     }
 
     // Level 3: no match — create a new ReplacementInstance.
@@ -254,11 +255,12 @@ namespace dxvk {
 
     m_replacementInstances.push_back(std::move(newReplacementInstance));
 
+    perf::countD3D9(perf::D3D9Ctr::TrackerNew);
     return replacementInstance;
   }
 
   ReplacementInstance* DrawCallTracker::findOrCreateReplacementInstance(
-      const DrawCallState& drawCallState,
+      const SceneDraw& drawCallState,
       const RayPortalManager& rayPortalManager,
       const MaterialData* overrideMaterialData) {
     // Tracking hash uses topology only (indices + geometry descriptor), matching how the
@@ -267,10 +269,11 @@ namespace dxvk {
     // even when the material changes between frames (LOD, texture animation).
     const auto& hashes = drawCallState.getGeometryData().hashes;
     const Matrix4& objectToWorld = drawCallState.getTransformData().objectToWorld;
+    const XXH64_hash_t topologyHash = hashes.getHashForRule<rules::TopologicalHash>();
 
     const ReplacementInstance::LookupKey key {
       computeIdentityHash(drawCallState, overrideMaterialData),
-      hashes.getHashForRule<rules::TopologicalHash>(),
+      topologyHash,
       drawCallState.getMaterialData().getHash(),
       hashes[HashComponents::VertexPosition],
       drawCallState.getGeometryData().boundingBox.getTransformedCentroid(objectToWorld),
@@ -288,6 +291,7 @@ namespace dxvk {
         RtxOptions::useRayPortalVirtualInstanceMatching()) {
       ReplacementInstance* portalResult = tryPortalMatch(result, key, rayPortalManager);
       if (portalResult != nullptr) {
+        perf::countD3D9(perf::D3D9Ctr::TrackerPortal);
         return portalResult;
       }
     }
@@ -304,7 +308,7 @@ namespace dxvk {
       ReplacementInstance* newInstance,
       const ReplacementInstance::LookupKey& key,
       const RayPortalManager& rayPortalManager) {
-    const uint32_t currentFrameId = m_device->getCurrentFrameId();
+    const uint32_t currentFrameId = frameId();
     const float uniqueObjectDistanceSqr = RtxOptions::getUniqueObjectDistanceSqr();
 
     auto spatialMapIter = m_assetSpatialMaps.find(key.spatialMapHash);
@@ -356,6 +360,7 @@ namespace dxvk {
       return;
     }
 
+    noteRekeyOrDestroy(replacementInstance);
     m_identityHashMap.erase(replacementInstance->identityHash);
 
     eraseFromSpatialMap(m_assetSpatialMaps, replacementInstance->spatialMapHash,
@@ -366,87 +371,76 @@ namespace dxvk {
 
   void DrawCallTracker::garbageCollectReplacementInstances(
       RtCamera& camera,
-      bool isAntiCullingSupported) {
+      bool isAntiCullingSupported,
+      bool parallelScan,
+      uint32_t keptCutFrame) {
+    translator::LifetimeFrame lifetime = translator::LifetimeFrame::read(camera, isAntiCullingSupported, false);
+    lifetime.keptCutFrame = keptCutFrame;
+    collectReplacementInstances(lifetime, parallelScan);
+  }
 
-    const uint32_t currentFrame = m_device->getCurrentFrameId();
-    const uint32_t numFramesToKeepObjects = RtxOptions::numFramesToKeepInstances();
-    const uint32_t numFramesToKeepLights = RtxOptions::AntiCulling::Light::numFramesToExtendLightLifetime();
-
-    const bool objectAntiCullingEnabled = RtxOptions::AntiCulling::isObjectAntiCullingEnabled();
-    const bool lightAntiCullingEnabled = RtxOptions::AntiCulling::isLightAntiCullingEnabled();
-    const bool isCameraCut = camera.isCameraCut();
+  void DrawCallTracker::collectReplacementInstances(const translator::LifetimeFrame& lifetimeIn, bool parallelScan) {
+    const uint32_t currentFrame = frameId();
     const bool forceGC = (m_replacementInstances.size() >=
         RtxOptions::AntiCulling::Object::numObjectsToKeep());
+    translator::LifetimeFrame lifetime = lifetimeIn;
+    lifetime.currentFrame = currentFrame;
+    lifetime.forceCollect = forceGC;
+    const uint32_t numFramesToKeepObjects = lifetime.framesToKeepObjects;
+    // Geometry that is new every frame is drawn under a new instance every frame, so its last instance is stale as soon
+    // as a frame does not draw it.
+    const auto isStale = [&](const ReplacementInstance& ri) {
+      return ri.frameLastSeen + (ri.newGeometryEveryFrame ? 1u : numFramesToKeepObjects) <= currentFrame;
+    };
+
+    // rtx.parallelScenePrepScans: the stale replacement instances are found on worker threads, and the
+    // loop below then only reads their flags. The flags move with the instances when the loop swap-removes one.
+    std::vector<uint8_t>& stale = m_gcStaleScratch;
+    const bool useStaleFlags = parallelScan && m_replacementInstances.size() >= 4096;
+    if (useStaleFlags) {
+      const uint32_t count = uint32_t(m_replacementInstances.size());
+      stale.resize(count);
+      constexpr uint32_t kChunk = 1024;
+      concurrency::parallel_for<uint32_t>(0, (count + kChunk - 1) / kChunk, [&](uint32_t chunk) {
+        const uint32_t end = std::min(count, (chunk + 1) * kChunk);
+        for (uint32_t i = chunk * kChunk; i < end; ++i) {
+          if (i + 8 < end) {
+            _mm_prefetch(reinterpret_cast<const char*>(&m_replacementInstances[i + 8]->frameLastSeen), _MM_HINT_T0);
+          }
+          const ReplacementInstance& ri = *m_replacementInstances[i];
+          stale[i] = isStale(ri) ? 1 : 0;
+        }
+      });
+    }
 
     for (size_t i = 0; i < m_replacementInstances.size();) {
+      if (useStaleFlags && stale[i] == 0) {
+        ++i;
+        continue;
+      }
       ReplacementInstance* replacementInstance = m_replacementInstances[i].get();
 
-      const bool hasLights = replacementInstance->lightBoundingBox.isValid();
-      const bool hasMeshes = replacementInstance->geometryBoundingBox.isValid();
-
-      if (replacementInstance->frameLastSeen + numFramesToKeepObjects <= currentFrame) {
-        bool keepAlive = false;
-
-        // Only anti-cull RIs that have been matched at least once after creation.
-        const bool isStable = (replacementInstance->frameLastSeen > replacementInstance->frameCreated);
-
-        if (!isCameraCut && isStable) {
-          // Skinned and player model objects should always be GC'd when stale —
-          // anti-culling them produces frozen poses or wrong positions.
-          // Objects tagged IgnoreAntiCulling by the game config are also exempt.
-          // Translation-animated objects (transform changed in their last update)
-          // are also exempt: anti-culling them freezes them mid-motion at the
-          // last-seen position, which is rarely the right answer for a moving
-          // entity that the game has finished drawing.
-          // Note: the old system also exempted spritesheet-animated objects, but that
-          // was likely a conservative safeguard — spritesheet state isn't broken by
-          // anti-culling the way skeletal pose is.
-          const CategoryFlags categories(replacementInstance->categoryFlags);
-          const bool wasMovingWhenLastSeen =
-              replacementInstance->dirtyFlags.test(ReplacementInstance::DirtyFlag::Transform);
-          const bool exemptFromAntiCulling =
-              replacementInstance->isSkinned ||
-              categories.test(InstanceCategories::ThirdPersonPlayerModel) ||
-              categories.test(InstanceCategories::IgnoreAntiCulling) ||
-              wasMovingWhenLastSeen;
-
-          // Object anti-culling: keep objects that are OUTSIDE the camera frustum.
-          // If the game stopped submitting an object that's clearly visible, it
-          // likely had a valid reason (destruction, LOD swap, etc.) — allow GC.
-          // Objects outside the frustum may have been wrongly culled by the game's
-          // own frustum (which doesn't match ours) and should be preserved.
-          if (!keepAlive && objectAntiCullingEnabled && !forceGC
-              && isAntiCullingSupported && hasMeshes && !exemptFromAntiCulling) {
-            keepAlive = !aabbIntersectsFrustum(
-                camera,
-                replacementInstance->geometryBoundingBox,
-                replacementInstance->objectToWorld);
-          }
-
-          // Light anti-culling for mesh replacement lights. Mirrors the old
-          // LightManager MeshReplacement behavior: isDynamic lights inside
-          // the frustum were GC'd immediately — only lights OUTSIDE the
-          // camera frustum were protected, and only within the extended
-          // lifetime window. Uses the camera frustum (not the wider light
-          // anti-culling frustum) since the check is position-based like
-          // object anti-culling.
-          if (!keepAlive && lightAntiCullingEnabled && hasLights
-              && isAntiCullingSupported && !exemptFromAntiCulling && !forceGC) {
-            const bool withinExtendedLifetime =
-                replacementInstance->frameLastSeen + numFramesToKeepLights > currentFrame;
-            if (withinExtendedLifetime) {
-              keepAlive = !aabbIntersectsFrustum(
-                  camera,
-                  replacementInstance->lightBoundingBox,
-                  replacementInstance->objectToWorld);
-            }
-          }
-        }
+      if (isStale(*replacementInstance)) {
+        // translator::LifetimePolicy (shared with the scene's transient lane).
+        translator::UnseenObject unseen;
+        unseen.frameLastSeen = replacementInstance->frameLastSeen;
+        unseen.frameCreated = replacementInstance->frameCreated;
+        unseen.categories = replacementInstance->categoryFlags;
+        unseen.skinned = replacementInstance->isSkinned;
+        unseen.wasMovingWhenLastSeen = replacementInstance->dirtyFlags.test(ReplacementInstance::DirtyFlag::Transform);
+        unseen.geometryBounds = &replacementInstance->geometryBoundingBox;
+        unseen.lightBounds = &replacementInstance->lightBoundingBox;
+        unseen.objectToWorld = &replacementInstance->objectToWorld;
+        const bool keepAlive = !replacementInstance->newGeometryEveryFrame && translator::LifetimePolicy::keepUnseen(unseen, lifetime);
 
         if (!keepAlive) {
           destroyReplacementInstance(replacementInstance);
           std::swap(m_replacementInstances[i], m_replacementInstances.back());
           m_replacementInstances.pop_back();
+          if (useStaleFlags) {
+            stale[i] = stale.back();
+            stale.pop_back();
+          }
           continue;
         }
       }
@@ -455,6 +449,9 @@ namespace dxvk {
   }
 
   void DrawCallTracker::clear() {
+    ++m_retainedSteadyEpoch;
+    ++m_retainedSteadyClearEpoch;
+    m_retainedSteadyInvalidations.clear();
     m_identityHashMap.clear();
     m_assetSpatialMaps.clear();
     m_replacementInstances.clear();

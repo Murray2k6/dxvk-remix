@@ -62,8 +62,7 @@ HRESULT Direct3DVertexShader9_LSS::GetDevice(IDirect3DDevice9** ppDevice) {
   if (ppDevice == nullptr) {
     return D3DERR_INVALIDCALL;
   }
-  m_pDevice->AddRef();
-  (*ppDevice) = m_pDevice;
+  m_pDevice->reportDevice(ppDevice);
   return S_OK;
 }
 
